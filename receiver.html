@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BeeCaster Receiver</title>
+    <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <style>
+        /* Base receiver styles */
+        body {
+            overflow: hidden;
+            margin: 0;
+            padding: 0;
+            background: #090a0f;
+        }
+
+        video {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            background-size: cover;
+            background-position: center;
+            filter: blur(14px) saturate(110%);
+            transform: scale(1.06);
+        }
+
+        #backdrop {
+            position: absolute;
+            inset: 0;
+            z-index: 1;
+            background-size: cover;
+            background-position: center;
+            opacity: 0.28;
+            filter: blur(42px) saturate(130%);
+            transform: scale(1.08);
+        }
+
+        #skin-root {
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+        }
+
+        #splash {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            color: #f5f7ff;
+            z-index: 3;
+            font-family: Segoe UI, Roboto, Arial, sans-serif;
+            font-size: 72px;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            text-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+        }
+    </style>
+</head>
+<body>
+    <video id="receiverVideoElement"></video>
+    <div id="backdrop"></div>
+    <div id="skin-root"></div>
+    <div id="splash">BeeCaster</div>
+
+    <script>
+        const CHANNEL = 'urn:x-cast:com.google.cast.media';
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const playerManager = context.getPlayerManager();
+
+        playerManager.setSupportedMediaCommands(
+            cast.framework.messages.Command.ALL_BASIC_MEDIA |
+            cast.framework.messages.Command.PAUSE |
+            cast.framework.messages.Command.QUEUE_NEXT |
+            cast.framework.messages.Command.QUEUE_PREV
+        );
+
+        const state = {
+            media: {},
+            customData: {},
+            currentTimeSec: 0,
+            durationSec: 0,
+            layoutEndpoint: '/cast/layout',
+            themeEndpoint: '/cast/theme'
+        };
+
+        const defaultLayout = `
+<div class='np-shell'>
+  <div class='np-art-wrap'>
+    <img class='np-art' data-field='albumArtUrl' alt='Album art' />
+  </div>
+  <div class='np-main'>
+    <div class='np-kicker'>Now Playing</div>
+    <div class='np-title' data-field='trackTitle'></div>
+    <div class='np-subtitle' data-field='artist'></div>
+    <div class='np-meta' data-field='album'></div>
+    <div class='np-progress'>
+      <span class='np-time' data-field='currentPositionText'>0:00</span>
+      <div class='np-progress-track'><div class='np-progress-fill' data-field='progressFill'></div></div>
+      <span class='np-time' data-field='durationText'>0:00</span>
+    </div>
+    <div class='np-detail-grid'>
+      <div><span class='np-label'>Codec</span><span data-field='audioCodec'></span></div>
+      <div><span class='np-label'>Quality</span><span data-field='qualityLevel'></span></div>
+      <div><span class='np-label'>Format</span><span data-field='properties'></span></div>
+      <div><span class='np-label'>Queue</span><span data-field='position'></span></div>
+      <div><span class='np-label'>Next</span><span data-field='next'></span></div>
+      <div><span class='np-label'>Genre</span><span data-field='genre'></span></div>
+    </div>
+  </div>
+</div>`;
+
+        const defaultTheme = `
+:root {
+  --np-bg: #090a0f;
+  --np-surface: rgba(24, 27, 38, 0.82);
+  --np-text: #f5f7ff;
+  --np-text-muted: #adb3ca;
+  --np-accent: #1db954;
+}
+
+.np-shell {
+  display: grid;
+  grid-template-columns: minmax(320px, 36vw) 1fr;
+  gap: 4vw;
+  height: 100vh;
+  padding: 5vh 5vw;
+  box-sizing: border-box;
+}
+
+.np-art-wrap { display: flex; align-items: center; justify-content: center; }
+
+.np-art {
+  width: min(34vw, 520px);
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 22px;
+  box-shadow: 0 26px 70px rgba(0,0,0,0.5);
+}
+
+.np-main { align-self: center; }
+.np-kicker { text-transform: uppercase; letter-spacing: .15em; color: var(--np-text-muted); font-size: 1.2vw; }
+.np-title { font-size: 4.2vw; font-weight: 800; line-height: 1.05; margin-top: .4rem; }
+.np-subtitle { margin-top: .7rem; font-size: 2vw; color: var(--np-text-muted); }
+.np-meta { margin-top: .4rem; font-size: 1.45vw; color: var(--np-text-muted); }
+
+.np-progress {
+  margin-top: 2.8rem;
+  display: grid;
+  grid-template-columns: 80px 1fr 80px;
+  gap: 1rem;
+  align-items: center;
+}
+
+.np-progress-track {
+  background: rgba(255,255,255,.16);
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.np-progress-fill {
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, var(--np-accent), #63e29f);
+}
+
+.np-time { font-variant-numeric: tabular-nums; color: var(--np-text-muted); }
+
+.np-detail-grid {
+  margin-top: 2.1rem;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem 2rem;
+}
+
+.np-label {
+  display: block;
+  font-size: .95vw;
+  color: var(--np-text-muted);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+.np-detail-grid span[data-field] {
+  display: block;
+  margin-top: .2rem;
+  font-size: 1.2vw;
+}
+`;
+
+        function setBackground(artUrl) {
+            if (!artUrl) {
+                return;
+            }
+
+            const bust = `${artUrl}?${Date.now()}`;
+            document.getElementById('receiverVideoElement').style.backgroundImage = `linear-gradient(rgba(5, 7, 11, 0.58), rgba(5, 7, 11, 0.78)),url("${bust}")`;
+            document.getElementById('backdrop').style.backgroundImage = `url("${bust}")`;
+        }
+
+        function formatSeconds(value) {
+            if (!value || value < 0) {
+                return '0:00';
+            }
+
+            const whole = Math.floor(value);
+            const h = Math.floor(whole / 3600);
+            const m = Math.floor((whole % 3600) / 60);
+            const s = whole % 60;
+
+            if (h > 0) {
+                return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+            }
+
+            return `${m}:${String(s).padStart(2, '0')}`;
+        }
+
+        function readMediaState(request) {
+            state.media = request.media || {};
+            state.customData = state.media.customData || {};
+
+            state.layoutEndpoint = state.customData.LayoutEndpoint || '/cast/layout';
+            state.themeEndpoint = state.customData.ThemeEndpoint || '/cast/theme';
+
+            state.durationSec = Number(state.media.duration || 0);
+            if (!state.durationSec && state.customData.DurationMs) {
+                state.durationSec = Number(state.customData.DurationMs) / 1000;
+            }
+
+            if (state.customData.CurrentPositionMs) {
+                state.currentTimeSec = Number(state.customData.CurrentPositionMs) / 1000;
+            }
+
+            const images = state.media.metadata && state.media.metadata.images ? state.media.metadata.images : [];
+            const artUrl = images.length > 0 ? images[0].url : '';
+            setBackground(artUrl);
+        }
+
+        function setField(name, value) {
+            const nodes = document.querySelectorAll(`[data-field='${name}']`);
+            nodes.forEach(node => {
+                if (name === 'albumArtUrl' && node.tagName === 'IMG') {
+                    node.src = value || '';
+                } else if (name === 'progressFill') {
+                    node.style.width = value || '0%';
+                } else {
+                    node.textContent = value || '';
+                }
+            });
+        }
+
+        function renderData() {
+            const metadata = state.media.metadata || {};
+            const custom = state.customData || {};
+            const images = metadata.images || [];
+            const artUrl = images.length > 0 ? images[0].url : '';
+            const durationText = custom.DurationText || formatSeconds(state.durationSec);
+            const currentText = formatSeconds(state.currentTimeSec);
+            const ratio = state.durationSec > 0 ? Math.min(100, Math.max(0, (state.currentTimeSec / state.durationSec) * 100)) : 0;
+
+            setField('trackTitle', metadata.title || custom.TrackTitle || 'Unknown title');
+            setField('artist', metadata.artist || custom.Artist || 'Unknown artist');
+            setField('album', metadata.albumName || custom.Album || '');
+            setField('albumArtist', metadata.albumArtist || custom.AlbumArtist || '');
+            setField('genre', custom.Genre || '');
+            setField('year', custom.Year || '');
+            setField('trackNumber', custom.TrackNumber || '');
+            setField('position', custom.Position || '');
+            setField('next', custom.Next || '');
+            setField('properties', custom.Properties || '');
+            setField('audioCodec', custom.AudioCodec || '');
+            setField('qualityLevel', custom.QualityLevel || '');
+            setField('durationText', durationText);
+            setField('currentPositionText', currentText);
+            setField('albumArtUrl', artUrl);
+            setField('progressFill', `${ratio.toFixed(2)}%`);
+        }
+
+        async function loadTheme() {
+            try {
+                const resp = await fetch(state.themeEndpoint, { cache: 'no-store' });
+                if (!resp.ok) {
+                    console.log('Theme endpoint not available, using default theme');
+                    applyDefaultTheme();
+                    return;
+                }
+
+                const css = await resp.text();
+                let style = document.getElementById('dynamic-theme');
+                if (!style) {
+                    style = document.createElement('style');
+                    style.id = 'dynamic-theme';
+                    document.head.appendChild(style);
+                }
+
+                style.textContent = css;
+            } catch (err) {
+                console.log('Failed to load theme, using default:', err);
+                applyDefaultTheme();
+            }
+        }
+
+        function applyDefaultTheme() {
+            let style = document.getElementById('dynamic-theme');
+            if (!style) {
+                style = document.createElement('style');
+                style.id = 'dynamic-theme';
+                document.head.appendChild(style);
+            }
+            style.textContent = defaultTheme;
+        }
+
+        async function loadLayout() {
+            let html = defaultLayout;
+            try {
+                const resp = await fetch(state.layoutEndpoint, { cache: 'no-store' });
+                if (resp.ok) {
+                    html = await resp.text();
+                } else {
+                    console.log('Layout endpoint not available, using default layout');
+                }
+            } catch (err) {
+                console.log('Failed to load layout, using default:', err);
+            }
+
+            document.getElementById('skin-root').innerHTML = html;
+        }
+
+        playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
+            document.getElementById('splash').style.visibility = 'hidden';
+            readMediaState(request);
+            await loadTheme();
+            await loadLayout();
+            renderData();
+            return request;
+        });
+
+        const playerData = {};
+        const playerDataBinder = new cast.framework.ui.PlayerDataBinder(playerData);
+        playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
+            state.currentTimeSec = Number(e.value || 0);
+            renderData();
+        });
+
+        playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, event => {
+            const next = event.requestData && event.requestData.jump == 1;
+            const objToSender = {
+                type: next ? 'NEXT' : 'PREVIOUS',
+                message: next ? 'NEXT' : 'PREVIOUS'
+            };
+            context.sendCustomMessage(CHANNEL, undefined, objToSender);
+        });
+
+        context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
+            context.stop();
+        });
+
+        const options = new cast.framework.CastReceiverOptions();
+        options.customNamespaces = Object.assign({});
+        options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
+
+        context.start(options);
+    </script>
+</body>
+</html>
