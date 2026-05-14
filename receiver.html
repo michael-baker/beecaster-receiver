@@ -232,17 +232,63 @@
             return String(h);
         }
 
-        function injectLayout(layoutHtml, themeCss) {
-            const hash = simpleHash(layoutHtml);
+        // Reset all BeeCaster event listeners so re-injected scripts start clean.
+        // Safe to call because the bootstrap itself never registers listeners —
+        // they are only registered by community layout scripts.
+        function clearLayoutListeners() {
+            Object.keys(eventListeners).forEach(key => { eventListeners[key] = []; });
+        }
+
+        // Extract <script> tags from layoutHtml and execute them as real DOM script
+        // elements (innerHTML never executes scripts). Also executes the standalone
+        // layoutScript string (customData.LayoutScript) if provided.
+        function executeLayoutScripts(layoutHtml, standaloneScript) {
+            // Clean up script elements from any previous layout injection
+            document.querySelectorAll('script[data-beecaster-layout]').forEach(el => el.remove());
+
+            // Re-execute inline <script> blocks found inside the layout HTML
+            if (layoutHtml) {
+                const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+                let match;
+                let idx = 0;
+                while ((match = scriptRegex.exec(layoutHtml)) !== null) {
+                    const src = match[1].trim();
+                    if (src) {
+                        const el = document.createElement('script');
+                        el.setAttribute('data-beecaster-layout', 'inline-' + idx++);
+                        el.textContent = src;
+                        document.head.appendChild(el);
+                        console.log('[SCRIPT] Executed inline layout script #' + idx);
+                    }
+                }
+            }
+
+            // Execute the standalone LayoutScript delivered in customData
+            if (standaloneScript && standaloneScript.trim()) {
+                const el = document.createElement('script');
+                el.setAttribute('data-beecaster-layout', 'standalone');
+                el.textContent = standaloneScript;
+                document.head.appendChild(el);
+                console.log('[SCRIPT] Executed LayoutScript (' + standaloneScript.length + ' chars)');
+            }
+        }
+
+        function injectLayout(layoutHtml, themeCss, layoutScript) {
+            const hash = simpleHash((layoutHtml || '') + (layoutScript || ''));
             if (hash && hash === lastLayoutHtmlHash) {
                 console.log('[LAYOUT] Same layout content, skipping re-inject');
                 return;
             }
             lastLayoutHtmlHash = hash;
 
-            if (layoutHtml) {
-                document.getElementById('layout-container').innerHTML = layoutHtml;
-                console.log('[LAYOUT] Injected layout HTML (' + layoutHtml.length + ' chars)');
+            // Strip <script> tags before innerHTML — we execute them explicitly below
+            const htmlWithoutScripts = layoutHtml
+                ? layoutHtml.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+                : null;
+
+            if (htmlWithoutScripts) {
+                document.getElementById('layout-container').innerHTML = htmlWithoutScripts;
+                console.log('[LAYOUT] Injected layout HTML (' + htmlWithoutScripts.length + ' chars)');
             } else {
                 console.warn('[LAYOUT] No LayoutHtml provided in customData');
             }
@@ -260,6 +306,8 @@
                 console.warn('[THEME] No ThemeCss provided in customData');
             }
 
+            clearLayoutListeners();
+            executeLayoutScripts(layoutHtml, layoutScript);
             emit('LAYOUT_READY', {});
             updateDebugOverlay();
         }
@@ -325,8 +373,8 @@
 
                 console.log(`[CONFIG] CustomData fields: ${Object.keys(state.customData).length}`);
 
-                // Inject layout/theme — content is embedded in customData by the sender
-                injectLayout(state.customData.LayoutHtml || null, state.customData.ThemeCss || null);
+                // Inject layout/theme/script — all content is embedded in customData by the sender
+                injectLayout(state.customData.LayoutHtml || null, state.customData.ThemeCss || null, state.customData.LayoutScript || null);
 
                 const metadata = state.media.metadata || {};
                 const images = metadata.images || [];
