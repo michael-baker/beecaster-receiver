@@ -221,8 +221,15 @@
             state.media = request.media || {};
             state.customData = state.media.customData || {};
 
-            state.layoutEndpoint = state.customData.LayoutEndpoint || '/cast/layout';
-            state.themeEndpoint = state.customData.ThemeEndpoint || '/cast/theme';
+            // Construct absolute URLs from MediaBaseUrl if provided
+            const baseUrl = state.customData.MediaBaseUrl || '';
+            console.log('MediaBaseUrl from customData:', baseUrl);
+
+            state.layoutEndpoint = state.customData.LayoutEndpoint || (baseUrl ? baseUrl + 'cast/layout' : '/cast/layout');
+            state.themeEndpoint = state.customData.ThemeEndpoint || (baseUrl ? baseUrl + 'cast/theme' : '/cast/theme');
+
+            console.log('Layout endpoint:', state.layoutEndpoint);
+            console.log('Theme endpoint:', state.themeEndpoint);
 
             state.durationSec = Number(state.media.duration || 0);
             if (!state.durationSec && state.customData.DurationMs) {
@@ -315,17 +322,25 @@
         async function loadLayout() {
             let html = defaultLayout;
             try {
-                const resp = await fetch(state.layoutEndpoint, { cache: 'no-store' });
+                console.log('Fetching layout from:', state.layoutEndpoint);
+                const resp = await fetch(state.layoutEndpoint, { cache: 'no-store', mode: 'cors' });
+                console.log('Layout response status:', resp.status);
                 if (resp.ok) {
                     html = await resp.text();
+                    console.log('Layout loaded successfully, length:', html.length);
                 } else {
-                    console.log('Layout endpoint not available, using default layout');
+                    console.warn('Layout endpoint returned', resp.status, '- using default layout');
                 }
             } catch (err) {
-                console.log('Failed to load layout, using default:', err);
+                console.error('Failed to load layout, using default:', err);
             }
 
-            document.getElementById('skin-root').innerHTML = html;
+            const root = document.getElementById('skin-root');
+            // Only update if layout actually changed to prevent flashing
+            if (root.innerHTML !== html) {
+                root.innerHTML = html;
+                console.log('Layout DOM updated');
+            }
         }
 
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
@@ -342,6 +357,7 @@
             await loadLayout();
             renderData();
 
+            console.log('=== LOAD interceptor complete ===');
             return request;
         });
 
