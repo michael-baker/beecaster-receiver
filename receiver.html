@@ -1,125 +1,55 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>BeeCaster Receiver</title>
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <!-- Cast Debug Logger for on-device debugging -->
     <script src="//www.gstatic.com/cast/sdk/libs/devtools/debug_layer/caf_receiver_logger.js"></script>
     <style>
-        /* Base receiver styles */
-        body {
-            overflow: hidden;
-            margin: 0;
-            padding: 0;
-            background: linear-gradient(135deg, #3d2645 0%, #4a3052 50%, #5a4a6e 100%);
-        }
-
-        video {
-            position: absolute;
-            inset: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 0;
-            background-size: cover;
-            background-position: center;
-            filter: blur(14px) saturate(150%) hue-rotate(-10deg);
-            transform: scale(1.06);
-        }
-
-        #backdrop {
-            position: absolute;
-            inset: 0;
-            z-index: 1;
-            background-size: cover;
-            background-position: center;
-            opacity: 0.35;
-            filter: blur(42px) saturate(160%) hue-rotate(-10deg);
-            transform: scale(1.08);
-        }
-
-        #skin-root {
-            position: absolute;
-            inset: 0;
-            z-index: 2;
-        }
-
-        #splash {
-            position: absolute;
-            left: 50%;
-            top: 50%;
-            transform: translate(-50%, -50%);
-            color: #f5f7ff;
-            z-index: 3;
-            font-family: Segoe UI, Roboto, Arial, sans-serif;
-            font-size: 72px;
-            font-weight: 700;
-            letter-spacing: 0.03em;
-            text-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
-        }
-
-        #debug-overlay {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 10000;
-            background: rgba(0, 0, 0, 0.95);
-            color: #00ff00;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-            padding: 15px;
-            border: 3px solid #00ff00;
-            border-radius: 8px;
-            line-height: 1.6;
-            max-width: 450px;
-            box-shadow: 0 0 30px rgba(0, 255, 0, 0.5), inset 0 0 10px rgba(0, 255, 0, 0.1);
-            pointer-events: none;
-            overflow-y: auto;
-            max-height: 80vh;
-        }
-
-        #debug-overlay div {
-            margin: 4px 0;
-        }
-
-        .debug-label {
-            color: #ffaa00;
-            font-weight: bold;
-        }
+        *{margin:0;padding:0;box-sizing:border-box}body{overflow:hidden;background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        video{position:fixed;inset:0;width:100%;height:100%;z-index:0;background-size:cover;background-position:center;filter:blur(14px) saturate(150%) hue-rotate(-10deg);transform:scale(1.06);pointer-events:none}
+        #backdrop{position:fixed;inset:0;z-index:1;background-size:cover;background-position:center;opacity:0.35;filter:blur(42px) saturate(160%) hue-rotate(-10deg);transform:scale(1.08);pointer-events:none}
+        #layout-container{position:fixed;inset:0;z-index:2;overflow:hidden}
+        #debug-overlay{position:fixed;top:20px;right:20px;z-index:10000;background:rgba(0,0,0,0.95);color:#0f0;font-family:'Courier New',monospace;font-size:14px;padding:15px;border:3px solid #0f0;border-radius:8px;line-height:1.6;max-width:450px;box-shadow:0 0 30px rgba(0,255,0,0.5);pointer-events:none;overflow-y:auto;max-height:80vh}
+        #debug-overlay div{margin:4px 0}.debug-label{color:#fa0;font-weight:bold}
     </style>
 </head>
 <body>
     <video id="receiverVideoElement"></video>
     <div id="backdrop"></div>
-    <div id="skin-root"></div>
-    <div id="splash">BeeCaster</div>
+    <div id="layout-container"></div>
     <div id="debug-overlay">
         <div><span class="debug-label">BEECASTER DEBUG</span></div>
         <div>LOAD: <span id="debug-load-count">0</span></div>
         <div>Layout: <span id="debug-layout-count">0</span></div>
         <div>Theme: <span id="debug-theme-count">0</span></div>
         <div>ContentID: <span id="debug-content-id">—</span></div>
+        <div>BaseURL: <span id="debug-base-url">—</span></div>
         <div>Fields: <span id="debug-fields">—</span></div>
         <div>State: <span id="debug-state">idle</span></div>
     </div>
-
     <script>
+        // ============================================================================
+        // BEECASTER BOOTSTRAP RECEIVER - GitHub Hosted Version
+        // ============================================================================
+        // This receiver is hosted on GitHub. It fetches layout/theme from the
+        // local MusicBee plugin web server using MediaBaseUrl from customData.
+        // ============================================================================
+
         const CHANNEL = 'urn:x-cast:com.google.cast.media';
         const LOG_TAG = 'BeeCaster';
-        
-        // Initialize Cast Debug Logger (if device is registered)
+
         let castDebugLogger = null;
         try {
             castDebugLogger = cast.debug.CastDebugLogger.getInstance();
         } catch (e) {
-            console.log('CastDebugLogger not available - device may not be registered in Cast SDK Developer Console');
+            console.log('CastDebugLogger not available');
         }
-        
+
         const context = cast.framework.CastReceiverContext.getInstance();
         const playerManager = context.getPlayerManager();
-        
-        // Enable debug logger on READY event
+
         if (castDebugLogger) {
             context.addEventListener(cast.framework.system.EventType.READY, () => {
                 if (!castDebugLogger.debugOverlayElement_) {
@@ -128,8 +58,6 @@
                     castDebugLogger.info(LOG_TAG, 'Cast Debug Logger enabled');
                 }
             });
-            
-            // Log player events for debugging
             castDebugLogger.loggerLevelByEvents = {
                 'cast.framework.events.category.CORE': cast.framework.LoggerLevel.INFO,
                 'cast.framework.events.EventType.MEDIA_STATUS': cast.framework.LoggerLevel.DEBUG
@@ -143,281 +71,185 @@
             cast.framework.messages.Command.QUEUE_PREV
         );
 
+        // ============================================================================
+        // STATE
+        // ============================================================================
         const state = {
             media: {},
             customData: {},
             currentTimeSec: 0,
             durationSec: 0,
+            playbackState: 'STOPPED',
+            mediaBaseUrl: '',
             layoutEndpoint: '/cast/layout',
             themeEndpoint: '/cast/theme'
         };
 
-        const defaultLayout = `
-<div class='np-shell'>
-  <div class='np-art-wrap'>
-    <img class='np-art' data-field='albumArtUrl' alt='Album art' />
-  </div>
-  <div class='np-main'>
-    <div class='np-kicker'>Now Playing</div>
-    <div class='np-title' data-field='trackTitle'></div>
-    <div class='np-subtitle' data-field='artist'></div>
-    <div class='np-meta' data-field='album'></div>
-    <div class='np-progress'>
-      <span class='np-time' data-field='currentPositionText'>0:00</span>
-      <div class='np-progress-track'><div class='np-progress-fill' data-field='progressFill'></div></div>
-      <span class='np-time' data-field='durationText'>0:00</span>
-    </div>
-    <div class='np-detail-grid'>
-      <div><span class='np-label'>Codec</span><span data-field='audioCodec'></span></div>
-      <div><span class='np-label'>Quality</span><span data-field='qualityLevel'></span></div>
-      <div><span class='np-label'>Format</span><span data-field='properties'></span></div>
-      <div><span class='np-label'>Queue</span><span data-field='position'></span></div>
-      <div><span class='np-label'>Next</span><span data-field='next'></span></div>
-      <div><span class='np-label'>Genre</span><span data-field='genre'></span></div>
-    </div>
-  </div>
-</div>`;
+        let lastKnownPositionSec = 0;
+        let lastKnownPositionTimestamp = 0;
+        let isAnimatingProgress = false;
+        let animationFrameId = null;
 
-        const defaultTheme = `
-:root {
-  --np-bg: #090a0f;
-  --np-surface: rgba(24, 27, 38, 0.82);
-  --np-text: #f5f7ff;
-  --np-text-muted: #adb3ca;
-  --np-accent: #1db954;
-}
-
-.np-shell {
-  display: grid;
-  grid-template-columns: minmax(320px, 36vw) 1fr;
-  gap: 4vw;
-  height: 100vh;
-  padding: 5vh 5vw;
-  box-sizing: border-box;
-}
-
-.np-art-wrap { display: flex; align-items: center; justify-content: center; }
-
-.np-art {
-  width: min(34vw, 520px);
-  aspect-ratio: 1 / 1;
-  object-fit: cover;
-  border-radius: 22px;
-  box-shadow: 0 26px 70px rgba(0,0,0,0.5);
-}
-
-.np-main { align-self: center; }
-.np-kicker { text-transform: uppercase; letter-spacing: .15em; color: var(--np-text-muted); font-size: 1.2vw; }
-.np-title { font-size: 4.2vw; font-weight: 800; line-height: 1.05; margin-top: .4rem; }
-.np-subtitle { margin-top: .7rem; font-size: 2vw; color: var(--np-text-muted); }
-.np-meta { margin-top: .4rem; font-size: 1.45vw; color: var(--np-text-muted); }
-
-.np-progress {
-  margin-top: 2.8rem;
-  display: grid;
-  grid-template-columns: 80px 1fr 80px;
-  gap: 1rem;
-  align-items: center;
-}
-
-.np-progress-track {
-  background: rgba(255,255,255,.16);
-  height: 8px;
-  border-radius: 999px;
-  overflow: hidden;
-}
-
-.np-progress-fill {
-  width: 0%;
-  height: 100%;
-  background: linear-gradient(90deg, var(--np-accent), #63e29f);
-}
-
-.np-time { font-variant-numeric: tabular-nums; color: var(--np-text-muted); }
-
-.np-detail-grid {
-  margin-top: 2.1rem;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem 2rem;
-}
-
-.np-label {
-  display: block;
-  font-size: .95vw;
-  color: var(--np-text-muted);
-  text-transform: uppercase;
-  letter-spacing: .08em;
-}
-
-.np-detail-grid span[data-field] {
-  display: block;
-  margin-top: .2rem;
-  font-size: 1.2vw;
-}
-`;
-
-        // Track last art URL to prevent redundant background updates
+        let loadCount = 0;
+        let layoutFetchCount = 0;
+        let themeFetchCount = 0;
+        let lastLoadTimestamp = 0;
+        let isLoadInProgress = false;
+        let lastContentId = '';
         let lastBackgroundUrl = null;
+        let lastRenderTime = 0;
+        let lastMediaBaseUrl = '';
 
-        function setBackground(artUrl) {
-            if (!artUrl) {
-                console.log('No album art URL provided');
-                return;
+        const LOAD_DEBOUNCE_MS = 500;
+        const RENDER_DEBOUNCE_MS = 500;
+
+        const eventListeners = {
+            'LOAD': [], 'PLAY': [], 'PAUSE': [], 'STOP': [],
+            'TIME_UPDATE': [], 'STATE_CHANGE': [], 'LAYOUT_READY': []
+        };
+
+        // ============================================================================
+        // BEECASTER PUBLIC API
+        // ============================================================================
+        window.BeeCaster = {
+            on(eventType, callback) {
+                if (eventListeners[eventType]) {
+                    eventListeners[eventType].push(callback);
+                    console.log(`[API] Listener registered for ${eventType}`);
+                } else {
+                    console.warn(`[API] Unknown event type: ${eventType}`);
+                }
+            },
+            onStateChange(callback) {
+                this.on('STATE_CHANGE', callback);
+            },
+            getState() {
+                return { ...state };
+            },
+            updateField(fieldName, value) {
+                const fields = document.querySelectorAll(`[data-field="${fieldName}"]`);
+                fields.forEach(node => {
+                    if (fieldName === 'progressFill') {
+                        node.style.width = value || '0%';
+                    } else if (fieldName === 'albumArtUrl') {
+                        node.src = value || '';
+                    } else {
+                        const newText = value || '';
+                        if (node.textContent !== newText) {
+                            node.textContent = newText;
+                        }
+                    }
+                });
             }
+        };
 
-            console.log(`setBackground called with: ${artUrl}`);
-            console.log(`Last background URL was: ${lastBackgroundUrl}`);
-
-            // Skip if this is the same URL we already have
-            if (lastBackgroundUrl === artUrl) {
-                console.log('Background already set to this URL, skipping');
-                return;
+        // ============================================================================
+        // INTERNAL FUNCTIONS
+        // ============================================================================
+        function emit(eventType, data) {
+            if (eventListeners[eventType]) {
+                eventListeners[eventType].forEach(cb => {
+                    try { cb(data); } catch (e) {
+                        console.error(`Error in ${eventType} listener:`, e);
+                    }
+                });
             }
+        }
 
-            console.log('Setting NEW background image:', artUrl);
-            const videoElement = document.getElementById('receiverVideoElement');
-            const backdropElement = document.getElementById('backdrop');
-
-            // Preload image before setting to prevent flash
-            const img = new Image();
-            img.onload = () => {
-                console.log('Background image loaded successfully');
-                videoElement.style.backgroundImage = `linear-gradient(135deg, rgba(61, 38, 69, 0.75) 0%, rgba(74, 48, 82, 0.65) 50%, rgba(90, 74, 110, 0.75) 100%),url("${artUrl}")`;
-                backdropElement.style.backgroundImage = `url("${artUrl}")`;
-                lastBackgroundUrl = artUrl;
-                console.log('Background updated to:', artUrl);
-            };
-            img.onerror = () => {
-                console.error('Failed to load background image:', artUrl);
-                lastBackgroundUrl = null;
-            };
-            img.src = artUrl;
+        function updateState(updates) {
+            Object.assign(state, updates);
+            emit('STATE_CHANGE', { ...state });
+            updateDebugOverlay();
         }
 
         function formatSeconds(value) {
-            if (!value || value < 0) {
-                return '0:00';
-            }
-
+            if (!value || value < 0) return '0:00';
             const whole = Math.floor(value);
             const h = Math.floor(whole / 3600);
             const m = Math.floor((whole % 3600) / 60);
             const s = whole % 60;
-
             if (h > 0) {
                 return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
             }
-
             return `${m}:${String(s).padStart(2, '0')}`;
         }
 
-        function readMediaState(request) {
-            state.media = request.media || {};
-            state.customData = state.media.customData || {};
+        // ============================================================================
+        // PROGRESS ANIMATION
+        // ============================================================================
+        function updateProgressSmooth() {
+            if (!isAnimatingProgress || state.durationSec <= 0) return;
+            const now = Date.now();
+            const elapsedMs = now - lastKnownPositionTimestamp;
+            const elapsedSec = elapsedMs / 1000;
+            const smoothPosition = lastKnownPositionSec + elapsedSec;
+            const ratio = Math.min(100, Math.max(0, (smoothPosition / state.durationSec) * 100));
 
-            // Construct absolute URLs from MediaBaseUrl if provided
-            const baseUrl = state.customData.MediaBaseUrl || '';
-            console.log('MediaBaseUrl from customData:', baseUrl);
+            window.BeeCaster.updateField('progressFill', `${ratio.toFixed(2)}%`);
 
-            state.layoutEndpoint = state.customData.LayoutEndpoint || (baseUrl ? baseUrl + 'cast/layout' : '/cast/layout');
-            state.themeEndpoint = state.customData.ThemeEndpoint || (baseUrl ? baseUrl + 'cast/theme' : '/cast/theme');
-
-            console.log('Layout endpoint:', state.layoutEndpoint);
-            console.log('Theme endpoint:', state.themeEndpoint);
-
-            state.durationSec = Number(state.media.duration || 0);
-            if (!state.durationSec && state.customData.DurationMs) {
-                state.durationSec = Number(state.customData.DurationMs) / 1000;
+            const now2 = Date.now();
+            if (now2 - lastRenderTime >= RENDER_DEBOUNCE_MS) {
+                const currentText = formatSeconds(smoothPosition);
+                window.BeeCaster.updateField('currentPositionText', currentText);
+                lastRenderTime = now2;
             }
 
-            if (state.customData.CurrentPositionMs) {
-                state.currentTimeSec = Number(state.customData.CurrentPositionMs) / 1000;
+            if (smoothPosition >= state.durationSec) {
+                isAnimatingProgress = false;
+                return;
+            }
+
+            animationFrameId = requestAnimationFrame(updateProgressSmooth);
+        }
+
+        function startProgressAnimation(positionSec, timestamp) {
+            lastKnownPositionSec = positionSec;
+            lastKnownPositionTimestamp = timestamp;
+            isAnimatingProgress = true;
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            updateProgressSmooth();
+        }
+
+        function stopProgressAnimation() {
+            isAnimatingProgress = false;
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
             }
         }
 
-        function setField(name, value) {
-            const nodes = document.querySelectorAll(`[data-field='${name}']`);
-            nodes.forEach(node => {
-                if (name === 'albumArtUrl' && node.tagName === 'IMG') {
-                    // Only update image if URL actually changed to prevent reload flash
-                    const newSrc = value || '';
-                    if (node.src !== newSrc && node.getAttribute('data-current-src') !== newSrc) {
-                        console.log('Updating album art:', newSrc);
-                        node.setAttribute('data-current-src', newSrc);
-                        node.src = newSrc;
-                    }
-                } else if (name === 'progressFill') {
-                    // Progress bar always updates
-                    node.style.width = value || '0%';
-                } else {
-                    // Only update text if it changed
-                    const newText = value || '';
-                    if (node.textContent !== newText) {
-                        node.textContent = newText;
-                    }
+        // ============================================================================
+        // ASSET LOADING
+        // ============================================================================
+        async function loadLayout() {
+            layoutFetchCount++;
+            console.log(`[LAYOUT] Fetching from: ${state.layoutEndpoint}`);
+            try {
+                const resp = await fetch(state.layoutEndpoint, { cache: 'no-store', mode: 'cors' });
+                if (!resp.ok) {
+                    console.warn(`[LAYOUT] Failed (${resp.status})`);
+                    return;
                 }
-            });
-        }
-
-        function renderData(fullUpdate = false) {
-            const metadata = state.media.metadata || {};
-            const custom = state.customData || {};
-            const images = metadata.images || [];
-            const artUrl = images.length > 0 ? images[0].url : '';
-
-            console.log(`renderData called: fullUpdate=${fullUpdate}, artUrl=${artUrl}`);
-
-            if (fullUpdate) {
-                console.log('CustomData contents:', custom);
-                console.log('AudioCodec:', custom.AudioCodec);
-                console.log('Properties:', custom.Properties);
-                console.log('Next:', custom.Next);
-            }
-
-            const durationText = custom.DurationText || formatSeconds(state.durationSec);
-            const currentText = formatSeconds(state.currentTimeSec);
-            const ratio = state.durationSec > 0 ? Math.min(100, Math.max(0, (state.currentTimeSec / state.durationSec) * 100)) : 0;
-
-            // Always update time-sensitive fields
-            setField('currentPositionText', currentText);
-            setField('progressFill', `${ratio.toFixed(2)}%`);
-
-            // Only update metadata fields on full update (track change)
-            if (fullUpdate) {
-                console.log('Full metadata update - updating all fields including album art');
-                setField('trackTitle', metadata.title || custom.TrackTitle || 'Unknown title');
-                setField('artist', metadata.artist || custom.Artist || 'Unknown artist');
-                setField('album', metadata.albumName || custom.Album || '');
-                setField('albumArtist', metadata.albumArtist || custom.AlbumArtist || '');
-                setField('genre', custom.Genre || '');
-                setField('year', custom.Year || '');
-                setField('trackNumber', custom.TrackNumber || '');
-                setField('position', custom.Position || '');
-                setField('next', custom.Next || '');
-                setField('properties', custom.Properties || '');
-                setField('audioCodec', custom.AudioCodec || '');
-                setField('qualityLevel', custom.QualityLevel || '');
-                setField('durationText', durationText);
-                setField('albumArtUrl', artUrl);
-
-                // Update background on track change
-                console.log('Calling setBackground from renderData with:', artUrl);
-                setBackground(artUrl);
+                const html = await resp.text();
+                const container = document.getElementById('layout-container');
+                container.innerHTML = html;
+                console.log('[LAYOUT] Loaded successfully');
+                emit('LAYOUT_READY', {});
+                updateDebugOverlay();
+            } catch (e) {
+                console.error('[LAYOUT] Error:', e);
             }
         }
 
         async function loadTheme() {
+            themeFetchCount++;
+            console.log(`[THEME] Fetching from: ${state.themeEndpoint}`);
             try {
-                themeFetchCount++;
-                console.log(`[THEME] Fetching theme (attempt #${themeFetchCount})`);
                 const resp = await fetch(state.themeEndpoint, { cache: 'no-store' });
                 if (!resp.ok) {
-                    console.log('Theme endpoint not available, using default theme');
-                    applyDefaultTheme();
+                    console.warn(`[THEME] Failed (${resp.status})`);
                     return;
                 }
-
                 const css = await resp.text();
                 let style = document.getElementById('dynamic-theme');
                 if (!style) {
@@ -425,115 +257,54 @@
                     style.id = 'dynamic-theme';
                     document.head.appendChild(style);
                 }
-
                 style.textContent = css;
-            } catch (err) {
-                console.log('Failed to load theme, using default:', err);
-                applyDefaultTheme();
-            }
-        }
-
-        function applyDefaultTheme() {
-            let style = document.getElementById('dynamic-theme');
-            if (!style) {
-                style = document.createElement('style');
-                style.id = 'dynamic-theme';
-                document.head.appendChild(style);
-            }
-            style.textContent = defaultTheme;
-        }
-
-        let lastLoadedLayout = '';
-        let layoutLoadCount = 0;
-
-        async function loadLayout() {
-            layoutFetchCount++;
-            console.log(`=== loadLayout called (count: ${layoutFetchCount}) ===`);
-
-            let html = defaultLayout;
-            try {
-                console.log(`[LAYOUT] Fetching layout (attempt #${layoutFetchCount}) from:`, state.layoutEndpoint);
-                const resp = await fetch(state.layoutEndpoint, { cache: 'no-store', mode: 'cors' });
-                console.log('Layout response status:', resp.status);
-                if (resp.ok) {
-                    html = await resp.text();
-                    console.log('Layout loaded successfully, length:', html.length);
-                } else {
-                    console.warn('Layout endpoint returned', resp.status, '- using default layout');
-                }
-            } catch (err) {
-                console.error('Failed to load layout, using default:', err);
-            }
-
-            const root = document.getElementById('skin-root');
-            // Only update if layout actually changed to prevent flashing
-            if (lastLoadedLayout !== html) {
-                console.log('Layout changed, updating DOM');
-                root.innerHTML = html;
-                lastLoadedLayout = html;
-                console.log('Layout DOM updated');
-            } else {
-                console.log('Layout unchanged, skipping DOM update');
-            }
-        }
-
-        let loadCount = 0;
-        let layoutFetchCount = 0;
-        let themeFetchCount = 0;
-        let isLoadInProgress = false;
-        let firstLoadComplete = false;
-        let lastLoadTimestamp = 0;
-        let lastContentId = '';
-        const LOAD_DEBOUNCE_MS = 500; // Ignore LOAD events within 500ms of last one
-
-        // Real on-screen debug overlay update
-        function updateDebugOverlay() {
-            try {
-                document.getElementById('debug-load-count').textContent = loadCount;
-                document.getElementById('debug-layout-count').textContent = layoutFetchCount;
-                document.getElementById('debug-theme-count').textContent = themeFetchCount;
-                
-                const shortId = lastContentId ? lastContentId.substring(0, 16) : '—';
-                document.getElementById('debug-content-id').textContent = shortId;
-                
-                const metadataFields = Object.keys(state.customData)
-                    .filter(k => k.match(/AudioCodec|QualityLevel|Properties|Genre/))
-                    .length;
-                document.getElementById('debug-fields').textContent = metadataFields > 0 ? `${metadataFields} ✓` : '0';
-                
-                const stateText = isLoadInProgress ? 'LOADING' : (firstLoadComplete ? 'PLAYING' : 'INIT');
-                document.getElementById('debug-state').textContent = stateText;
+                console.log('[THEME] Loaded successfully');
+                updateDebugOverlay();
             } catch (e) {
-                console.error('Debug overlay update failed:', e);
+                console.error('[THEME] Error:', e);
             }
         }
-        
-        // Update overlay periodically
-        setInterval(updateDebugOverlay, 500);
 
+        // ============================================================================
+        // BACKGROUND IMAGE
+        // ============================================================================
+        function setBackground(artUrl) {
+            if (!artUrl) return;
+            if (lastBackgroundUrl === artUrl) return;
+
+            const videoElement = document.getElementById('receiverVideoElement');
+            const backdropElement = document.getElementById('backdrop');
+
+            const img = new Image();
+            img.onload = () => {
+                videoElement.style.backgroundImage = `linear-gradient(135deg, rgba(61, 38, 69, 0.75) 0%, rgba(74, 48, 82, 0.65) 50%, rgba(90, 74, 110, 0.75) 100%), url("${artUrl}")`;
+                backdropElement.style.backgroundImage = `url("${artUrl}")`;
+                lastBackgroundUrl = artUrl;
+            };
+            img.onerror = () => {
+                console.error('Failed to load background:', artUrl);
+                lastBackgroundUrl = null;
+            };
+            img.src = artUrl;
+        }
+
+        // ============================================================================
+        // CAST MESSAGE INTERCEPTOR - LOAD HANDLER
+        // ============================================================================
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
             loadCount++;
             const now = Date.now();
             const timeSinceLastLoad = now - lastLoadTimestamp;
 
-            const logMsg = `=== LOAD interceptor #${loadCount} === Time since last: ${timeSinceLastLoad}ms`;
-            console.log(logMsg);
-            if (castDebugLogger) castDebugLogger.info(LOG_TAG, logMsg);
-            console.log('Timestamp:', new Date().toISOString());
-            console.log('First load complete:', firstLoadComplete);
+            console.log(`=== LOAD #${loadCount} === Time since last: ${timeSinceLastLoad}ms`);
 
-            // Debounce rapid LOAD events
             if (timeSinceLastLoad < LOAD_DEBOUNCE_MS && loadCount > 1) {
-                const skipMsg = `LOAD event too soon (${timeSinceLastLoad}ms), ignoring as duplicate`;
-                console.warn(skipMsg);
-                if (castDebugLogger) castDebugLogger.warn(LOG_TAG, skipMsg);
+                console.warn(`LOAD too soon, ignoring`);
                 return request;
             }
 
             if (isLoadInProgress) {
-                const inProgressMsg = 'LOAD already in progress, ignoring duplicate call';
-                console.warn(inProgressMsg);
-                if (castDebugLogger) castDebugLogger.warn(LOG_TAG, inProgressMsg);
+                console.warn('LOAD in progress, ignoring');
                 return request;
             }
 
@@ -542,75 +313,98 @@
 
             try {
                 lastContentId = request.media?.contentId || '';
-                console.log('Media info:', request.media);
-                console.log('Content ID:', lastContentId);
-                console.log('Content Type:', request.media?.contentType);
-                console.log('Stream Type:', request.media?.streamType);
-                const customDataKeys = Object.keys(request.media?.customData || {});
-                console.log('Custom Data keys:', customDataKeys);
-                if (castDebugLogger) {
-                    castDebugLogger.debug(LOG_TAG, `Content ID: ${lastContentId.substring(0, 30)}`);
-                    castDebugLogger.debug(LOG_TAG, `Custom Data fields: ${customDataKeys.length}`);
-                }
-                
-                if (customDataKeys.length > 0) {
-                    customDataKeys.forEach(key => {
-                        if (request.media.customData[key]) {
-                            const fieldMsg = `${key}: ${String(request.media.customData[key]).substring(0, 40)}`;
-                            console.log(`  ${fieldMsg}`);
-                            if (castDebugLogger && key.match(/AudioCodec|QualityLevel|Properties|Genre/)) {
-                                castDebugLogger.debug(LOG_TAG, fieldMsg);
-                            }
-                        }
-                    });
+                state.media = request.media || {};
+                state.customData = state.media.customData || {};
+
+                // Extract MediaBaseUrl from customData and construct endpoints
+                state.mediaBaseUrl = (state.customData.MediaBaseUrl || '').trim();
+
+                // Ensure trailing slash
+                if (state.mediaBaseUrl && !state.mediaBaseUrl.endsWith('/')) {
+                    state.mediaBaseUrl += '/';
                 }
 
-                document.getElementById('splash').style.visibility = 'hidden';
-                readMediaState(request);
+                // Fallback to localhost if not provided
+                if (!state.mediaBaseUrl) {
+                    state.mediaBaseUrl = 'http://localhost:8080/';
+                    console.warn('[CONFIG] No MediaBaseUrl in customData, using localhost fallback');
+                }
 
-                // Extract album art URL for background
-                const images = request.media?.metadata?.images || [];
+                // Construct endpoints using MediaBaseUrl
+                state.layoutEndpoint = state.customData.LayoutEndpoint || `${state.mediaBaseUrl}cast/layout`;
+                state.themeEndpoint = state.customData.ThemeEndpoint || `${state.mediaBaseUrl}cast/theme`;
+
+                console.log(`[CONFIG] MediaBaseUrl: ${state.mediaBaseUrl}`);
+                console.log(`[CONFIG] Layout endpoint: ${state.layoutEndpoint}`);
+                console.log(`[CONFIG] Theme endpoint: ${state.themeEndpoint}`);
+                console.log(`[CONFIG] CustomData fields: ${Object.keys(state.customData).length}`);
+
+                const metadata = state.media.metadata || {};
+                const images = metadata.images || [];
                 const artUrl = images.length > 0 ? images[0].url : '';
-                console.log('Album art URL from metadata:', artUrl);
 
-                // Only load theme/layout on first load or if endpoints changed
-                if (!firstLoadComplete) {
-                    console.log('First load - loading theme and layout');
-                    await loadTheme();
-                    await loadLayout();
+                updateState({
+                    media: state.media,
+                    customData: state.customData,
+                    durationSec: state.media.duration || 0
+                });
+
+                // Update all UI fields
+                window.BeeCaster.updateField('trackTitle', metadata.title || state.customData.TrackTitle || 'Unknown');
+                window.BeeCaster.updateField('artist', metadata.artist || state.customData.Artist || 'Unknown');
+                window.BeeCaster.updateField('album', metadata.albumName || state.customData.Album || '');
+                window.BeeCaster.updateField('albumArtist', metadata.albumArtist || state.customData.AlbumArtist || '');
+                window.BeeCaster.updateField('genre', state.customData.Genre || '');
+                window.BeeCaster.updateField('year', state.customData.Year || '');
+                window.BeeCaster.updateField('trackNumber', state.customData.TrackNumber || '');
+                window.BeeCaster.updateField('position', state.customData.Position || '');
+                window.BeeCaster.updateField('next', state.customData.Next || '');
+                window.BeeCaster.updateField('properties', state.customData.Properties || '');
+                window.BeeCaster.updateField('audioCodec', state.customData.AudioCodec || '');
+                window.BeeCaster.updateField('qualityLevel', state.customData.QualityLevel || '');
+                window.BeeCaster.updateField('durationText', formatSeconds(state.durationSec));
+                window.BeeCaster.updateField('albumArtUrl', artUrl);
+
+                setBackground(artUrl);
+
+                // Load layout and theme on first load or if MediaBaseUrl changed
+                if (!firstLoadComplete || lastMediaBaseUrl !== state.mediaBaseUrl) {
                     firstLoadComplete = true;
-
-                    // Wait for DOM to be ready before rendering on first load
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                } else {
-                    console.log('Subsequent load - skipping theme/layout reload');
+                    lastMediaBaseUrl = state.mediaBaseUrl;
+                    await Promise.all([loadLayout(), loadTheme()]);
                 }
 
-                // renderData will handle setting the background
-                renderData(true); // Full update on track load
-
-                console.log('=== LOAD interceptor complete ===');
-                if (castDebugLogger) castDebugLogger.info(LOG_TAG, `LOAD complete. Fields populated: ${Object.keys(state.customData).length}`);
-                updateDebugOverlay();
+                emit('LOAD', { contentId: lastContentId, customData: state.customData });
+                console.log('=== LOAD complete ===');
                 updateDebugOverlay();
             } catch (error) {
-                console.error('Error in LOAD interceptor:', error);
+                console.error('Error in LOAD:', error);
             } finally {
                 isLoadInProgress = false;
             }
 
-            // Return the original request to allow default processing
             return request;
         });
 
+        // ============================================================================
+        // PLAYER STATE SYNCHRONIZATION
+        // ============================================================================
         const playerData = {};
         const playerDataBinder = new cast.framework.ui.PlayerDataBinder(playerData);
         playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
+            const now = Date.now();
+            const timeSinceLastRender = now - lastRenderTime;
             state.currentTimeSec = Number(e.value || 0);
-            renderData(false); // Time-only update, no metadata refresh
+            if (timeSinceLastRender >= RENDER_DEBOUNCE_MS) {
+                lastRenderTime = now;
+                startProgressAnimation(state.currentTimeSec, now);
+                emit('TIME_UPDATE', { currentTime: state.currentTimeSec, duration: state.durationSec });
+            }
         });
 
-        // Listen for player state changes
+        // ============================================================================
+        // PLAYER EVENT LISTENERS
+        // ============================================================================
         playerManager.addEventListener(cast.framework.events.EventType.PLAYER_LOAD_COMPLETE, () => {
             console.log('Player load complete');
         });
@@ -619,60 +413,71 @@
             console.error('Player error:', event.detailedErrorCode, event.error);
         });
 
-        // Log when media actually starts playing
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, () => {
-            console.log('Media is now PLAYING');
+            console.log('PLAYING');
+            state.playbackState = 'PLAYING';
+            startProgressAnimation(state.currentTimeSec, Date.now());
+            emit('PLAY', {});
+            updateState({ playbackState: 'PLAYING' });
         });
 
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, () => {
-            console.log('Media PAUSED');
+            console.log('PAUSED');
+            state.playbackState = 'PAUSED';
+            stopProgressAnimation();
+            emit('PAUSE', {});
+            updateState({ playbackState: 'PAUSED' });
+        });
+
+        playerManager.addEventListener(cast.framework.events.EventType.STOPPED, () => {
+            console.log('STOPPED');
+            state.playbackState = 'STOPPED';
+            stopProgressAnimation();
+            emit('STOP', {});
+            updateState({ playbackState: 'STOPPED' });
         });
 
         playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, event => {
             const next = event.requestData && event.requestData.jump == 1;
-            const objToSender = {
+            context.sendCustomMessage(CHANNEL, undefined, {
                 type: next ? 'NEXT' : 'PREVIOUS',
                 message: next ? 'NEXT' : 'PREVIOUS'
-            };
-            context.sendCustomMessage(CHANNEL, undefined, objToSender);
+            });
         });
 
-        context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
-            context.stop();
-        });
+        // ============================================================================
+        // DEBUG OVERLAY UPDATES
+        // ============================================================================
+        function updateDebugOverlay() {
+            try {
+                document.getElementById('debug-load-count').textContent = loadCount;
+                document.getElementById('debug-layout-count').textContent = layoutFetchCount;
+                document.getElementById('debug-theme-count').textContent = themeFetchCount;
+                document.getElementById('debug-content-id').textContent = lastContentId.substring(0, 20) || '—';
+                document.getElementById('debug-base-url').textContent = state.mediaBaseUrl.substring(0, 30) || '—';
+                document.getElementById('debug-fields').textContent = Object.keys(state.customData).length;
+                document.getElementById('debug-state').textContent = state.playbackState;
+            } catch (e) {}
+        }
+
+        // ============================================================================
+        // STARTUP
+        // ============================================================================
+        let firstLoadComplete = false;
+        console.log('[BOOTSTRAP] BeeCaster receiver initialized (GitHub hosted)');
+        console.log('[BOOTSTRAP] Receiver will fetch layout/theme from local web server');
+        console.log('[BOOTSTRAP] Expected customData.MediaBaseUrl: http://[host]:8080/');
+        console.log('[BOOTSTRAP] Waiting for LOAD message...');
 
         const options = new cast.framework.CastReceiverOptions();
         options.customNamespaces = Object.assign({});
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
-
-        // Configure media element for audio playback
         options.mediaElement = document.getElementById('receiverVideoElement');
-
-        // Enable detailed logs for debugging
         options.disableIdleTimeout = false;
-        options.maxInactivity = 3600; // 1 hour
-        options.debug = true; // Enable Cast SDK debugging
+        options.maxInactivity = 3600;
+        options.debug = true;
 
-        console.log('Starting Cast receiver context with options:', options);
         context.start(options);
-
-        // Set detailed logger level after context starts
-        try {
-            cast.framework.CastReceiverContext.getInstance().setLoggerLevel(cast.framework.LoggerLevel.DEBUG);
-            console.log('[DEBUG] Cast SDK logger level set to DEBUG');
-        } catch (e) {
-            console.log('[DEBUG] Could not set logger level:', e);
-        }
-
-        // Enable Cast Debug Logger overlay if available
-        if (cast.framework.CastDebugLogger) {
-            try {
-                cast.framework.CastDebugLogger.getInstance().setEnabled(true);
-                console.log('[DEBUG] Cast Debug Logger overlay enabled on receiver');
-            } catch (e) {
-                console.log('[DEBUG] Cast Debug Logger not available:', e);
-            }
-        }
     </script>
 </body>
 </html>
