@@ -329,11 +329,19 @@
         }
 
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
+            console.log('=== LOAD interceptor triggered ===');
+            console.log('Media info:', request.media);
+            console.log('Content ID:', request.media?.contentId);
+            console.log('Content Type:', request.media?.contentType);
+            console.log('Stream Type:', request.media?.streamType);
+            console.log('Custom Data:', request.media?.customData);
+
             document.getElementById('splash').style.visibility = 'hidden';
             readMediaState(request);
             await loadTheme();
             await loadLayout();
             renderData();
+
             return request;
         });
 
@@ -342,6 +350,24 @@
         playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
             state.currentTimeSec = Number(e.value || 0);
             renderData();
+        });
+
+        // Listen for player state changes
+        playerManager.addEventListener(cast.framework.events.EventType.PLAYER_LOAD_COMPLETE, () => {
+            console.log('Player load complete');
+        });
+
+        playerManager.addEventListener(cast.framework.events.EventType.ERROR, (event) => {
+            console.error('Player error:', event.detailedErrorCode, event.error);
+        });
+
+        // Log when media actually starts playing
+        playerManager.addEventListener(cast.framework.events.EventType.PLAYING, () => {
+            console.log('Media is now PLAYING');
+        });
+
+        playerManager.addEventListener(cast.framework.events.EventType.PAUSE, () => {
+            console.log('Media PAUSED');
         });
 
         playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, event => {
@@ -361,6 +387,14 @@
         options.customNamespaces = Object.assign({});
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
 
+        // Configure media element for audio playback
+        options.mediaElement = document.getElementById('receiverVideoElement');
+
+        // Enable detailed logs for debugging
+        options.disableIdleTimeout = false;
+        options.maxInactivity = 3600; // 1 hour
+
+        console.log('Starting Cast receiver context with options:', options);
         context.start(options);
     </script>
 </body>
