@@ -11,7 +11,7 @@
             overflow: hidden;
             margin: 0;
             padding: 0;
-            background: #090a0f;
+            background: linear-gradient(135deg, #3d2645 0%, #4a3052 50%, #5a4a6e 100%);
         }
 
         video {
@@ -22,7 +22,7 @@
             z-index: 0;
             background-size: cover;
             background-position: center;
-            filter: blur(14px) saturate(110%);
+            filter: blur(14px) saturate(150%) hue-rotate(-10deg);
             transform: scale(1.06);
         }
 
@@ -32,8 +32,8 @@
             z-index: 1;
             background-size: cover;
             background-position: center;
-            opacity: 0.28;
-            filter: blur(42px) saturate(130%);
+            opacity: 0.35;
+            filter: blur(42px) saturate(160%) hue-rotate(-10deg);
             transform: scale(1.08);
         }
 
@@ -213,7 +213,7 @@
             const img = new Image();
             img.onload = () => {
                 console.log('Background image loaded successfully');
-                videoElement.style.backgroundImage = `linear-gradient(rgba(5, 7, 11, 0.58), rgba(5, 7, 11, 0.78)),url("${artUrl}")`;
+                videoElement.style.backgroundImage = `linear-gradient(135deg, rgba(61, 38, 69, 0.75) 0%, rgba(74, 48, 82, 0.65) 50%, rgba(90, 74, 110, 0.75) 100%),url("${artUrl}")`;
                 backdropElement.style.backgroundImage = `url("${artUrl}")`;
                 lastBackgroundUrl = artUrl;
             };
@@ -359,6 +359,8 @@
             style.textContent = defaultTheme;
         }
 
+        let lastLoadedLayout = '';
+
         async function loadLayout() {
             let html = defaultLayout;
             try {
@@ -377,42 +379,74 @@
 
             const root = document.getElementById('skin-root');
             // Only update if layout actually changed to prevent flashing
-            if (root.innerHTML !== html) {
+            if (lastLoadedLayout !== html) {
+                console.log('Layout changed, updating DOM');
                 root.innerHTML = html;
+                lastLoadedLayout = html;
                 console.log('Layout DOM updated');
+            } else {
+                console.log('Layout unchanged, skipping DOM update');
             }
         }
 
+        let loadCount = 0;
+        let isLoadInProgress = false;
+        let firstLoadComplete = false;
+
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
-            console.log('=== LOAD interceptor triggered ===');
-            console.log('Media info:', request.media);
-            console.log('Content ID:', request.media?.contentId);
-            console.log('Content Type:', request.media?.contentType);
-            console.log('Stream Type:', request.media?.streamType);
-            console.log('Custom Data:', request.media?.customData);
+            loadCount++;
+            console.log(`=== LOAD interceptor triggered (call #${loadCount}) ===`);
+            console.log('Timestamp:', new Date().toISOString());
+            console.log('First load complete:', firstLoadComplete);
 
-            document.getElementById('splash').style.visibility = 'hidden';
-            readMediaState(request);
-
-            // Extract album art URL for background
-            const images = request.media?.metadata?.images || [];
-            const artUrl = images.length > 0 ? images[0].url : '';
-            console.log('Album art URL from metadata:', artUrl);
-
-            await loadTheme();
-            await loadLayout();
-
-            // Wait for DOM to be ready before rendering
-            await new Promise(resolve => setTimeout(resolve, 100));
-
-            // Set background before rendering to ensure it's ready
-            if (artUrl) {
-                setBackground(artUrl);
+            if (isLoadInProgress) {
+                console.warn('LOAD already in progress, ignoring duplicate call');
+                return request;
             }
 
-            renderData(true); // Full update on track load
+            isLoadInProgress = true;
 
-            console.log('=== LOAD interceptor complete ===');
+            try {
+                console.log('Media info:', request.media);
+                console.log('Content ID:', request.media?.contentId);
+                console.log('Content Type:', request.media?.contentType);
+                console.log('Stream Type:', request.media?.streamType);
+                console.log('Custom Data:', request.media?.customData);
+
+                document.getElementById('splash').style.visibility = 'hidden';
+                readMediaState(request);
+
+                // Extract album art URL for background
+                const images = request.media?.metadata?.images || [];
+                const artUrl = images.length > 0 ? images[0].url : '';
+                console.log('Album art URL from metadata:', artUrl);
+
+                // Only load theme/layout on first load or if endpoints changed
+                if (!firstLoadComplete) {
+                    console.log('First load - loading theme and layout');
+                    await loadTheme();
+                    await loadLayout();
+                    firstLoadComplete = true;
+                } else {
+                    console.log('Subsequent load - skipping theme/layout reload');
+                }
+
+                // Wait for DOM to be ready before rendering
+                await new Promise(resolve => setTimeout(resolve, 100));
+
+                // Set background before rendering to ensure it's ready
+                if (artUrl) {
+                    setBackground(artUrl);
+                }
+
+                renderData(true); // Full update on track load
+
+                console.log('=== LOAD interceptor complete ===');
+            } finally {
+                isLoadInProgress = false;
+            }
+
+            // Return the original request to allow default processing
             return request;
         });
 
