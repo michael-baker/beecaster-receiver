@@ -301,6 +301,13 @@
 
             console.log(`renderData called: fullUpdate=${fullUpdate}, artUrl=${artUrl}`);
 
+            if (fullUpdate) {
+                console.log('CustomData contents:', custom);
+                console.log('AudioCodec:', custom.AudioCodec);
+                console.log('Properties:', custom.Properties);
+                console.log('Next:', custom.Next);
+            }
+
             const durationText = custom.DurationText || formatSeconds(state.durationSec);
             const currentText = formatSeconds(state.currentTimeSec);
             const ratio = state.durationSec > 0 ? Math.min(100, Math.max(0, (state.currentTimeSec / state.durationSec) * 100)) : 0;
@@ -335,6 +342,8 @@
 
         async function loadTheme() {
             try {
+                themeFetchCount++;
+                console.log(`[THEME] Fetching theme (attempt #${themeFetchCount})`);
                 const resp = await fetch(state.themeEndpoint, { cache: 'no-store' });
                 if (!resp.ok) {
                     console.log('Theme endpoint not available, using default theme');
@@ -368,11 +377,15 @@
         }
 
         let lastLoadedLayout = '';
+        let layoutLoadCount = 0;
 
         async function loadLayout() {
+            layoutFetchCount++;
+            console.log(`=== loadLayout called (count: ${layoutFetchCount}) ===`);
+
             let html = defaultLayout;
             try {
-                console.log('Fetching layout from:', state.layoutEndpoint);
+                console.log(`[LAYOUT] Fetching layout (attempt #${layoutFetchCount}) from:`, state.layoutEndpoint);
                 const resp = await fetch(state.layoutEndpoint, { cache: 'no-store', mode: 'cors' });
                 console.log('Layout response status:', resp.status);
                 if (resp.ok) {
@@ -398,28 +411,66 @@
         }
 
         let loadCount = 0;
+        let layoutFetchCount = 0;
+        let themeFetchCount = 0;
         let isLoadInProgress = false;
         let firstLoadComplete = false;
+        let lastLoadTimestamp = 0;
+        let lastContentId = '';
+        const LOAD_DEBOUNCE_MS = 500; // Ignore LOAD events within 500ms of last one
+
+        // Debug overlay function
+        function updateDebugOverlay() {
+            let debugInfo = `LOAD #${loadCount} | Layout #${layoutFetchCount} | Theme #${themeFetchCount}`;
+            if (lastContentId) {
+                debugInfo += ` | ID: ${lastContentId.substring(0, 20)}...`;
+            }
+            const customDataKeys = Object.keys(state.customData).filter(k => k.match(/AudioCodec|QualityLevel|Properties|Genre/));
+            if (customDataKeys.length > 0) {
+                debugInfo += ` | Fields: ${customDataKeys.join(',')}`;
+            }
+            console.log(`[DEBUG OVERLAY] ${debugInfo}`);
+        }
 
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
             loadCount++;
+            const now = Date.now();
+            const timeSinceLastLoad = now - lastLoadTimestamp;
+
             console.log(`=== LOAD interceptor triggered (call #${loadCount}) ===`);
             console.log('Timestamp:', new Date().toISOString());
+            console.log('Time since last LOAD:', timeSinceLastLoad, 'ms');
             console.log('First load complete:', firstLoadComplete);
+
+            // Debounce rapid LOAD events
+            if (timeSinceLastLoad < LOAD_DEBOUNCE_MS && loadCount > 1) {
+                console.warn(`LOAD event too soon (${timeSinceLastLoad}ms), ignoring as duplicate`);
+                return request;
+            }
 
             if (isLoadInProgress) {
                 console.warn('LOAD already in progress, ignoring duplicate call');
                 return request;
             }
 
+            lastLoadTimestamp = now;
             isLoadInProgress = true;
 
             try {
+                lastContentId = request.media?.contentId || '';
                 console.log('Media info:', request.media);
-                console.log('Content ID:', request.media?.contentId);
+                console.log('Content ID:', lastContentId);
                 console.log('Content Type:', request.media?.contentType);
                 console.log('Stream Type:', request.media?.streamType);
-                console.log('Custom Data:', request.media?.customData);
+                const customDataKeys = Object.keys(request.media?.customData || {});
+                console.log('Custom Data keys:', customDataKeys);
+                if (customDataKeys.length > 0) {
+                    customDataKeys.forEach(key => {
+                        if (request.media.customData[key]) {
+                            console.log(`  ${key}: ${request.media.customData[key]}`);
+                        }
+                    });
+                }
 
                 document.getElementById('splash').style.visibility = 'hidden';
                 readMediaState(request);
@@ -446,6 +497,9 @@
                 renderData(true); // Full update on track load
 
                 console.log('=== LOAD interceptor complete ===');
+                updateDebugOverlay();
+            } catch (error) {
+                console.error('Error in LOAD interceptor:', error);
             } finally {
                 isLoadInProgress = false;
             }
@@ -502,9 +556,28 @@
         // Enable detailed logs for debugging
         options.disableIdleTimeout = false;
         options.maxInactivity = 3600; // 1 hour
+        options.debug = true; // Enable Cast SDK debugging
 
         console.log('Starting Cast receiver context with options:', options);
         context.start(options);
+
+        // Set detailed logger level after context starts
+        try {
+            cast.framework.CastReceiverContext.getInstance().setLoggerLevel(cast.framework.LoggerLevel.DEBUG);
+            console.log('[DEBUG] Cast SDK logger level set to DEBUG');
+        } catch (e) {
+            console.log('[DEBUG] Could not set logger level:', e);
+        }
+
+        // Enable Cast Debug Logger overlay if available
+        if (cast.framework.CastDebugLogger) {
+            try {
+                cast.framework.CastDebugLogger.getInstance().setEnabled(true);
+                console.log('[DEBUG] Cast Debug Logger overlay enabled on receiver');
+            } catch (e) {
+                console.log('[DEBUG] Cast Debug Logger not available:', e);
+            }
+        }
     </script>
 </body>
 </html>
