@@ -13,19 +13,25 @@
         #layout-container{position:fixed;inset:0;z-index:2;overflow:hidden}
         #debug-overlay{position:fixed;top:20px;right:20px;z-index:10000;background:rgba(0,0,0,0.95);color:#0f0;font-family:'Courier New',monospace;font-size:14px;padding:15px;border:3px solid #0f0;border-radius:8px;line-height:1.6;max-width:450px;box-shadow:0 0 30px rgba(0,255,0,0.5);pointer-events:none;overflow-y:auto;max-height:80vh}
         #debug-overlay div{margin:4px 0}.debug-label{color:#fa0;font-weight:bold}
+        #splash{position:fixed;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(135deg,#3d2645 0%,#4a3052 50%,#5a4a6e 100%);transition:opacity .5s ease}
+        #splash.hidden{opacity:0;pointer-events:none}
+        .splash-logo{font-size:5vw;font-weight:700;color:#fff;font-family:'Product Sans','Google Sans',Roboto,sans-serif;text-shadow:0 0 40px rgba(233,75,158,.8);letter-spacing:.05em}
+        .splash-sub{margin-top:1.5rem;font-size:1.5vw;color:rgba(255,255,255,.6);font-family:Roboto,sans-serif;letter-spacing:.12em}
     </style>
 </head>
 <body>
     <video id="receiverVideoElement"></video>
     <div id="backdrop"></div>
+    <div id="splash">
+        <div class="splash-logo">BeeCaster</div>
+        <div class="splash-sub">Now casting from MusicBee</div>
+    </div>
     <div id="layout-container"></div>
     <div id="debug-overlay">
         <div><span class="debug-label">BEECASTER DEBUG</span></div>
         <div>LOAD: <span id="debug-load-count">0</span></div>
-        <div>Layout: <span id="debug-layout-count">0</span></div>
-        <div>Theme: <span id="debug-theme-count">0</span></div>
+        <div>Layout: <span id="debug-layout-hash">—</span></div>
         <div>ContentID: <span id="debug-content-id">—</span></div>
-        <div>BaseURL: <span id="debug-base-url">—</span></div>
         <div>Fields: <span id="debug-fields">—</span></div>
         <div>State: <span id="debug-state">idle</span></div>
     </div>
@@ -79,10 +85,7 @@
             customData: {},
             currentTimeSec: 0,
             durationSec: 0,
-            playbackState: 'STOPPED',
-            mediaBaseUrl: '',
-            layoutEndpoint: '/cast/layout',
-            themeEndpoint: '/cast/theme'
+            playbackState: 'STOPPED'
         };
 
         let lastKnownPositionSec = 0;
@@ -91,14 +94,12 @@
         let animationFrameId = null;
 
         let loadCount = 0;
-        let layoutFetchCount = 0;
-        let themeFetchCount = 0;
         let lastLoadTimestamp = 0;
         let isLoadInProgress = false;
         let lastContentId = '';
         let lastBackgroundUrl = null;
         let lastRenderTime = 0;
-        let lastMediaBaseUrl = '';
+        let lastLayoutHtmlHash = '';
 
         const LOAD_DEBOUNCE_MS = 500;
         const RENDER_DEBOUNCE_MS = 500;
@@ -219,49 +220,55 @@
         }
 
         // ============================================================================
-        // ASSET LOADING
+        // LAYOUT INJECTION — content delivered via Cast LOAD customData
+        // (avoids mixed-content: receiver is HTTPS, local server is HTTP)
         // ============================================================================
-        async function loadLayout() {
-            layoutFetchCount++;
-            console.log(`[LAYOUT] Fetching from: ${state.layoutEndpoint}`);
-            try {
-                const resp = await fetch(state.layoutEndpoint, { cache: 'no-store', mode: 'cors' });
-                if (!resp.ok) {
-                    console.warn(`[LAYOUT] Failed (${resp.status})`);
-                    return;
-                }
-                const html = await resp.text();
-                const container = document.getElementById('layout-container');
-                container.innerHTML = html;
-                console.log('[LAYOUT] Loaded successfully');
-                emit('LAYOUT_READY', {});
-                updateDebugOverlay();
-            } catch (e) {
-                console.error('[LAYOUT] Error:', e);
+        function simpleHash(str) {
+            if (!str) return '';
+            let h = 0;
+            for (let i = 0; i < str.length; i++) {
+                h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
             }
+            return String(h);
         }
 
-        async function loadTheme() {
-            themeFetchCount++;
-            console.log(`[THEME] Fetching from: ${state.themeEndpoint}`);
-            try {
-                const resp = await fetch(state.themeEndpoint, { cache: 'no-store' });
-                if (!resp.ok) {
-                    console.warn(`[THEME] Failed (${resp.status})`);
-                    return;
-                }
-                const css = await resp.text();
+        function injectLayout(layoutHtml, themeCss) {
+            const hash = simpleHash(layoutHtml);
+            if (hash && hash === lastLayoutHtmlHash) {
+                console.log('[LAYOUT] Same layout content, skipping re-inject');
+                return;
+            }
+            lastLayoutHtmlHash = hash;
+
+            if (layoutHtml) {
+                document.getElementById('layout-container').innerHTML = layoutHtml;
+                console.log('[LAYOUT] Injected layout HTML (' + layoutHtml.length + ' chars)');
+            } else {
+                console.warn('[LAYOUT] No LayoutHtml provided in customData');
+            }
+
+            if (themeCss) {
                 let style = document.getElementById('dynamic-theme');
                 if (!style) {
                     style = document.createElement('style');
                     style.id = 'dynamic-theme';
                     document.head.appendChild(style);
                 }
-                style.textContent = css;
-                console.log('[THEME] Loaded successfully');
-                updateDebugOverlay();
-            } catch (e) {
-                console.error('[THEME] Error:', e);
+                style.textContent = themeCss;
+                console.log('[THEME] Injected theme CSS (' + themeCss.length + ' chars)');
+            } else {
+                console.warn('[THEME] No ThemeCss provided in customData');
+            }
+
+            emit('LAYOUT_READY', {});
+            updateDebugOverlay();
+        }
+
+        function hideSplash() {
+            const splash = document.getElementById('splash');
+            if (splash) {
+                splash.classList.add('hidden');
+                setTimeout(() => { if (splash.parentNode) splash.parentNode.removeChild(splash); }, 600);
             }
         }
 
@@ -291,7 +298,7 @@
         // ============================================================================
         // CAST MESSAGE INTERCEPTOR - LOAD HANDLER
         // ============================================================================
-        playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
+        playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
             loadCount++;
             const now = Date.now();
             const timeSinceLastLoad = now - lastLoadTimestamp;
@@ -316,28 +323,10 @@
                 state.media = request.media || {};
                 state.customData = state.media.customData || {};
 
-                // Extract MediaBaseUrl from customData and construct endpoints
-                state.mediaBaseUrl = (state.customData.MediaBaseUrl || '').trim();
-
-                // Ensure trailing slash
-                if (state.mediaBaseUrl && !state.mediaBaseUrl.endsWith('/')) {
-                    state.mediaBaseUrl += '/';
-                }
-
-                // Fallback to localhost if not provided
-                if (!state.mediaBaseUrl) {
-                    state.mediaBaseUrl = 'http://localhost:8080/';
-                    console.warn('[CONFIG] No MediaBaseUrl in customData, using localhost fallback');
-                }
-
-                // Construct endpoints using MediaBaseUrl
-                state.layoutEndpoint = state.customData.LayoutEndpoint || `${state.mediaBaseUrl}cast/layout`;
-                state.themeEndpoint = state.customData.ThemeEndpoint || `${state.mediaBaseUrl}cast/theme`;
-
-                console.log(`[CONFIG] MediaBaseUrl: ${state.mediaBaseUrl}`);
-                console.log(`[CONFIG] Layout endpoint: ${state.layoutEndpoint}`);
-                console.log(`[CONFIG] Theme endpoint: ${state.themeEndpoint}`);
                 console.log(`[CONFIG] CustomData fields: ${Object.keys(state.customData).length}`);
+
+                // Inject layout/theme — content is embedded in customData by the sender
+                injectLayout(state.customData.LayoutHtml || null, state.customData.ThemeCss || null);
 
                 const metadata = state.media.metadata || {};
                 const images = metadata.images || [];
@@ -366,13 +355,7 @@
                 window.BeeCaster.updateField('albumArtUrl', artUrl);
 
                 setBackground(artUrl);
-
-                // Load layout and theme on first load or if MediaBaseUrl changed
-                if (!firstLoadComplete || lastMediaBaseUrl !== state.mediaBaseUrl) {
-                    firstLoadComplete = true;
-                    lastMediaBaseUrl = state.mediaBaseUrl;
-                    await Promise.all([loadLayout(), loadTheme()]);
-                }
+                hideSplash();
 
                 emit('LOAD', { contentId: lastContentId, customData: state.customData });
                 console.log('=== LOAD complete ===');
@@ -451,10 +434,8 @@
         function updateDebugOverlay() {
             try {
                 document.getElementById('debug-load-count').textContent = loadCount;
-                document.getElementById('debug-layout-count').textContent = layoutFetchCount;
-                document.getElementById('debug-theme-count').textContent = themeFetchCount;
+                document.getElementById('debug-layout-hash').textContent = lastLayoutHtmlHash || '—';
                 document.getElementById('debug-content-id').textContent = lastContentId.substring(0, 20) || '—';
-                document.getElementById('debug-base-url').textContent = state.mediaBaseUrl.substring(0, 30) || '—';
                 document.getElementById('debug-fields').textContent = Object.keys(state.customData).length;
                 document.getElementById('debug-state').textContent = state.playbackState;
             } catch (e) {}
@@ -463,10 +444,8 @@
         // ============================================================================
         // STARTUP
         // ============================================================================
-        let firstLoadComplete = false;
-        console.log('[BOOTSTRAP] BeeCaster receiver initialized (GitHub hosted)');
-        console.log('[BOOTSTRAP] Receiver will fetch layout/theme from local web server');
-        console.log('[BOOTSTRAP] Expected customData.MediaBaseUrl: http://[host]:8080/');
+        console.log('[BOOTSTRAP] BeeCaster receiver initialising (github.io hosted)');
+        console.log('[BOOTSTRAP] Layout/theme injected via Cast LOAD customData — no device-side fetch');
         console.log('[BOOTSTRAP] Waiting for LOAD message...');
 
         const options = new cast.framework.CastReceiverOptions();
