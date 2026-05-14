@@ -190,14 +190,38 @@
 }
 `;
 
+        // Track last art URL to prevent redundant background updates
+        let lastBackgroundUrl = null;
+
         function setBackground(artUrl) {
             if (!artUrl) {
+                console.log('No album art URL provided');
                 return;
             }
 
-            const bust = `${artUrl}?${Date.now()}`;
-            document.getElementById('receiverVideoElement').style.backgroundImage = `linear-gradient(rgba(5, 7, 11, 0.58), rgba(5, 7, 11, 0.78)),url("${bust}")`;
-            document.getElementById('backdrop').style.backgroundImage = `url("${bust}")`;
+            // Skip if this is the same URL we already have
+            if (lastBackgroundUrl === artUrl) {
+                console.log('Background already set to:', artUrl);
+                return;
+            }
+
+            console.log('Setting background image:', artUrl);
+            const videoElement = document.getElementById('receiverVideoElement');
+            const backdropElement = document.getElementById('backdrop');
+
+            // Preload image before setting to prevent flash
+            const img = new Image();
+            img.onload = () => {
+                console.log('Background image loaded successfully');
+                videoElement.style.backgroundImage = `linear-gradient(rgba(5, 7, 11, 0.58), rgba(5, 7, 11, 0.78)),url("${artUrl}")`;
+                backdropElement.style.backgroundImage = `url("${artUrl}")`;
+                lastBackgroundUrl = artUrl;
+            };
+            img.onerror = () => {
+                console.error('Failed to load background image:', artUrl);
+                lastBackgroundUrl = null;
+            };
+            img.src = artUrl;
         }
 
         function formatSeconds(value) {
@@ -239,26 +263,33 @@
             if (state.customData.CurrentPositionMs) {
                 state.currentTimeSec = Number(state.customData.CurrentPositionMs) / 1000;
             }
-
-            const images = state.media.metadata && state.media.metadata.images ? state.media.metadata.images : [];
-            const artUrl = images.length > 0 ? images[0].url : '';
-            setBackground(artUrl);
         }
 
         function setField(name, value) {
             const nodes = document.querySelectorAll(`[data-field='${name}']`);
             nodes.forEach(node => {
                 if (name === 'albumArtUrl' && node.tagName === 'IMG') {
-                    node.src = value || '';
+                    // Only update image if URL actually changed to prevent reload flash
+                    const newSrc = value || '';
+                    if (node.src !== newSrc && node.getAttribute('data-current-src') !== newSrc) {
+                        console.log('Updating album art:', newSrc);
+                        node.setAttribute('data-current-src', newSrc);
+                        node.src = newSrc;
+                    }
                 } else if (name === 'progressFill') {
+                    // Progress bar always updates
                     node.style.width = value || '0%';
                 } else {
-                    node.textContent = value || '';
+                    // Only update text if it changed
+                    const newText = value || '';
+                    if (node.textContent !== newText) {
+                        node.textContent = newText;
+                    }
                 }
             });
         }
 
-        function renderData() {
+        function renderData(fullUpdate = false) {
             const metadata = state.media.metadata || {};
             const custom = state.customData || {};
             const images = metadata.images || [];
@@ -267,22 +298,31 @@
             const currentText = formatSeconds(state.currentTimeSec);
             const ratio = state.durationSec > 0 ? Math.min(100, Math.max(0, (state.currentTimeSec / state.durationSec) * 100)) : 0;
 
-            setField('trackTitle', metadata.title || custom.TrackTitle || 'Unknown title');
-            setField('artist', metadata.artist || custom.Artist || 'Unknown artist');
-            setField('album', metadata.albumName || custom.Album || '');
-            setField('albumArtist', metadata.albumArtist || custom.AlbumArtist || '');
-            setField('genre', custom.Genre || '');
-            setField('year', custom.Year || '');
-            setField('trackNumber', custom.TrackNumber || '');
-            setField('position', custom.Position || '');
-            setField('next', custom.Next || '');
-            setField('properties', custom.Properties || '');
-            setField('audioCodec', custom.AudioCodec || '');
-            setField('qualityLevel', custom.QualityLevel || '');
-            setField('durationText', durationText);
+            // Always update time-sensitive fields
             setField('currentPositionText', currentText);
-            setField('albumArtUrl', artUrl);
             setField('progressFill', `${ratio.toFixed(2)}%`);
+
+            // Only update metadata fields on full update (track change)
+            if (fullUpdate) {
+                console.log('Full metadata update');
+                setField('trackTitle', metadata.title || custom.TrackTitle || 'Unknown title');
+                setField('artist', metadata.artist || custom.Artist || 'Unknown artist');
+                setField('album', metadata.albumName || custom.Album || '');
+                setField('albumArtist', metadata.albumArtist || custom.AlbumArtist || '');
+                setField('genre', custom.Genre || '');
+                setField('year', custom.Year || '');
+                setField('trackNumber', custom.TrackNumber || '');
+                setField('position', custom.Position || '');
+                setField('next', custom.Next || '');
+                setField('properties', custom.Properties || '');
+                setField('audioCodec', custom.AudioCodec || '');
+                setField('qualityLevel', custom.QualityLevel || '');
+                setField('durationText', durationText);
+                setField('albumArtUrl', artUrl);
+
+                // Update background on track change
+                setBackground(artUrl);
+            }
         }
 
         async function loadTheme() {
@@ -353,9 +393,24 @@
 
             document.getElementById('splash').style.visibility = 'hidden';
             readMediaState(request);
+
+            // Extract album art URL for background
+            const images = request.media?.metadata?.images || [];
+            const artUrl = images.length > 0 ? images[0].url : '';
+            console.log('Album art URL from metadata:', artUrl);
+
             await loadTheme();
             await loadLayout();
-            renderData();
+
+            // Wait for DOM to be ready before rendering
+            await new Promise(resolve => setTimeout(resolve, 100));
+
+            // Set background before rendering to ensure it's ready
+            if (artUrl) {
+                setBackground(artUrl);
+            }
+
+            renderData(true); // Full update on track load
 
             console.log('=== LOAD interceptor complete ===');
             return request;
@@ -365,7 +420,7 @@
         const playerDataBinder = new cast.framework.ui.PlayerDataBinder(playerData);
         playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
             state.currentTimeSec = Number(e.value || 0);
-            renderData();
+            renderData(false); // Time-only update, no metadata refresh
         });
 
         // Listen for player state changes
