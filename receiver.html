@@ -114,10 +114,10 @@
         //   true /true /true /false → add background image fetch
         //   true /true /true /true  → full (current broken state)
         // ============================================================================
-        const ENABLE_LAYOUT_INJECT  = true;  // inject LayoutHtml into #layout-container + ThemeCss
-        const ENABLE_SCRIPT_EXEC    = true;  // execute LayoutScript / inline <script> tags
-        const ENABLE_BACKGROUND_IMG = true;  // fetch album art and apply CSS background
-        const ENABLE_HIDE_SPLASH    = true;  // fade out purple splash on LOAD
+        const ENABLE_LAYOUT_INJECT  = false;  // inject LayoutHtml into #layout-container + ThemeCss
+        const ENABLE_SCRIPT_EXEC    = false;  // execute LayoutScript / inline <script> tags
+        const ENABLE_BACKGROUND_IMG = false;  // fetch album art and apply CSS background
+        const ENABLE_HIDE_SPLASH    = false;  // fade out purple splash on LOAD
 
         const eventListeners = {
             'LOAD': [], 'PLAY': [], 'PAUSE': [], 'STOP': [],
