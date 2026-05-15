@@ -34,6 +34,7 @@
         <div>ContentID: <span id="debug-content-id">—</span></div>
         <div>Fields: <span id="debug-fields">—</span></div>
         <div>State: <span id="debug-state">idle</span></div>
+        <div>Flags: <span id="debug-flags">LSBH</span> (L=layout S=script B=bg H=splash)</div>
     </div>
     <script>
         // ============================================================================
@@ -103,6 +104,20 @@
 
         const LOAD_DEBOUNCE_MS = 500;
         const RENDER_DEBOUNCE_MS = 500;
+
+        // ============================================================================
+        // ISOLATION FLAGS — set each to false one at a time to find LoadAsync timeout
+        // Testing order: start with all false, enable one at a time until it breaks
+        //   false/false/false/false → baseline (no customisation, should succeed)
+        //   true /false/false/false → add layout HTML+CSS
+        //   true /true /false/false → add script execution
+        //   true /true /true /false → add background image fetch
+        //   true /true /true /true  → full (current broken state)
+        // ============================================================================
+        const ENABLE_LAYOUT_INJECT  = true;  // inject LayoutHtml into #layout-container + ThemeCss
+        const ENABLE_SCRIPT_EXEC    = true;  // execute LayoutScript / inline <script> tags
+        const ENABLE_BACKGROUND_IMG = true;  // fetch album art and apply CSS background
+        const ENABLE_HIDE_SPLASH    = true;  // fade out purple splash on LOAD
 
         const eventListeners = {
             'LOAD': [], 'PLAY': [], 'PAUSE': [], 'STOP': [],
@@ -307,7 +322,11 @@
             }
 
             clearLayoutListeners();
-            executeLayoutScripts(layoutHtml, layoutScript);
+            if (ENABLE_SCRIPT_EXEC) {
+                executeLayoutScripts(layoutHtml, layoutScript);
+            } else {
+                console.warn('[ISOLATION] ENABLE_SCRIPT_EXEC=false — skipping script execution');
+            }
             emit('LAYOUT_READY', {});
             updateDebugOverlay();
         }
@@ -374,7 +393,11 @@
                 console.log(`[CONFIG] CustomData fields: ${Object.keys(state.customData).length}`);
 
                 // Inject layout/theme/script — all content is embedded in customData by the sender
-                injectLayout(state.customData.LayoutHtml || null, state.customData.ThemeCss || null, state.customData.LayoutScript || null);
+                if (ENABLE_LAYOUT_INJECT) {
+                    injectLayout(state.customData.LayoutHtml || null, state.customData.ThemeCss || null, state.customData.LayoutScript || null);
+                } else {
+                    console.warn('[ISOLATION] ENABLE_LAYOUT_INJECT=false — skipping layout injection');
+                }
 
                 const metadata = state.media.metadata || {};
                 const images = metadata.images || [];
@@ -402,8 +425,16 @@
                 window.BeeCaster.updateField('durationText', formatSeconds(state.durationSec));
                 window.BeeCaster.updateField('albumArtUrl', artUrl);
 
-                setBackground(artUrl);
-                hideSplash();
+                if (ENABLE_BACKGROUND_IMG) {
+                    setBackground(artUrl);
+                } else {
+                    console.warn('[ISOLATION] ENABLE_BACKGROUND_IMG=false — skipping background fetch');
+                }
+                if (ENABLE_HIDE_SPLASH) {
+                    hideSplash();
+                } else {
+                    console.warn('[ISOLATION] ENABLE_HIDE_SPLASH=false — splash stays visible');
+                }
 
                 emit('LOAD', { contentId: lastContentId, customData: state.customData });
                 console.log('=== LOAD complete ===');
@@ -486,6 +517,12 @@
                 document.getElementById('debug-content-id').textContent = lastContentId.substring(0, 20) || '—';
                 document.getElementById('debug-fields').textContent = Object.keys(state.customData).length;
                 document.getElementById('debug-state').textContent = state.playbackState;
+                const flagEl = document.getElementById('debug-flags');
+                if (flagEl) flagEl.textContent =
+                    (ENABLE_LAYOUT_INJECT  ? 'L' : 'l') +
+                    (ENABLE_SCRIPT_EXEC    ? 'S' : 's') +
+                    (ENABLE_BACKGROUND_IMG ? 'B' : 'b') +
+                    (ENABLE_HIDE_SPLASH    ? 'H' : 'h');
             } catch (e) {}
         }
 
