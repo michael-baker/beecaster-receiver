@@ -742,11 +742,12 @@
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
 
         // Spectrum namespace — receives 24-band FFT data from the plugin
-        const SPECTRUM_NS = 'urn:x-cast:com.beecaster.spectrum';
-        options.customNamespaces[SPECTRUM_NS] = cast.framework.system.MessageType.JSON;
+        // const SPECTRUM_NS = 'urn:x-cast:com.beecaster.spectrum';
+        // options.customNamespaces[SPECTRUM_NS] = cast.framework.system.MessageType.JSON;
 
-        // ── Spectrum renderer ─────────────────────────────────────────────────
+        // ── Spectrum renderer — DISABLED for debugging ────────────────────────
         (function () {
+            return; // disabled — re-enable once cast page load is confirmed working
             const FAKE_DATA = true;  // TODO: remove — drives canvas with synthetic data for layout testing
 
             const canvas  = document.getElementById('spectrum-canvas');
