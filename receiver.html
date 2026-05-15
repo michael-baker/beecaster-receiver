@@ -14,11 +14,20 @@
             background: linear-gradient(135deg, #3d2645 0%, #4a3052 50%, #5a4a6e 100%);
         }
 
+        /* CAF audio media element — kept invisible; background role moved to #art-blur-light */
         video {
             position: absolute;
             inset: 0;
             width: 100%;
             height: 100%;
+            z-index: 0;
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        #art-blur-light {
+            position: absolute;
+            inset: 0;
             z-index: 0;
             background-size: cover;
             background-position: center;
@@ -79,13 +88,32 @@
             0% { opacity: 0.88; }
             100% { opacity: 1; }
         }
+
+        #spectrum-canvas {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 80px;
+            z-index: 5;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 600ms ease;
+        }
+        #spectrum-canvas.visible {
+            opacity: 1;
+        }
     </style>
 </head>
 <body>
-    <video id="receiverVideoElement"></video>
+    <!-- class="castMediaElement" is the Google-recommended way to designate the media element -->
+    <!-- instead of passing options.mediaElement explicitly (which is discouraged per CAF docs) -->
+    <video id="receiverVideoElement" class="castMediaElement"></video>
+    <div id="art-blur-light"></div>
     <div id="backdrop"></div>
     <div id="skin-root"></div>
     <div id="splash">BeeCaster</div>
+    <canvas id="spectrum-canvas"></canvas>
 
     <script>
         const CHANNEL = 'urn:x-cast:com.google.cast.media';
@@ -215,37 +243,34 @@
 
         // Track last art URL to prevent redundant background updates
         let lastBackgroundUrl = null;
+        const artBlurLight = document.getElementById('art-blur-light');
+        const backdropEl = document.getElementById('backdrop');
 
         function setBackground(artUrl) {
             if (!artUrl) {
-                console.log('No album art URL provided');
+                console.log('[bg] No album art URL provided');
                 return;
             }
 
-            console.log(`setBackground called with: ${artUrl}`);
-            console.log(`Last background URL was: ${lastBackgroundUrl}`);
-
-            // Skip if this is the same URL we already have
             if (lastBackgroundUrl === artUrl) {
-                console.log('Background already set to this URL, skipping');
+                console.log('[bg] Already set, skipping:', artUrl);
                 return;
             }
 
-            console.log('Setting NEW background image:', artUrl);
-            const videoElement = document.getElementById('receiverVideoElement');
-            const backdropElement = document.getElementById('backdrop');
+            console.log('[bg] Setting background:', artUrl);
 
-            // Preload image before setting to prevent flash
+            // Preload then apply atomically to both layers
             const img = new Image();
             img.onload = () => {
-                console.log('Background image loaded successfully');
-                videoElement.style.backgroundImage = `linear-gradient(135deg, rgba(61, 38, 69, 0.75) 0%, rgba(74, 48, 82, 0.65) 50%, rgba(90, 74, 110, 0.75) 100%),url("${artUrl}")`;
-                backdropElement.style.backgroundImage = `url("${artUrl}")`;
+                const gradient = `linear-gradient(135deg, rgba(61,38,69,0.75) 0%, rgba(74,48,82,0.65) 50%, rgba(90,74,110,0.75) 100%)`;
+                // Use dedicated #art-blur-light — NOT the CAF video element
+                artBlurLight.style.backgroundImage = `${gradient}, url("${artUrl}")`;
+                backdropEl.style.backgroundImage = `url("${artUrl}")`;
                 lastBackgroundUrl = artUrl;
-                console.log('Background updated to:', artUrl);
+                console.log('[bg] Applied:', artUrl);
             };
             img.onerror = () => {
-                console.error('Failed to load background image:', artUrl);
+                console.error('[bg] Failed to load image:', artUrl);
                 lastBackgroundUrl = null;
             };
             img.src = artUrl;
@@ -313,13 +338,33 @@
             const nodes = getFieldNodes(name);
             nodes.forEach(node => {
                 if (name === 'albumArtUrl' && node.tagName === 'IMG') {
-                    // Only update image if URL actually changed to prevent reload flash
                     const newSrc = value || '';
-                    if (node.src !== newSrc && node.getAttribute('data-current-src') !== newSrc) {
-                        console.log('Updating album art:', newSrc);
-                        node.setAttribute('data-current-src', newSrc);
-                        node.src = newSrc;
+                    if (node.getAttribute('data-current-src') === newSrc) {
+                        // Already showing or pending — skip
+                        return;
                     }
+                    // Claim the slot immediately so concurrent calls don't double-fire
+                    node.setAttribute('data-current-src', newSrc);
+                    if (!newSrc) {
+                        node.src = '';
+                        return;
+                    }
+                    // Preload into a throwaway Image first so the <img> never goes blank
+                    const preload = new Image();
+                    preload.onload = () => {
+                        // Only apply if the pending src hasn't been superseded by another track
+                        if (node.getAttribute('data-current-src') === newSrc) {
+                            node.src = newSrc;
+                            console.log('[art] img src swapped after preload:', newSrc);
+                        }
+                    };
+                    preload.onerror = () => {
+                        console.error('[art] img preload failed:', newSrc);
+                        if (node.getAttribute('data-current-src') === newSrc) {
+                            node.removeAttribute('data-current-src');
+                        }
+                    };
+                    preload.src = newSrc;
                 } else if (name === 'progressFill') {
                     // Progress bar always updates
                     node.style.width = value || '0%';
@@ -511,6 +556,19 @@
         let lastAcceptedArtUrl = '';
         let lastAcceptedLoadTimestamp = 0;
 
+        // CRITICAL: If no PRELOAD interceptor is registered, CAF calls the LOAD interceptor
+        // for PRELOAD messages too (documented behavior). This would render the next queued
+        // track's art/metadata while the current track is still playing. Register a no-op
+        // PRELOAD interceptor to block that.
+        playerManager.setMessageInterceptor(
+            cast.framework.messages.MessageType.PRELOAD,
+            request => {
+                console.log('[caf] PRELOAD received (suppressing UI update) contentId:',
+                    request.media?.contentId);
+                return request;
+            }
+        );
+
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
             loadCount++;
             const now = Date.now();
@@ -613,22 +671,58 @@
         });
 
         // Listen for player state changes
+        playerManager.addEventListener(cast.framework.events.EventType.PLAYER_LOADING, (event) => {
+            console.log('[caf] PLAYER_LOADING (CAF begins handling LOAD) itemId:',
+                event.media?.contentId);
+        });
+
         playerManager.addEventListener(cast.framework.events.EventType.PLAYER_LOAD_COMPLETE, () => {
-            console.log('Player load complete');
+            console.log('[caf] PLAYER_LOAD_COMPLETE');
+        });
+
+        playerManager.addEventListener(cast.framework.events.EventType.MEDIA_INFORMATION_CHANGED, () => {
+            // Fires for live radio metadata changes; log but don\'t re-render
+            console.log('[caf] MEDIA_INFORMATION_CHANGED');
         });
 
         playerManager.addEventListener(cast.framework.events.EventType.ERROR, (event) => {
-            console.error('Player error:', event.detailedErrorCode, event.error);
+            console.error('[caf] ERROR:', event.detailedErrorCode, event.error);
         });
 
-        // Log when media actually starts playing
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, () => {
-            console.log('Media is now PLAYING');
+            console.log('[caf] PLAYING');
         });
 
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, () => {
-            console.log('Media PAUSED');
+            console.log('[caf] PAUSED');
         });
+
+        playerManager.addEventListener(cast.framework.events.EventType.BUFFERING, () => {
+            console.log('[caf] BUFFERING');
+        });
+
+        playerManager.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, (event) => {
+            console.log('[caf] MEDIA_STATUS playerState=', event.mediaStatus?.playerState,
+                'currentTime=', event.mediaStatus?.currentTime);
+        });
+
+        // Detect if CAF disrupts video element styles (suspected root cause of redraw flash)
+        (function installVideoStyleWatcher() {
+            const videoEl = document.getElementById('receiverVideoElement');
+            const observer = new MutationObserver(mutations => {
+                mutations.forEach(m => {
+                    if (m.type === 'attributes' && m.attributeName === 'style') {
+                        console.warn('[DEBUG] video element style mutated by CAF:',
+                            videoEl.getAttribute('style'));
+                    }
+                    if (m.type === 'attributes' && m.attributeName === 'src') {
+                        console.warn('[DEBUG] video element src mutated:', videoEl.src);
+                    }
+                });
+            });
+            observer.observe(videoEl, { attributes: true, attributeFilter: ['style', 'src', 'class'] });
+            console.log('[DEBUG] MutationObserver on video element installed');
+        })();
 
         playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, event => {
             const next = event.requestData && event.requestData.jump == 1;
@@ -647,12 +741,87 @@
         options.customNamespaces = Object.assign({});
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
 
-        // Configure media element for audio playback
-        options.mediaElement = document.getElementById('receiverVideoElement');
+        // Spectrum namespace — receives 24-band FFT data from the plugin
+        const SPECTRUM_NS = 'urn:x-cast:com.beecaster.spectrum';
+        options.customNamespaces[SPECTRUM_NS] = cast.framework.system.MessageType.JSON;
+
+        // ── Spectrum renderer ─────────────────────────────────────────────────
+        (function () {
+            const canvas  = document.getElementById('spectrum-canvas');
+            const ctx     = canvas.getContext('2d');
+            const BANDS   = 24;
+            const BAR_GAP = 0.18;  // fraction of bar width used as gap
+
+            let bins      = new Float32Array(BANDS);   // latest data from plugin
+            let hasData   = false;
+
+            // Resize canvas to its CSS pixel size (account for devicePixelRatio)
+            function resizeCanvas() {
+                const dpr = window.devicePixelRatio || 1;
+                canvas.width  = canvas.offsetWidth  * dpr;
+                canvas.height = canvas.offsetHeight * dpr;
+                ctx.scale(dpr, dpr);
+            }
+            resizeCanvas();
+            window.addEventListener('resize', () => { ctx.resetTransform(); resizeCanvas(); });
+
+            // Receive spectrum data from the plugin
+            context.addCustomMessageListener(SPECTRUM_NS, event => {
+                const msg = event.data;
+                if (!msg || !Array.isArray(msg.bins) || msg.bins.length !== BANDS) return;
+                for (let i = 0; i < BANDS; i++) bins[i] = msg.bins[i];
+                if (!hasData) {
+                    hasData = true;
+                    canvas.classList.add('visible');
+                }
+            });
+
+            // rAF render loop — decoupled from message receive rate
+            function render() {
+                requestAnimationFrame(render);
+                if (!hasData) return;
+
+                const W = canvas.offsetWidth;
+                const H = canvas.offsetHeight;
+                ctx.clearRect(0, 0, W, H);
+
+                const totalGap  = W * 0.02;           // 1% padding each side
+                const drawW     = W - totalGap * 2;
+                const barW      = drawW / BANDS;
+                const gapW      = barW * BAR_GAP;
+                const fillW     = barW - gapW;
+
+                for (let i = 0; i < BANDS; i++) {
+                    const v   = Math.max(0, Math.min(1, bins[i]));
+                    const bH  = Math.max(2, v * H * 0.92);
+                    const x   = totalGap + i * barW + gapW * 0.5;
+                    const y   = H - bH;
+
+                    // Gradient: brighter at the top, softer at the base
+                    const grad = ctx.createLinearGradient(0, y, 0, H);
+                    grad.addColorStop(0,   'rgba(220, 200, 255, 0.55)');
+                    grad.addColorStop(0.5, 'rgba(180, 140, 230, 0.30)');
+                    grad.addColorStop(1,   'rgba(140, 100, 200, 0.10)');
+
+                    ctx.fillStyle = grad;
+                    ctx.beginPath();
+                    ctx.roundRect(x, y, fillW, bH, [3, 3, 0, 0]);
+                    ctx.fill();
+                }
+            }
+            render();
+        })();
 
         // Enable detailed logs for debugging
         options.disableIdleTimeout = false;
         options.maxInactivity = 3600; // 1 hour
+
+        // Enable verbose CAF framework logging — visible in chrome://inspect
+        options.loggerLevel = cast.framework.LoggerLevel.DEBUG;
+
+        // Do NOT set options.mediaElement — Google docs explicitly discourage passing a custom
+        // MediaElement because "you lose many benefits of using Web Receiver SDK".
+        // CAF discovers the element via class="castMediaElement" on the <video> tag instead.
 
         console.log('Starting Cast receiver context with options:', options);
         context.start(options);
