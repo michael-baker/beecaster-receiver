@@ -747,6 +747,8 @@
 
         // ── Spectrum renderer ─────────────────────────────────────────────────
         (function () {
+            const FAKE_DATA = true;  // TODO: remove — drives canvas with synthetic data for layout testing
+
             const canvas  = document.getElementById('spectrum-canvas');
             const ctx     = canvas.getContext('2d');
             const BANDS   = 24;
@@ -754,6 +756,29 @@
 
             let bins      = new Float32Array(BANDS);   // latest data from plugin
             let hasData   = false;
+
+            // ── Fake data generator (testing only) ────────────────────────────
+            if (FAKE_DATA) {
+                const fakeSmoothed = new Float32Array(BANDS);
+                let t = 0;
+                setInterval(() => {
+                    t += 0.07;
+                    for (let i = 0; i < BANDS; i++) {
+                        // Bass hump at low bands, roll-off toward highs
+                        const bassCurve  = Math.max(0, 1 - i / 6);
+                        const midBump    = Math.exp(-Math.pow((i - 10) / 4, 2)) * 0.55;
+                        const noise      = Math.random() * 0.25;
+                        const wave       = (Math.sin(t + i * 0.4) * 0.5 + 0.5) * 0.45;
+                        const raw        = Math.min(1, bassCurve * 0.7 + midBump + wave + noise);
+                        // Fast attack, slow decay
+                        fakeSmoothed[i]  = raw > fakeSmoothed[i]
+                            ? raw * 0.6 + fakeSmoothed[i] * 0.4
+                            : fakeSmoothed[i] * 0.82;
+                        bins[i] = fakeSmoothed[i];
+                    }
+                    if (!hasData) { hasData = true; canvas.classList.add('visible'); }
+                }, 64); // ~15 fps, matching real analyzer cadence
+            }
 
             // Resize canvas to its CSS pixel size (account for devicePixelRatio)
             function resizeCanvas() {
