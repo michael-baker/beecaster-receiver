@@ -5,18 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>BeeCaster Receiver</title>
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <script src="//www.gstatic.com/cast/sdk/libs/devtools/debug_layer/caf_receiver_logger.js"></script>
     <style>
-        *{margin:0;padding:0;box-sizing:border-box}body{overflow:hidden;background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        video{position:fixed;inset:0;width:100%;height:100%;z-index:0;background-size:cover;background-position:center;filter:blur(14px) saturate(150%) hue-rotate(-10deg);transform:scale(1.06);pointer-events:none}
-        #backdrop{position:fixed;inset:0;z-index:1;background-size:cover;background-position:center;opacity:0.35;filter:blur(42px) saturate(160%) hue-rotate(-10deg);transform:scale(1.08);pointer-events:none}
-        #layout-container{position:fixed;inset:0;z-index:2;overflow:hidden}
-        #debug-overlay{position:fixed;top:20px;right:20px;z-index:10000;background:rgba(0,0,0,0.95);color:#0f0;font-family:'Courier New',monospace;font-size:14px;padding:15px;border:3px solid #0f0;border-radius:8px;line-height:1.6;max-width:450px;box-shadow:0 0 30px rgba(0,255,0,0.5);pointer-events:none;overflow-y:auto;max-height:80vh}
-        #debug-overlay div{margin:4px 0}.debug-label{color:#fa0;font-weight:bold}
-        #splash{position:fixed;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(135deg,#3d2645 0%,#4a3052 50%,#5a4a6e 100%);transition:opacity .5s ease}
-        #splash.hidden{opacity:0;pointer-events:none}
-        .splash-logo{font-size:5vw;font-weight:700;color:#fff;font-family:'Product Sans','Google Sans',Roboto,sans-serif;text-shadow:0 0 40px rgba(233,75,158,.8);letter-spacing:.05em}
-        .splash-sub{margin-top:1.5rem;font-size:1.5vw;color:rgba(255,255,255,.6);font-family:Roboto,sans-serif;letter-spacing:.12em}
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #000; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        video { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; background-size: cover; background-position: center; filter: blur(14px) saturate(150%) hue-rotate(-10deg); transform: scale(1.06); pointer-events: none; }
+        #backdrop { position: fixed; inset: 0; z-index: 1; background-size: cover; background-position: center; opacity: 0.35; filter: blur(42px) saturate(160%) hue-rotate(-10deg); transform: scale(1.08); pointer-events: none; }
+        #layout-container { position: fixed; inset: 0; z-index: 2; overflow: hidden; }
+        #splash { position: fixed; inset: 0; z-index: 5; display: flex; flex-direction: column; align-items: center; justify-content: center; background: linear-gradient(135deg, #3d2645 0%, #4a3052 50%, #5a4a6e 100%); transition: opacity 0.5s ease; }
+        #splash.hidden { opacity: 0; pointer-events: none; }
+        .splash-logo { font-size: 5vw; font-weight: 700; text-shadow: 0 0 40px rgba(233,75,158,0.8); letter-spacing: 0.05em; }
+        .splash-sub  { margin-top: 1.5rem; font-size: 1.5vw; color: rgba(255,255,255,0.6); letter-spacing: 0.12em; }
+        #debug-overlay { position: fixed; top: 20px; right: 20px; z-index: 10000; background: rgba(0,0,0,0.92); color: #0f0; font-family: 'Courier New', monospace; font-size: 13px; padding: 12px 16px; border: 2px solid #0f0; border-radius: 6px; line-height: 1.7; pointer-events: none; }
+        .dl { color: #fa0; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -28,519 +28,251 @@
     </div>
     <div id="layout-container"></div>
     <div id="debug-overlay">
-        <div><span class="debug-label">BEECASTER DEBUG</span></div>
-        <div>LOAD: <span id="debug-load-count">0</span></div>
-        <div>Layout: <span id="debug-layout-hash">—</span></div>
-        <div>ContentID: <span id="debug-content-id">—</span></div>
-        <div>Fields: <span id="debug-fields">—</span></div>
-        <div>State: <span id="debug-state">idle</span></div>
-        <div>Flags: <span id="debug-flags">LSBH</span> (L=layout S=script B=bg H=splash)</div>
+        <div><span class="dl">BEECASTER</span></div>
+        <div>LOAD: <span id="d-loads">0</span></div>
+        <div>ID:   <span id="d-cid">—</span></div>
+        <div>Fields: <span id="d-fields">0</span></div>
+        <div>State: <span id="d-state">idle</span></div>
     </div>
+
     <script>
-        // ============================================================================
-        // BEECASTER BOOTSTRAP RECEIVER - GitHub Hosted Version
-        // ============================================================================
-        // This receiver is hosted on GitHub. It fetches layout/theme from the
-        // local MusicBee plugin web server using MediaBaseUrl from customData.
-        // ============================================================================
+        // ============================================================
+        // BeeCaster Receiver — github.io hosted
+        // Layout/theme/script delivered via Cast LOAD customData only.
+        // Synchronous LOAD interceptor — no async, no debounce.
+        // customNamespaces intentionally absent: registering the SDK's
+        // reserved urn:x-cast:com.google.cast.media namespace as a
+        // custom namespace intercepts LOAD before playerManager sees it,
+        // causing LoadAsync to time out on the sender.
+        // ============================================================
 
-        const CHANNEL = 'urn:x-cast:com.google.cast.media';
-        const LOG_TAG = 'BeeCaster';
-
-        let castDebugLogger = null;
-        try {
-            castDebugLogger = cast.debug.CastDebugLogger.getInstance();
-        } catch (e) {
-            console.log('CastDebugLogger not available');
-        }
-
-        const context = cast.framework.CastReceiverContext.getInstance();
+        const context       = cast.framework.CastReceiverContext.getInstance();
         const playerManager = context.getPlayerManager();
-
-        if (castDebugLogger) {
-            context.addEventListener(cast.framework.system.EventType.READY, () => {
-                if (!castDebugLogger.debugOverlayElement_) {
-                    castDebugLogger.setEnabled(true);
-                    castDebugLogger.showDebugLogs(true);
-                    castDebugLogger.info(LOG_TAG, 'Cast Debug Logger enabled');
-                }
-            });
-            castDebugLogger.loggerLevelByEvents = {
-                'cast.framework.events.category.CORE': cast.framework.LoggerLevel.INFO,
-                'cast.framework.events.EventType.MEDIA_STATUS': cast.framework.LoggerLevel.DEBUG
-            };
-        }
 
         playerManager.setSupportedMediaCommands(
             cast.framework.messages.Command.ALL_BASIC_MEDIA |
-            cast.framework.messages.Command.PAUSE |
-            cast.framework.messages.Command.QUEUE_NEXT |
+            cast.framework.messages.Command.PAUSE           |
+            cast.framework.messages.Command.QUEUE_NEXT      |
             cast.framework.messages.Command.QUEUE_PREV
         );
 
-        // ============================================================================
-        // STATE
-        // ============================================================================
+        // ── State ────────────────────────────────────────────────────
         const state = {
-            media: {},
-            customData: {},
-            currentTimeSec: 0,
-            durationSec: 0,
+            media: {}, customData: {},
+            currentTimeSec: 0, durationSec: 0,
             playbackState: 'STOPPED'
         };
 
-        let lastKnownPositionSec = 0;
-        let lastKnownPositionTimestamp = 0;
-        let isAnimatingProgress = false;
-        let animationFrameId = null;
-
-        let loadCount = 0;
-        let lastLoadTimestamp = 0;
-        let isLoadInProgress = false;
-        let lastContentId = '';
-        let lastBackgroundUrl = null;
-        let lastRenderTime = 0;
-        let lastLayoutHtmlHash = '';
-
-        const LOAD_DEBOUNCE_MS = 500;
-        const RENDER_DEBOUNCE_MS = 500;
-
-        // ============================================================================
-        // ISOLATION FLAGS — set each to false one at a time to find LoadAsync timeout
-        // Testing order: start with all false, enable one at a time until it breaks
-        //   false/false/false/false → baseline (no customisation, should succeed)
-        //   true /false/false/false → add layout HTML+CSS
-        //   true /true /false/false → add script execution
-        //   true /true /true /false → add background image fetch
-        //   true /true /true /true  → full (current broken state)
-        // ============================================================================
-        const ENABLE_LAYOUT_INJECT  = false;  // inject LayoutHtml into #layout-container + ThemeCss
-        const ENABLE_SCRIPT_EXEC    = false;  // execute LayoutScript / inline <script> tags
-        const ENABLE_BACKGROUND_IMG = false;  // fetch album art and apply CSS background
-        const ENABLE_HIDE_SPLASH    = false;  // fade out purple splash on LOAD
-
+        // ── Event bus ────────────────────────────────────────────────
         const eventListeners = {
-            'LOAD': [], 'PLAY': [], 'PAUSE': [], 'STOP': [],
-            'TIME_UPDATE': [], 'STATE_CHANGE': [], 'LAYOUT_READY': []
+            LOAD: [], PLAY: [], PAUSE: [], STOP: [],
+            TIME_UPDATE: [], STATE_CHANGE: [], LAYOUT_READY: []
         };
 
-        // ============================================================================
-        // BEECASTER PUBLIC API
-        // ============================================================================
+        function emit(type, data) {
+            (eventListeners[type] || []).forEach(function(cb) {
+                try { cb(data); } catch (e) { console.error('[BeeCaster] listener error', type, e); }
+            });
+        }
+
+        // ── BeeCaster public API (available to LayoutScript) ─────────
         window.BeeCaster = {
-            on(eventType, callback) {
+            on: function(eventType, callback) {
                 if (eventListeners[eventType]) {
                     eventListeners[eventType].push(callback);
-                    console.log(`[API] Listener registered for ${eventType}`);
                 } else {
-                    console.warn(`[API] Unknown event type: ${eventType}`);
+                    console.warn('[BeeCaster] unknown event:', eventType);
                 }
             },
-            onStateChange(callback) {
-                this.on('STATE_CHANGE', callback);
-            },
-            getState() {
-                return { ...state };
-            },
-            updateField(fieldName, value) {
-                const fields = document.querySelectorAll(`[data-field="${fieldName}"]`);
-                fields.forEach(node => {
-                    if (fieldName === 'progressFill') {
-                        node.style.width = value || '0%';
-                    } else if (fieldName === 'albumArtUrl') {
+            getState: function() { return Object.assign({}, state); },
+            updateField: function(fieldName, value) {
+                document.querySelectorAll('[data-field="' + fieldName + '"]').forEach(function(node) {
+                    if (fieldName === 'albumArtUrl') {
                         node.src = value || '';
+                    } else if (fieldName === 'progressFill') {
+                        node.style.width = value || '0%';
                     } else {
-                        const newText = value || '';
-                        if (node.textContent !== newText) {
-                            node.textContent = newText;
-                        }
+                        var t = value || '';
+                        if (node.textContent !== t) node.textContent = t;
                     }
                 });
             }
         };
 
-        // ============================================================================
-        // INTERNAL FUNCTIONS
-        // ============================================================================
-        function emit(eventType, data) {
-            if (eventListeners[eventType]) {
-                eventListeners[eventType].forEach(cb => {
-                    try { cb(data); } catch (e) {
-                        console.error(`Error in ${eventType} listener:`, e);
-                    }
-                });
-            }
+        // ── Helpers ──────────────────────────────────────────────────
+        function formatSeconds(v) {
+            if (!v || v < 0) return '0:00';
+            var w = Math.floor(v), h = Math.floor(w / 3600),
+                m = Math.floor((w % 3600) / 60), s = w % 60;
+            return h > 0
+                ? h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0')
+                : m + ':' + String(s).padStart(2,'0');
         }
 
-        function updateState(updates) {
-            Object.assign(state, updates);
-            emit('STATE_CHANGE', { ...state });
-            updateDebugOverlay();
-        }
-
-        function formatSeconds(value) {
-            if (!value || value < 0) return '0:00';
-            const whole = Math.floor(value);
-            const h = Math.floor(whole / 3600);
-            const m = Math.floor((whole % 3600) / 60);
-            const s = whole % 60;
-            if (h > 0) {
-                return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-            }
-            return `${m}:${String(s).padStart(2, '0')}`;
-        }
-
-        // ============================================================================
-        // PROGRESS ANIMATION
-        // ============================================================================
-        function updateProgressSmooth() {
-            if (!isAnimatingProgress || state.durationSec <= 0) return;
-            const now = Date.now();
-            const elapsedMs = now - lastKnownPositionTimestamp;
-            const elapsedSec = elapsedMs / 1000;
-            const smoothPosition = lastKnownPositionSec + elapsedSec;
-            const ratio = Math.min(100, Math.max(0, (smoothPosition / state.durationSec) * 100));
-
-            window.BeeCaster.updateField('progressFill', `${ratio.toFixed(2)}%`);
-
-            const now2 = Date.now();
-            if (now2 - lastRenderTime >= RENDER_DEBOUNCE_MS) {
-                const currentText = formatSeconds(smoothPosition);
-                window.BeeCaster.updateField('currentPositionText', currentText);
-                lastRenderTime = now2;
-            }
-
-            if (smoothPosition >= state.durationSec) {
-                isAnimatingProgress = false;
-                return;
-            }
-
-            animationFrameId = requestAnimationFrame(updateProgressSmooth);
-        }
-
-        function startProgressAnimation(positionSec, timestamp) {
-            lastKnownPositionSec = positionSec;
-            lastKnownPositionTimestamp = timestamp;
-            isAnimatingProgress = true;
-            if (animationFrameId) cancelAnimationFrame(animationFrameId);
-            updateProgressSmooth();
-        }
-
-        function stopProgressAnimation() {
-            isAnimatingProgress = false;
-            if (animationFrameId) {
-                cancelAnimationFrame(animationFrameId);
-                animationFrameId = null;
-            }
-        }
-
-        // ============================================================================
-        // LAYOUT INJECTION — content delivered via Cast LOAD customData
-        // (avoids mixed-content: receiver is HTTPS, local server is HTTP)
-        // ============================================================================
-        function simpleHash(str) {
-            if (!str) return '';
-            let h = 0;
-            for (let i = 0; i < str.length; i++) {
-                h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
-            }
-            return String(h);
-        }
-
-        // Reset all BeeCaster event listeners so re-injected scripts start clean.
-        // Safe to call because the bootstrap itself never registers listeners —
-        // they are only registered by community layout scripts.
-        function clearLayoutListeners() {
-            Object.keys(eventListeners).forEach(key => { eventListeners[key] = []; });
-        }
-
-        // Extract <script> tags from layoutHtml and execute them as real DOM script
-        // elements (innerHTML never executes scripts). Also executes the standalone
-        // layoutScript string (customData.LayoutScript) if provided.
-        function executeLayoutScripts(layoutHtml, standaloneScript) {
-            // Clean up script elements from any previous layout injection
-            document.querySelectorAll('script[data-beecaster-layout]').forEach(el => el.remove());
-
-            // Re-execute inline <script> blocks found inside the layout HTML
-            if (layoutHtml) {
-                const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-                let match;
-                let idx = 0;
-                while ((match = scriptRegex.exec(layoutHtml)) !== null) {
-                    const src = match[1].trim();
-                    if (src) {
-                        const el = document.createElement('script');
-                        el.setAttribute('data-beecaster-layout', 'inline-' + idx++);
-                        el.textContent = src;
-                        document.head.appendChild(el);
-                        console.log('[SCRIPT] Executed inline layout script #' + idx);
-                    }
-                }
-            }
-
-            // Execute the standalone LayoutScript delivered in customData
-            if (standaloneScript && standaloneScript.trim()) {
-                const el = document.createElement('script');
-                el.setAttribute('data-beecaster-layout', 'standalone');
-                el.textContent = standaloneScript;
-                document.head.appendChild(el);
-                console.log('[SCRIPT] Executed LayoutScript (' + standaloneScript.length + ' chars)');
-            }
-        }
-
-        function injectLayout(layoutHtml, themeCss, layoutScript) {
-            const hash = simpleHash((layoutHtml || '') + (layoutScript || ''));
-            if (hash && hash === lastLayoutHtmlHash) {
-                console.log('[LAYOUT] Same layout content, skipping re-inject');
-                return;
-            }
-            lastLayoutHtmlHash = hash;
-
-            // Strip <script> tags before innerHTML — we execute them explicitly below
-            const htmlWithoutScripts = layoutHtml
-                ? layoutHtml.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
-                : null;
-
-            if (htmlWithoutScripts) {
-                document.getElementById('layout-container').innerHTML = htmlWithoutScripts;
-                console.log('[LAYOUT] Injected layout HTML (' + htmlWithoutScripts.length + ' chars)');
-            } else {
-                console.warn('[LAYOUT] No LayoutHtml provided in customData');
-            }
-
-            if (themeCss) {
-                let style = document.getElementById('dynamic-theme');
-                if (!style) {
-                    style = document.createElement('style');
-                    style.id = 'dynamic-theme';
-                    document.head.appendChild(style);
-                }
-                style.textContent = themeCss;
-                console.log('[THEME] Injected theme CSS (' + themeCss.length + ' chars)');
-            } else {
-                console.warn('[THEME] No ThemeCss provided in customData');
-            }
-
-            clearLayoutListeners();
-            if (ENABLE_SCRIPT_EXEC) {
-                executeLayoutScripts(layoutHtml, layoutScript);
-            } else {
-                console.warn('[ISOLATION] ENABLE_SCRIPT_EXEC=false — skipping script execution');
-            }
-            emit('LAYOUT_READY', {});
-            updateDebugOverlay();
+        var lastBgUrl = null;
+        function setBackground(url) {
+            if (!url || url === lastBgUrl) return;
+            var img = new Image();
+            img.onload = function() {
+                document.getElementById('receiverVideoElement').style.backgroundImage =
+                    'linear-gradient(135deg,rgba(61,38,69,.75) 0%,rgba(74,48,82,.65) 50%,rgba(90,74,110,.75) 100%),url("' + url + '")';
+                document.getElementById('backdrop').style.backgroundImage = 'url("' + url + '")';
+                lastBgUrl = url;
+            };
+            img.onerror = function() { lastBgUrl = null; };
+            img.src = url;
         }
 
         function hideSplash() {
-            const splash = document.getElementById('splash');
-            if (splash) {
-                splash.classList.add('hidden');
-                setTimeout(() => { if (splash.parentNode) splash.parentNode.removeChild(splash); }, 600);
-            }
+            var el = document.getElementById('splash');
+            if (!el) return;
+            el.classList.add('hidden');
+            setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 600);
         }
 
-        // ============================================================================
-        // BACKGROUND IMAGE
-        // ============================================================================
-        function setBackground(artUrl) {
-            if (!artUrl) return;
-            if (lastBackgroundUrl === artUrl) return;
+        // ── Layout injection ─────────────────────────────────────────
+        // HTML → innerHTML (no scripts — only LayoutScript field is used for JS).
+        // CSS  → <style id="dynamic-theme">.
+        // JS   → single named <script id="beecaster-layout-script">, replaced
+        //        fresh on each LOAD so listeners never accumulate.
+        function injectLayout(html, css, script) {
+            // 1. HTML
+            document.getElementById('layout-container').innerHTML = html || '';
 
-            const videoElement = document.getElementById('receiverVideoElement');
-            const backdropElement = document.getElementById('backdrop');
+            // 2. CSS
+            var styleEl = document.getElementById('dynamic-theme');
+            if (!styleEl) {
+                styleEl = document.createElement('style');
+                styleEl.id = 'dynamic-theme';
+                document.head.appendChild(styleEl);
+            }
+            styleEl.textContent = css || '';
 
-            const img = new Image();
-            img.onload = () => {
-                videoElement.style.backgroundImage = `linear-gradient(135deg, rgba(61, 38, 69, 0.75) 0%, rgba(74, 48, 82, 0.65) 50%, rgba(90, 74, 110, 0.75) 100%), url("${artUrl}")`;
-                backdropElement.style.backgroundImage = `url("${artUrl}")`;
-                lastBackgroundUrl = artUrl;
-            };
-            img.onerror = () => {
-                console.error('Failed to load background:', artUrl);
-                lastBackgroundUrl = null;
-            };
-            img.src = artUrl;
+            // 3. JS — clear accumulated listeners, then run fresh script
+            Object.keys(eventListeners).forEach(function(k) { eventListeners[k] = []; });
+            var oldScript = document.getElementById('beecaster-layout-script');
+            if (oldScript) oldScript.remove();
+            if (script && script.trim()) {
+                var el = document.createElement('script');
+                el.id = 'beecaster-layout-script';
+                el.textContent = script;
+                document.head.appendChild(el);
+                console.log('[BeeCaster] LayoutScript executed (' + script.length + ' chars)');
+            }
+
+            emit('LAYOUT_READY', {});
         }
 
-        // ============================================================================
-        // CAST MESSAGE INTERCEPTOR - LOAD HANDLER
-        // ============================================================================
-        playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
-            loadCount++;
-            const now = Date.now();
-            const timeSinceLastLoad = now - lastLoadTimestamp;
+        // ── Debug overlay ────────────────────────────────────────────
+        var loadCount = 0;
+        function updateDebug(contentId, customData) {
+            document.getElementById('d-loads').textContent  = loadCount;
+            document.getElementById('d-cid').textContent    = (contentId || '').substring(0, 22) || '—';
+            document.getElementById('d-fields').textContent = Object.keys(customData || {}).length;
+            document.getElementById('d-state').textContent  = state.playbackState;
+        }
 
-            console.log(`=== LOAD #${loadCount} === Time since last: ${timeSinceLastLoad}ms`);
+        // ── LOAD interceptor (synchronous) ───────────────────────────
+        playerManager.setMessageInterceptor(
+            cast.framework.messages.MessageType.LOAD,
+            function(request) {
+                loadCount++;
+                console.log('[BeeCaster] LOAD #' + loadCount);
 
-            if (timeSinceLastLoad < LOAD_DEBOUNCE_MS && loadCount > 1) {
-                console.warn(`LOAD too soon, ignoring`);
-                return request;
-            }
+                try {
+                    var media    = request.media    || {};
+                    var custom   = media.customData || {};
+                    var metadata = media.metadata   || {};
+                    var images   = metadata.images  || [];
+                    var artUrl   = images.length > 0 ? images[0].url : '';
 
-            if (isLoadInProgress) {
-                console.warn('LOAD in progress, ignoring');
-                return request;
-            }
+                    state.media          = media;
+                    state.customData     = custom;
+                    state.durationSec    = Number(media.duration || 0);
+                    state.currentTimeSec = 0;
 
-            lastLoadTimestamp = now;
-            isLoadInProgress = true;
+                    injectLayout(
+                        custom.LayoutHtml   || null,
+                        custom.ThemeCss     || null,
+                        custom.LayoutScript || null
+                    );
 
-            try {
-                lastContentId = request.media?.contentId || '';
-                state.media = request.media || {};
-                state.customData = state.media.customData || {};
+                    window.BeeCaster.updateField('trackTitle',          metadata.title       || custom.TrackTitle  || '');
+                    window.BeeCaster.updateField('artist',              metadata.artist      || custom.Artist      || '');
+                    window.BeeCaster.updateField('album',               metadata.albumName   || custom.Album       || '');
+                    window.BeeCaster.updateField('albumArtist',         metadata.albumArtist || custom.AlbumArtist || '');
+                    window.BeeCaster.updateField('genre',               custom.Genre         || '');
+                    window.BeeCaster.updateField('year',                custom.Year          || '');
+                    window.BeeCaster.updateField('trackNumber',         custom.TrackNumber   || '');
+                    window.BeeCaster.updateField('position',            custom.Position      || '');
+                    window.BeeCaster.updateField('next',                custom.Next          || '');
+                    window.BeeCaster.updateField('properties',          custom.Properties    || '');
+                    window.BeeCaster.updateField('audioCodec',          custom.AudioCodec    || '');
+                    window.BeeCaster.updateField('qualityLevel',        custom.QualityLevel  || '');
+                    window.BeeCaster.updateField('durationText',        formatSeconds(state.durationSec));
+                    window.BeeCaster.updateField('albumArtUrl',         artUrl);
+                    window.BeeCaster.updateField('currentPositionText', '0:00');
+                    window.BeeCaster.updateField('progressFill',        '0%');
 
-                console.log(`[CONFIG] CustomData fields: ${Object.keys(state.customData).length}`);
-
-                // Inject layout/theme/script — all content is embedded in customData by the sender
-                if (ENABLE_LAYOUT_INJECT) {
-                    injectLayout(state.customData.LayoutHtml || null, state.customData.ThemeCss || null, state.customData.LayoutScript || null);
-                } else {
-                    console.warn('[ISOLATION] ENABLE_LAYOUT_INJECT=false — skipping layout injection');
-                }
-
-                const metadata = state.media.metadata || {};
-                const images = metadata.images || [];
-                const artUrl = images.length > 0 ? images[0].url : '';
-
-                updateState({
-                    media: state.media,
-                    customData: state.customData,
-                    durationSec: state.media.duration || 0
-                });
-
-                // Update all UI fields
-                window.BeeCaster.updateField('trackTitle', metadata.title || state.customData.TrackTitle || 'Unknown');
-                window.BeeCaster.updateField('artist', metadata.artist || state.customData.Artist || 'Unknown');
-                window.BeeCaster.updateField('album', metadata.albumName || state.customData.Album || '');
-                window.BeeCaster.updateField('albumArtist', metadata.albumArtist || state.customData.AlbumArtist || '');
-                window.BeeCaster.updateField('genre', state.customData.Genre || '');
-                window.BeeCaster.updateField('year', state.customData.Year || '');
-                window.BeeCaster.updateField('trackNumber', state.customData.TrackNumber || '');
-                window.BeeCaster.updateField('position', state.customData.Position || '');
-                window.BeeCaster.updateField('next', state.customData.Next || '');
-                window.BeeCaster.updateField('properties', state.customData.Properties || '');
-                window.BeeCaster.updateField('audioCodec', state.customData.AudioCodec || '');
-                window.BeeCaster.updateField('qualityLevel', state.customData.QualityLevel || '');
-                window.BeeCaster.updateField('durationText', formatSeconds(state.durationSec));
-                window.BeeCaster.updateField('albumArtUrl', artUrl);
-
-                if (ENABLE_BACKGROUND_IMG) {
                     setBackground(artUrl);
-                } else {
-                    console.warn('[ISOLATION] ENABLE_BACKGROUND_IMG=false — skipping background fetch');
-                }
-                if (ENABLE_HIDE_SPLASH) {
                     hideSplash();
-                } else {
-                    console.warn('[ISOLATION] ENABLE_HIDE_SPLASH=false — splash stays visible');
+
+                    emit('LOAD', { contentId: media.contentId, customData: custom });
+                    updateDebug(media.contentId, custom);
+                    console.log('[BeeCaster] LOAD complete — fields:', Object.keys(custom).length);
+                } catch (err) {
+                    console.error('[BeeCaster] LOAD error:', err);
                 }
 
-                emit('LOAD', { contentId: lastContentId, customData: state.customData });
-                console.log('=== LOAD complete ===');
-                updateDebugOverlay();
-            } catch (error) {
-                console.error('Error in LOAD:', error);
-            } finally {
-                isLoadInProgress = false;
+                return request;
             }
+        );
 
-            return request;
-        });
-
-        // ============================================================================
-        // PLAYER STATE SYNCHRONIZATION
-        // ============================================================================
-        const playerData = {};
-        const playerDataBinder = new cast.framework.ui.PlayerDataBinder(playerData);
-        playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
-            const now = Date.now();
-            const timeSinceLastRender = now - lastRenderTime;
-            state.currentTimeSec = Number(e.value || 0);
-            if (timeSinceLastRender >= RENDER_DEBOUNCE_MS) {
-                lastRenderTime = now;
-                startProgressAnimation(state.currentTimeSec, now);
+        // ── Time / progress ──────────────────────────────────────────
+        var playerData = {};
+        new cast.framework.ui.PlayerDataBinder(playerData).addEventListener(
+            cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED,
+            function(e) {
+                state.currentTimeSec = Number(e.value || 0);
+                var pct = state.durationSec > 0
+                    ? Math.min(100, Math.max(0, (state.currentTimeSec / state.durationSec) * 100))
+                    : 0;
+                window.BeeCaster.updateField('progressFill',        pct.toFixed(2) + '%');
+                window.BeeCaster.updateField('currentPositionText', formatSeconds(state.currentTimeSec));
                 emit('TIME_UPDATE', { currentTime: state.currentTimeSec, duration: state.durationSec });
             }
-        });
+        );
 
-        // ============================================================================
-        // PLAYER EVENT LISTENERS
-        // ============================================================================
-        playerManager.addEventListener(cast.framework.events.EventType.PLAYER_LOAD_COMPLETE, () => {
-            console.log('Player load complete');
-        });
-
-        playerManager.addEventListener(cast.framework.events.EventType.ERROR, (event) => {
-            console.error('Player error:', event.detailedErrorCode, event.error);
-        });
-
-        playerManager.addEventListener(cast.framework.events.EventType.PLAYING, () => {
-            console.log('PLAYING');
+        // ── Playback events ──────────────────────────────────────────
+        playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function() {
             state.playbackState = 'PLAYING';
-            startProgressAnimation(state.currentTimeSec, Date.now());
+            document.getElementById('d-state').textContent = 'PLAYING';
             emit('PLAY', {});
-            updateState({ playbackState: 'PLAYING' });
+            emit('STATE_CHANGE', Object.assign({}, state));
         });
-
-        playerManager.addEventListener(cast.framework.events.EventType.PAUSE, () => {
-            console.log('PAUSED');
+        playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function() {
             state.playbackState = 'PAUSED';
-            stopProgressAnimation();
+            document.getElementById('d-state').textContent = 'PAUSED';
             emit('PAUSE', {});
-            updateState({ playbackState: 'PAUSED' });
+            emit('STATE_CHANGE', Object.assign({}, state));
         });
-
-        playerManager.addEventListener(cast.framework.events.EventType.STOPPED, () => {
-            console.log('STOPPED');
+        playerManager.addEventListener(cast.framework.events.EventType.STOPPED, function() {
             state.playbackState = 'STOPPED';
-            stopProgressAnimation();
+            document.getElementById('d-state').textContent = 'STOPPED';
             emit('STOP', {});
-            updateState({ playbackState: 'STOPPED' });
+            emit('STATE_CHANGE', Object.assign({}, state));
+        });
+        playerManager.addEventListener(cast.framework.events.EventType.ERROR, function(e) {
+            console.error('[BeeCaster] Player error:', e.detailedErrorCode, e.error);
         });
 
-        playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, event => {
-            const next = event.requestData && event.requestData.jump == 1;
-            context.sendCustomMessage(CHANNEL, undefined, {
-                type: next ? 'NEXT' : 'PREVIOUS',
-                message: next ? 'NEXT' : 'PREVIOUS'
-            });
-        });
-
-        // ============================================================================
-        // DEBUG OVERLAY UPDATES
-        // ============================================================================
-        function updateDebugOverlay() {
-            try {
-                document.getElementById('debug-load-count').textContent = loadCount;
-                document.getElementById('debug-layout-hash').textContent = lastLayoutHtmlHash || '—';
-                document.getElementById('debug-content-id').textContent = lastContentId.substring(0, 20) || '—';
-                document.getElementById('debug-fields').textContent = Object.keys(state.customData).length;
-                document.getElementById('debug-state').textContent = state.playbackState;
-                const flagEl = document.getElementById('debug-flags');
-                if (flagEl) flagEl.textContent =
-                    (ENABLE_LAYOUT_INJECT  ? 'L' : 'l') +
-                    (ENABLE_SCRIPT_EXEC    ? 'S' : 's') +
-                    (ENABLE_BACKGROUND_IMG ? 'B' : 'b') +
-                    (ENABLE_HIDE_SPLASH    ? 'H' : 'h');
-            } catch (e) {}
-        }
-
-        // ============================================================================
-        // STARTUP
-        // ============================================================================
-        console.log('[BOOTSTRAP] BeeCaster receiver initialising (github.io hosted)');
-        console.log('[BOOTSTRAP] Layout/theme injected via Cast LOAD customData — no device-side fetch');
-        console.log('[BOOTSTRAP] Waiting for LOAD message...');
-
-        const options = new cast.framework.CastReceiverOptions();
-        options.customNamespaces = Object.assign({});
-        options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
-        options.mediaElement = document.getElementById('receiverVideoElement');
+        // ── Start ────────────────────────────────────────────────────
+        var options = new cast.framework.CastReceiverOptions();
+        options.mediaElement     = document.getElementById('receiverVideoElement');
+        options.maxInactivity    = 3600;
         options.disableIdleTimeout = false;
-        options.maxInactivity = 3600;
-        options.debug = true;
 
+        console.log('[BeeCaster] Starting receiver context');
         context.start(options);
     </script>
 </body>
