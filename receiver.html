@@ -246,34 +246,41 @@
         const artBlurLight = document.getElementById('art-blur-light');
         const backdropEl = document.getElementById('backdrop');
 
+        // Returns a Promise that resolves once the background DOM has been updated
+        // (or immediately if the URL is unchanged/empty, or on load failure).
+        // Callers that need to sequence after the paint (e.g. first reveal) can await it.
         function setBackground(artUrl) {
             if (!artUrl) {
                 console.log('[bg] No album art URL provided');
-                return;
+                return Promise.resolve();
             }
 
             if (lastBackgroundUrl === artUrl) {
                 console.log('[bg] Already set, skipping:', artUrl);
-                return;
+                return Promise.resolve();
             }
 
             console.log('[bg] Setting background:', artUrl);
 
-            // Preload then apply atomically to both layers
-            const img = new Image();
-            img.onload = () => {
-                const gradient = `linear-gradient(135deg, rgba(61,38,69,0.75) 0%, rgba(74,48,82,0.65) 50%, rgba(90,74,110,0.75) 100%)`;
-                // Use dedicated #art-blur-light — NOT the CAF video element
-                artBlurLight.style.backgroundImage = `${gradient}, url("${artUrl}")`;
-                backdropEl.style.backgroundImage = `url("${artUrl}")`;
-                lastBackgroundUrl = artUrl;
-                console.log('[bg] Applied:', artUrl);
-            };
-            img.onerror = () => {
-                console.error('[bg] Failed to load image:', artUrl);
-                lastBackgroundUrl = null;
-            };
-            img.src = artUrl;
+            return new Promise(resolve => {
+                // Preload then apply atomically to both layers
+                const img = new Image();
+                img.onload = () => {
+                    const gradient = `linear-gradient(135deg, rgba(61,38,69,0.75) 0%, rgba(74,48,82,0.65) 50%, rgba(90,74,110,0.75) 100%)`;
+                    // Use dedicated #art-blur-light — NOT the CAF video element
+                    artBlurLight.style.backgroundImage = `${gradient}, url("${artUrl}")`;
+                    backdropEl.style.backgroundImage = `url("${artUrl}")`;
+                    lastBackgroundUrl = artUrl;
+                    console.log('[bg] Applied:', artUrl);
+                    resolve();
+                };
+                img.onerror = () => {
+                    console.error('[bg] Failed to load image:', artUrl);
+                    lastBackgroundUrl = null;
+                    resolve(); // don't block reveal on a missing image
+                };
+                img.src = artUrl;
+            });
         }
 
         function formatSeconds(value) {
@@ -435,6 +442,7 @@
             setField('progressFill', snapshot.progressFill);
         }
 
+        // Returns the Promise from setBackground so callers can await the DOM paint.
         function applyTrackSnapshot(snapshot, animate = false) {
             applyProgressOnly(snapshot);
 
@@ -452,7 +460,7 @@
             setField('qualityLevel', snapshot.qualityLevel);
             setField('durationText', snapshot.durationText);
             setField('albumArtUrl', snapshot.artUrl);
-            setBackground(snapshot.artUrl);
+            const bgPromise = setBackground(snapshot.artUrl);
 
             if (animate) {
                 const root = document.getElementById('skin-root');
@@ -460,6 +468,8 @@
                 void root.offsetWidth;
                 root.classList.add('track-transition');
             }
+
+            return bgPromise;
         }
 
         let progressRafPending = false;
@@ -646,20 +656,18 @@
                     return request;
                 }
 
-                applyTrackSnapshot(snapshot, true);
+                // applyTrackSnapshot returns the setBackground Promise so we can await
+                // the actual DOM update rather than a separate probe Image (which had a
+                // race: probe.onload could resolve before setBackground's img.onload ran).
+                const bgPromise = applyTrackSnapshot(snapshot, true);
                 currentTrackSignature = nextTrackSignature;
 
-                // On the very first reveal: wait for the background art to finish loading
-                // before fading the splash away. Without this, the splash fades while
-                // #backdrop and #art-blur-light are still empty, causing a black flash.
-                // On subsequent reveals (body already has 'ready') this is a no-op.
-                if (!document.body.classList.contains('ready') && snapshot.artUrl) {
+                // On the very first reveal: wait for the backdrop to be painted before
+                // fading the splash away — prevents the black flash where the splash fades
+                // against an empty/black backdrop.
+                if (!document.body.classList.contains('ready')) {
                     console.log('[reveal] waiting for background before first reveal');
-                    await new Promise(resolve => {
-                        const probe = new Image();
-                        probe.onload = probe.onerror = () => resolve();
-                        probe.src = snapshot.artUrl;
-                    });
+                    await bgPromise;
                 }
 
                 revealUiOnce();
