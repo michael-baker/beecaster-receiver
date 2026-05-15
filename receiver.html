@@ -269,8 +269,25 @@
             }
         }
 
+        const fieldNodeCache = new Map();
+
+        function clearFieldCache() {
+            fieldNodeCache.clear();
+        }
+
+        function getFieldNodes(name) {
+            const cached = fieldNodeCache.get(name);
+            if (cached && cached.length > 0) {
+                return cached;
+            }
+
+            const nodes = Array.from(document.querySelectorAll(`[data-field='${name}']`));
+            fieldNodeCache.set(name, nodes);
+            return nodes;
+        }
+
         function setField(name, value) {
-            const nodes = document.querySelectorAll(`[data-field='${name}']`);
+            const nodes = getFieldNodes(name);
             nodes.forEach(node => {
                 if (name === 'albumArtUrl' && node.tagName === 'IMG') {
                     // Only update image if URL actually changed to prevent reload flash
@@ -402,6 +419,7 @@
                 console.log('Layout changed, updating DOM');
                 root.innerHTML = html;
                 lastLoadedLayout = html;
+                clearFieldCache();
                 console.log('Layout DOM updated');
             } else {
                 console.log('Layout unchanged, skipping DOM update');
@@ -413,6 +431,10 @@
         let firstLoadComplete = false;
         let lastLoadTimestamp = 0;
         const LOAD_DEBOUNCE_MS = 500; // Ignore LOAD events within 500ms of last one
+        const LOAD_DUPLICATE_WINDOW_MS = 3000;
+        let lastAcceptedContentId = '';
+        let lastAcceptedArtUrl = '';
+        let lastAcceptedLoadTimestamp = 0;
 
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
             loadCount++;
@@ -445,6 +467,22 @@
                 console.log('Stream Type:', request.media?.streamType);
                 console.log('Custom Data keys:', Object.keys(request.media?.customData || {}));
 
+                const incomingContentId = request.media?.contentId || '';
+                const incomingImages = request.media?.metadata?.images || [];
+                const incomingArtUrl = incomingImages.length > 0 ? incomingImages[0].url : '';
+                const sinceAcceptedMs = now - lastAcceptedLoadTimestamp;
+
+                if (
+                    firstLoadComplete &&
+                    incomingContentId &&
+                    incomingContentId === lastAcceptedContentId &&
+                    incomingArtUrl === lastAcceptedArtUrl &&
+                    sinceAcceptedMs < LOAD_DUPLICATE_WINDOW_MS
+                ) {
+                    console.warn(`Ignoring duplicate LOAD for same content within ${LOAD_DUPLICATE_WINDOW_MS}ms`);
+                    return request;
+                }
+
                 document.getElementById('splash').style.visibility = 'hidden';
                 readMediaState(request);
 
@@ -468,6 +506,10 @@
 
                 // renderData will handle setting the background
                 renderData(true); // Full update on track load
+
+                lastAcceptedContentId = incomingContentId;
+                lastAcceptedArtUrl = incomingArtUrl;
+                lastAcceptedLoadTimestamp = now;
 
                 console.log('=== LOAD interceptor complete ===');
             } catch (error) {
