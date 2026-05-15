@@ -765,6 +765,10 @@
         options.customNamespaces = Object.assign({});
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
 
+        // BeeCaster control namespace — receives out-of-band updates (e.g. UPDATE_ART)
+        const CONTROL_NS = 'urn:x-cast:com.beecaster.control';
+        options.customNamespaces[CONTROL_NS] = cast.framework.system.MessageType.JSON;
+
         // Spectrum namespace — receives 24-band FFT data from the plugin
         // const SPECTRUM_NS = 'urn:x-cast:com.beecaster.spectrum';
         // options.customNamespaces[SPECTRUM_NS] = cast.framework.system.MessageType.JSON;
@@ -879,6 +883,16 @@
         };
         window.addEventListener('unhandledrejection', function (e) {
             console.error('[CRASH] Unhandled promise rejection:', e.reason);
+        });
+
+        // Listen for BeeCaster control messages (art updates, etc.)
+        context.addCustomMessageListener(CONTROL_NS, (event) => {
+            const msg = event.data;
+            if (!msg) return;
+            if (msg.type === 'UPDATE_ART') {
+                console.log('[art-update] Received UPDATE_ART:', msg.artUrl);
+                setBackground(msg.artUrl);
+            }
         });
 
         console.log('Starting Cast receiver context with options:', options);
