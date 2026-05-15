@@ -845,12 +845,25 @@
         // Enable verbose CAF framework logging — visible in chrome://inspect
         options.loggerLevel = cast.framework.LoggerLevel.DEBUG;
 
-        // Do NOT set options.mediaElement — Google docs explicitly discourage passing a custom
-        // MediaElement because "you lose many benefits of using Web Receiver SDK".
-        // CAF discovers the element via class="castMediaElement" on the <video> tag instead.
+        // Set options.mediaElement explicitly as a fallback — required on older CAF versions
+        // that may not support class="castMediaElement" auto-discovery. Both are set (belt + suspenders).
+        options.mediaElement = document.getElementById('receiverVideoElement');
+
+        // Surface any JS crashes to the remote debugger console
+        window.onerror = function (msg, src, line, col, err) {
+            console.error('[CRASH] Uncaught error:', msg, 'at', src, line + ':' + col, err);
+        };
+        window.addEventListener('unhandledrejection', function (e) {
+            console.error('[CRASH] Unhandled promise rejection:', e.reason);
+        });
 
         console.log('Starting Cast receiver context with options:', options);
-        context.start(options);
+        try {
+            context.start(options);
+            console.log('[init] context.start() returned OK');
+        } catch (e) {
+            console.error('[CRASH] context.start() threw:', e);
+        }
     </script>
 </body>
 </html>
