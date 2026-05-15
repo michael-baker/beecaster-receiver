@@ -41,6 +41,17 @@
             position: absolute;
             inset: 0;
             z-index: 2;
+            opacity: 0;
+            transition: opacity 260ms ease;
+            will-change: opacity;
+        }
+
+        body.ready #skin-root {
+            opacity: 1;
+        }
+
+        #skin-root.track-transition {
+            animation: trackFade 260ms ease;
         }
 
         #splash {
@@ -55,6 +66,18 @@
             font-weight: 700;
             letter-spacing: 0.03em;
             text-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+            opacity: 1;
+            transition: opacity 240ms ease;
+        }
+
+        body.ready #splash {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        @keyframes trackFade {
+            0% { opacity: 0.88; }
+            100% { opacity: 1; }
         }
     </style>
 </head>
@@ -310,56 +333,105 @@
             });
         }
 
-        function renderData(fullUpdate = false) {
-            const metadata = state.media.metadata || {};
+        function revealUiOnce() {
+            if (document.body.classList.contains('ready')) {
+                return;
+            }
+
+            document.body.classList.add('ready');
+        }
+
+        function buildSnapshot(mediaOverride) {
+            const media = mediaOverride || state.media || {};
+            const metadata = media.metadata || {};
             const custom = state.customData || {};
             const images = metadata.images || [];
             const artUrl = images.length > 0 ? images[0].url : '';
+            const safeDuration = Number(state.durationSec || 0);
+            const safeCurrent = Number(state.currentTimeSec || 0);
+            const ratio = safeDuration > 0 ? Math.min(100, Math.max(0, (safeCurrent / safeDuration) * 100)) : 0;
 
-            console.log(`renderData called: fullUpdate=${fullUpdate}, artUrl=${artUrl}`);
+            return {
+                contentId: media.contentId || '',
+                trackTitle: metadata.title || custom.TrackTitle || 'Unknown title',
+                artist: metadata.artist || custom.Artist || 'Unknown artist',
+                album: metadata.albumName || custom.Album || '',
+                albumArtist: metadata.albumArtist || custom.AlbumArtist || '',
+                genre: custom.Genre || '',
+                year: custom.Year || '',
+                trackNumber: custom.TrackNumber || '',
+                position: custom.Position || '',
+                next: custom.Next || '',
+                properties: custom.Properties || '',
+                audioCodec: custom.AudioCodec || '',
+                qualityLevel: custom.QualityLevel || '',
+                durationText: custom.DurationText || formatSeconds(safeDuration),
+                currentText: formatSeconds(safeCurrent),
+                progressFill: `${ratio.toFixed(2)}%`,
+                artUrl
+            };
+        }
 
-            if (fullUpdate) {
-                console.log('CustomData contents:', custom);
-                console.log('AudioCodec:', custom.AudioCodec);
-                console.log('Properties:', custom.Properties);
-                console.log('Next:', custom.Next);
+        function buildTrackSignature(snapshot) {
+            return [
+                snapshot.contentId,
+                snapshot.trackTitle,
+                snapshot.artist,
+                snapshot.album,
+                snapshot.artUrl,
+                snapshot.durationText
+            ].join('|');
+        }
+
+        function applyProgressOnly(snapshot) {
+            setField('currentPositionText', snapshot.currentText);
+            setField('progressFill', snapshot.progressFill);
+        }
+
+        function applyTrackSnapshot(snapshot, animate = false) {
+            applyProgressOnly(snapshot);
+
+            setField('trackTitle', snapshot.trackTitle);
+            setField('artist', snapshot.artist);
+            setField('album', snapshot.album);
+            setField('albumArtist', snapshot.albumArtist);
+            setField('genre', snapshot.genre);
+            setField('year', snapshot.year);
+            setField('trackNumber', snapshot.trackNumber);
+            setField('position', snapshot.position);
+            setField('next', snapshot.next);
+            setField('properties', snapshot.properties);
+            setField('audioCodec', snapshot.audioCodec);
+            setField('qualityLevel', snapshot.qualityLevel);
+            setField('durationText', snapshot.durationText);
+            setField('albumArtUrl', snapshot.artUrl);
+            setBackground(snapshot.artUrl);
+
+            if (animate) {
+                const root = document.getElementById('skin-root');
+                root.classList.remove('track-transition');
+                void root.offsetWidth;
+                root.classList.add('track-transition');
+            }
+        }
+
+        let progressRafPending = false;
+        function scheduleProgressRender() {
+            if (progressRafPending) {
+                return;
             }
 
-            const durationText = custom.DurationText || formatSeconds(state.durationSec);
-            const currentText = formatSeconds(state.currentTimeSec);
-            const ratio = state.durationSec > 0 ? Math.min(100, Math.max(0, (state.currentTimeSec / state.durationSec) * 100)) : 0;
-
-            // Always update time-sensitive fields
-            setField('currentPositionText', currentText);
-            setField('progressFill', `${ratio.toFixed(2)}%`);
-
-            // Only update metadata fields on full update (track change)
-            if (fullUpdate) {
-                console.log('Full metadata update - updating all fields including album art');
-                setField('trackTitle', metadata.title || custom.TrackTitle || 'Unknown title');
-                setField('artist', metadata.artist || custom.Artist || 'Unknown artist');
-                setField('album', metadata.albumName || custom.Album || '');
-                setField('albumArtist', metadata.albumArtist || custom.AlbumArtist || '');
-                setField('genre', custom.Genre || '');
-                setField('year', custom.Year || '');
-                setField('trackNumber', custom.TrackNumber || '');
-                setField('position', custom.Position || '');
-                setField('next', custom.Next || '');
-                setField('properties', custom.Properties || '');
-                setField('audioCodec', custom.AudioCodec || '');
-                setField('qualityLevel', custom.QualityLevel || '');
-                setField('durationText', durationText);
-                setField('albumArtUrl', artUrl);
-
-                // Update background on track change
-                console.log('Calling setBackground from renderData with:', artUrl);
-                setBackground(artUrl);
-            }
+            progressRafPending = true;
+            requestAnimationFrame(() => {
+                progressRafPending = false;
+                const snapshot = buildSnapshot();
+                applyProgressOnly(snapshot);
+            });
         }
 
         async function loadTheme() {
             try {
-                const resp = await fetch(state.themeEndpoint, { cache: 'no-store' });
+                const resp = await fetch(state.themeEndpoint, { cache: 'default' });
                 if (!resp.ok) {
                     console.log('Theme endpoint not available, using default theme');
                     applyDefaultTheme();
@@ -401,7 +473,7 @@
             let html = defaultLayout;
             try {
                 console.log('Fetching layout from:', state.layoutEndpoint);
-                const resp = await fetch(state.layoutEndpoint, { cache: 'no-store', mode: 'cors' });
+                const resp = await fetch(state.layoutEndpoint, { cache: 'default', mode: 'cors' });
                 console.log('Layout response status:', resp.status);
                 if (resp.ok) {
                     html = await resp.text();
@@ -429,6 +501,9 @@
         let loadCount = 0;
         let isLoadInProgress = false;
         let firstLoadComplete = false;
+        let currentTrackSignature = '';
+        let lastLayoutEndpoint = '';
+        let lastThemeEndpoint = '';
         let lastLoadTimestamp = 0;
         const LOAD_DEBOUNCE_MS = 500; // Ignore LOAD events within 500ms of last one
         const LOAD_DUPLICATE_WINDOW_MS = 3000;
@@ -483,20 +558,20 @@
                     return request;
                 }
 
-                document.getElementById('splash').style.visibility = 'hidden';
                 readMediaState(request);
 
-                // Extract album art URL for background
-                const images = request.media?.metadata?.images || [];
-                const artUrl = images.length > 0 ? images[0].url : '';
-                console.log('Album art URL from metadata:', artUrl);
+                const snapshot = buildSnapshot(request.media || {});
+                const nextTrackSignature = buildTrackSignature(snapshot);
+                const endpointsChanged = (state.layoutEndpoint !== lastLayoutEndpoint) || (state.themeEndpoint !== lastThemeEndpoint);
 
                 // Only load theme/layout on first load or if endpoints changed
-                if (!firstLoadComplete) {
-                    console.log('First load - loading theme and layout');
+                if (!firstLoadComplete || endpointsChanged) {
+                    console.log('Loading theme/layout for initial render or endpoint change');
                     await loadTheme();
                     await loadLayout();
                     firstLoadComplete = true;
+                    lastLayoutEndpoint = state.layoutEndpoint;
+                    lastThemeEndpoint = state.themeEndpoint;
 
                     // Wait for DOM to be ready before rendering on first load
                     await new Promise(resolve => setTimeout(resolve, 100));
@@ -504,8 +579,16 @@
                     console.log('Subsequent load - skipping theme/layout reload');
                 }
 
-                // renderData will handle setting the background
-                renderData(true); // Full update on track load
+                if (nextTrackSignature === currentTrackSignature) {
+                    console.log('Same track signature detected - applying progress-only update');
+                    applyProgressOnly(snapshot);
+                    revealUiOnce();
+                    return request;
+                }
+
+                applyTrackSnapshot(snapshot, true);
+                currentTrackSignature = nextTrackSignature;
+                revealUiOnce();
 
                 lastAcceptedContentId = incomingContentId;
                 lastAcceptedArtUrl = incomingArtUrl;
@@ -526,7 +609,7 @@
         const playerDataBinder = new cast.framework.ui.PlayerDataBinder(playerData);
         playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
             state.currentTimeSec = Number(e.value || 0);
-            renderData(false); // Time-only update, no metadata refresh
+            scheduleProgressRender();
         });
 
         // Listen for player state changes
