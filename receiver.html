@@ -1,10 +1,11 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>BeeCaster Receiver</title>
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/devtools/debug_layer/caf_receiver_logger.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { overflow: hidden; background: #000; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -48,6 +49,22 @@
 
         const context       = cast.framework.CastReceiverContext.getInstance();
         const playerManager = context.getPlayerManager();
+
+        // ── Cast SDK debug logger ─────────────────────────────────
+        var castDebugLogger = cast.debug.CastDebugLogger.getInstance();
+        context.addEventListener(cast.framework.system.EventType.READY, function() {
+            castDebugLogger.setEnabled(true);
+            castDebugLogger.showDebugLogs(true);
+            castDebugLogger.loggerLevelByEvents = {
+                'cast.framework.events.category.CORE'          : cast.framework.LoggerLevel.INFO,
+                'cast.framework.events.EventType.MEDIA_STATUS' : cast.framework.LoggerLevel.DEBUG,
+                'cast.framework.events.EventType.ERROR'        : cast.framework.LoggerLevel.ERROR
+            };
+            castDebugLogger.loggerLevelByTags = {
+                'BeeCaster': cast.framework.LoggerLevel.DEBUG
+            };
+            castDebugLogger.info('BeeCaster', 'Receiver ready — debug logger active');
+        });
 
         playerManager.setSupportedMediaCommands(
             cast.framework.messages.Command.ALL_BASIC_MEDIA |
@@ -178,6 +195,7 @@
             function(request) {
                 loadCount++;
                 console.log('[BeeCaster] LOAD #' + loadCount);
+                castDebugLogger.info('BeeCaster', 'LOAD #' + loadCount + ' contentId=' + ((request.media && request.media.contentId) || '?'));
 
                 try {
                     var media    = request.media    || {};
@@ -219,8 +237,10 @@
 
                     emit('LOAD', { contentId: media.contentId, customData: custom });
                     updateDebug(media.contentId, custom);
+                    castDebugLogger.info('BeeCaster', 'LOAD complete — ' + Object.keys(custom).length + ' customData fields');
                     console.log('[BeeCaster] LOAD complete — fields:', Object.keys(custom).length);
                 } catch (err) {
+                    castDebugLogger.error('BeeCaster', 'LOAD error: ' + err);
                     console.error('[BeeCaster] LOAD error:', err);
                 }
 
@@ -263,7 +283,10 @@
             emit('STATE_CHANGE', Object.assign({}, state));
         });
         playerManager.addEventListener(cast.framework.events.EventType.ERROR, function(e) {
-            console.error('[BeeCaster] Player error:', e.detailedErrorCode, e.error);
+            var msg = 'Player error code=' + e.detailedErrorCode;
+            console.error('[BeeCaster] ' + msg, e.error);
+            castDebugLogger.error('BeeCaster', msg);
+            document.getElementById('d-state').textContent = 'ERR ' + e.detailedErrorCode;
         });
 
         // ── Start ────────────────────────────────────────────────────
