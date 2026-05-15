@@ -51,19 +51,31 @@
         const playerManager = context.getPlayerManager();
 
         // ── Cast SDK debug logger ─────────────────────────────────
-        var castDebugLogger = cast.debug.CastDebugLogger.getInstance();
+        // Declared null here so that a missing caf_receiver_logger.js does NOT
+        // crash the script before context.start() is reached.
+        var castDebugLogger = null;
+        function dbgLog(level, tag, msg) { if (castDebugLogger) castDebugLogger[level](tag, msg); }
+
         context.addEventListener(cast.framework.system.EventType.READY, function() {
-            castDebugLogger.setEnabled(true);
-            castDebugLogger.showDebugLogs(true);
-            castDebugLogger.loggerLevelByEvents = {
-                'cast.framework.events.category.CORE'          : cast.framework.LoggerLevel.INFO,
-                'cast.framework.events.EventType.MEDIA_STATUS' : cast.framework.LoggerLevel.DEBUG,
-                'cast.framework.events.EventType.ERROR'        : cast.framework.LoggerLevel.ERROR
-            };
-            castDebugLogger.loggerLevelByTags = {
-                'BeeCaster': cast.framework.LoggerLevel.DEBUG
-            };
-            castDebugLogger.info('BeeCaster', 'Receiver ready — debug logger active');
+            try {
+                if (window.cast && cast.debug && cast.debug.CastDebugLogger) {
+                    castDebugLogger = cast.debug.CastDebugLogger.getInstance();
+                    castDebugLogger.setEnabled(true);
+                    castDebugLogger.showDebugLogs(true);
+                    castDebugLogger.loggerLevelByEvents = {
+                        'cast.framework.events.category.CORE'          : cast.framework.LoggerLevel.INFO,
+                        'cast.framework.events.EventType.MEDIA_STATUS' : cast.framework.LoggerLevel.DEBUG,
+                        'cast.framework.events.EventType.ERROR'        : cast.framework.LoggerLevel.ERROR
+                    };
+                    castDebugLogger.loggerLevelByTags = {
+                        'BeeCaster': cast.framework.LoggerLevel.DEBUG
+                    };
+                    castDebugLogger.info('BeeCaster', 'Receiver ready — debug logger active');
+                }
+            } catch (e) {
+                console.warn('[BeeCaster] CastDebugLogger init failed:', e);
+            }
+            console.log('[BeeCaster] Receiver READY');
         });
 
         playerManager.setSupportedMediaCommands(
@@ -195,7 +207,7 @@
             function(request) {
                 loadCount++;
                 console.log('[BeeCaster] LOAD #' + loadCount);
-                castDebugLogger.info('BeeCaster', 'LOAD #' + loadCount + ' contentId=' + ((request.media && request.media.contentId) || '?'));
+                dbgLog('info', 'BeeCaster', 'LOAD #' + loadCount + ' contentId=' + ((request.media && request.media.contentId) || '?'));
 
                 try {
                     var media    = request.media    || {};
@@ -237,10 +249,10 @@
 
                     emit('LOAD', { contentId: media.contentId, customData: custom });
                     updateDebug(media.contentId, custom);
-                    castDebugLogger.info('BeeCaster', 'LOAD complete — ' + Object.keys(custom).length + ' customData fields');
+                    dbgLog('info', 'BeeCaster', 'LOAD complete — ' + Object.keys(custom).length + ' customData fields');
                     console.log('[BeeCaster] LOAD complete — fields:', Object.keys(custom).length);
                 } catch (err) {
-                    castDebugLogger.error('BeeCaster', 'LOAD error: ' + err);
+                    dbgLog('error', 'BeeCaster', 'LOAD error: ' + err);
                     console.error('[BeeCaster] LOAD error:', err);
                 }
 
@@ -285,7 +297,7 @@
         playerManager.addEventListener(cast.framework.events.EventType.ERROR, function(e) {
             var msg = 'Player error code=' + e.detailedErrorCode;
             console.error('[BeeCaster] ' + msg, e.error);
-            castDebugLogger.error('BeeCaster', msg);
+            dbgLog('error', 'BeeCaster', msg);
             document.getElementById('d-state').textContent = 'ERR ' + e.detailedErrorCode;
         });
 
