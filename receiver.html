@@ -5,8 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>BeeCaster Receiver</title>
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <!-- Cast Debug Logger for on-device debugging -->
-    <script src="//www.gstatic.com/cast/sdk/libs/devtools/debug_layer/caf_receiver_logger.js"></script>
     <style>
         /* Base receiver styles */
         body {
@@ -58,35 +56,6 @@
             letter-spacing: 0.03em;
             text-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
         }
-
-        #debug-overlay {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 10000;
-            background: rgba(0, 0, 0, 0.95);
-            color: #00ff00;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-            padding: 15px;
-            border: 3px solid #00ff00;
-            border-radius: 8px;
-            line-height: 1.6;
-            max-width: 450px;
-            box-shadow: 0 0 30px rgba(0, 255, 0, 0.5), inset 0 0 10px rgba(0, 255, 0, 0.1);
-            pointer-events: none;
-            overflow-y: auto;
-            max-height: 80vh;
-        }
-
-        #debug-overlay div {
-            margin: 4px 0;
-        }
-
-        .debug-label {
-            color: #ffaa00;
-            font-weight: bold;
-        }
     </style>
 </head>
 <body>
@@ -94,47 +63,11 @@
     <div id="backdrop"></div>
     <div id="skin-root"></div>
     <div id="splash">BeeCaster</div>
-    <div id="debug-overlay">
-        <div><span class="debug-label">BEECASTER DEBUG</span></div>
-        <div>LOAD: <span id="debug-load-count">0</span></div>
-        <div>Layout: <span id="debug-layout-count">0</span></div>
-        <div>Theme: <span id="debug-theme-count">0</span></div>
-        <div>ContentID: <span id="debug-content-id">—</span></div>
-        <div>Fields: <span id="debug-fields">—</span></div>
-        <div>State: <span id="debug-state">idle</span></div>
-    </div>
 
     <script>
         const CHANNEL = 'urn:x-cast:com.google.cast.media';
-        const LOG_TAG = 'BeeCaster';
-        
-        // Initialize Cast Debug Logger (if device is registered)
-        let castDebugLogger = null;
-        try {
-            castDebugLogger = cast.debug.CastDebugLogger.getInstance();
-        } catch (e) {
-            console.log('CastDebugLogger not available - device may not be registered in Cast SDK Developer Console');
-        }
-        
         const context = cast.framework.CastReceiverContext.getInstance();
         const playerManager = context.getPlayerManager();
-        
-        // Enable debug logger on READY event
-        if (castDebugLogger) {
-            context.addEventListener(cast.framework.system.EventType.READY, () => {
-                if (!castDebugLogger.debugOverlayElement_) {
-                    castDebugLogger.setEnabled(true);
-                    castDebugLogger.showDebugLogs(true);
-                    castDebugLogger.info(LOG_TAG, 'Cast Debug Logger enabled');
-                }
-            });
-            
-            // Log player events for debugging
-            castDebugLogger.loggerLevelByEvents = {
-                'cast.framework.events.category.CORE': cast.framework.LoggerLevel.INFO,
-                'cast.framework.events.EventType.MEDIA_STATUS': cast.framework.LoggerLevel.DEBUG
-            };
-        }
 
         playerManager.setSupportedMediaCommands(
             cast.framework.messages.Command.ALL_BASIC_MEDIA |
@@ -409,8 +342,6 @@
 
         async function loadTheme() {
             try {
-                themeFetchCount++;
-                console.log(`[THEME] Fetching theme (attempt #${themeFetchCount})`);
                 const resp = await fetch(state.themeEndpoint, { cache: 'no-store' });
                 if (!resp.ok) {
                     console.log('Theme endpoint not available, using default theme');
@@ -447,12 +378,12 @@
         let layoutLoadCount = 0;
 
         async function loadLayout() {
-            layoutFetchCount++;
-            console.log(`=== loadLayout called (count: ${layoutFetchCount}) ===`);
+            layoutLoadCount++;
+            console.log(`=== loadLayout called (count: ${layoutLoadCount}) ===`);
 
             let html = defaultLayout;
             try {
-                console.log(`[LAYOUT] Fetching layout (attempt #${layoutFetchCount}) from:`, state.layoutEndpoint);
+                console.log('Fetching layout from:', state.layoutEndpoint);
                 const resp = await fetch(state.layoutEndpoint, { cache: 'no-store', mode: 'cors' });
                 console.log('Layout response status:', resp.status);
                 if (resp.ok) {
@@ -478,62 +409,29 @@
         }
 
         let loadCount = 0;
-        let layoutFetchCount = 0;
-        let themeFetchCount = 0;
         let isLoadInProgress = false;
         let firstLoadComplete = false;
         let lastLoadTimestamp = 0;
-        let lastContentId = '';
         const LOAD_DEBOUNCE_MS = 500; // Ignore LOAD events within 500ms of last one
-
-        // Real on-screen debug overlay update
-        function updateDebugOverlay() {
-            try {
-                document.getElementById('debug-load-count').textContent = loadCount;
-                document.getElementById('debug-layout-count').textContent = layoutFetchCount;
-                document.getElementById('debug-theme-count').textContent = themeFetchCount;
-                
-                const shortId = lastContentId ? lastContentId.substring(0, 16) : '—';
-                document.getElementById('debug-content-id').textContent = shortId;
-                
-                const metadataFields = Object.keys(state.customData)
-                    .filter(k => k.match(/AudioCodec|QualityLevel|Properties|Genre/))
-                    .length;
-                document.getElementById('debug-fields').textContent = metadataFields > 0 ? `${metadataFields} ✓` : '0';
-                
-                const stateText = isLoadInProgress ? 'LOADING' : (firstLoadComplete ? 'PLAYING' : 'INIT');
-                document.getElementById('debug-state').textContent = stateText;
-            } catch (e) {
-                console.error('Debug overlay update failed:', e);
-            }
-        }
-        
-        // Update overlay periodically
-        setInterval(updateDebugOverlay, 500);
 
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, async request => {
             loadCount++;
             const now = Date.now();
             const timeSinceLastLoad = now - lastLoadTimestamp;
 
-            const logMsg = `=== LOAD interceptor #${loadCount} === Time since last: ${timeSinceLastLoad}ms`;
-            console.log(logMsg);
-            if (castDebugLogger) castDebugLogger.info(LOG_TAG, logMsg);
+            console.log(`=== LOAD interceptor triggered (call #${loadCount}) ===`);
             console.log('Timestamp:', new Date().toISOString());
+            console.log('Time since last LOAD:', timeSinceLastLoad, 'ms');
             console.log('First load complete:', firstLoadComplete);
 
             // Debounce rapid LOAD events
             if (timeSinceLastLoad < LOAD_DEBOUNCE_MS && loadCount > 1) {
-                const skipMsg = `LOAD event too soon (${timeSinceLastLoad}ms), ignoring as duplicate`;
-                console.warn(skipMsg);
-                if (castDebugLogger) castDebugLogger.warn(LOG_TAG, skipMsg);
+                console.warn(`LOAD event too soon (${timeSinceLastLoad}ms), ignoring as duplicate`);
                 return request;
             }
 
             if (isLoadInProgress) {
-                const inProgressMsg = 'LOAD already in progress, ignoring duplicate call';
-                console.warn(inProgressMsg);
-                if (castDebugLogger) castDebugLogger.warn(LOG_TAG, inProgressMsg);
+                console.warn('LOAD already in progress, ignoring duplicate call');
                 return request;
             }
 
@@ -541,29 +439,11 @@
             isLoadInProgress = true;
 
             try {
-                lastContentId = request.media?.contentId || '';
                 console.log('Media info:', request.media);
-                console.log('Content ID:', lastContentId);
+                console.log('Content ID:', request.media?.contentId);
                 console.log('Content Type:', request.media?.contentType);
                 console.log('Stream Type:', request.media?.streamType);
-                const customDataKeys = Object.keys(request.media?.customData || {});
-                console.log('Custom Data keys:', customDataKeys);
-                if (castDebugLogger) {
-                    castDebugLogger.debug(LOG_TAG, `Content ID: ${lastContentId.substring(0, 30)}`);
-                    castDebugLogger.debug(LOG_TAG, `Custom Data fields: ${customDataKeys.length}`);
-                }
-                
-                if (customDataKeys.length > 0) {
-                    customDataKeys.forEach(key => {
-                        if (request.media.customData[key]) {
-                            const fieldMsg = `${key}: ${String(request.media.customData[key]).substring(0, 40)}`;
-                            console.log(`  ${fieldMsg}`);
-                            if (castDebugLogger && key.match(/AudioCodec|QualityLevel|Properties|Genre/)) {
-                                castDebugLogger.debug(LOG_TAG, fieldMsg);
-                            }
-                        }
-                    });
-                }
+                console.log('Custom Data keys:', Object.keys(request.media?.customData || {}));
 
                 document.getElementById('splash').style.visibility = 'hidden';
                 readMediaState(request);
@@ -590,9 +470,6 @@
                 renderData(true); // Full update on track load
 
                 console.log('=== LOAD interceptor complete ===');
-                if (castDebugLogger) castDebugLogger.info(LOG_TAG, `LOAD complete. Fields populated: ${Object.keys(state.customData).length}`);
-                updateDebugOverlay();
-                updateDebugOverlay();
             } catch (error) {
                 console.error('Error in LOAD interceptor:', error);
             } finally {
@@ -651,28 +528,9 @@
         // Enable detailed logs for debugging
         options.disableIdleTimeout = false;
         options.maxInactivity = 3600; // 1 hour
-        options.debug = true; // Enable Cast SDK debugging
 
         console.log('Starting Cast receiver context with options:', options);
         context.start(options);
-
-        // Set detailed logger level after context starts
-        try {
-            cast.framework.CastReceiverContext.getInstance().setLoggerLevel(cast.framework.LoggerLevel.DEBUG);
-            console.log('[DEBUG] Cast SDK logger level set to DEBUG');
-        } catch (e) {
-            console.log('[DEBUG] Could not set logger level:', e);
-        }
-
-        // Enable Cast Debug Logger overlay if available
-        if (cast.framework.CastDebugLogger) {
-            try {
-                cast.framework.CastDebugLogger.getInstance().setEnabled(true);
-                console.log('[DEBUG] Cast Debug Logger overlay enabled on receiver');
-            } catch (e) {
-                console.log('[DEBUG] Cast Debug Logger not available:', e);
-            }
-        }
     </script>
 </body>
 </html>
