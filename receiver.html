@@ -648,6 +648,20 @@
 
                 applyTrackSnapshot(snapshot, true);
                 currentTrackSignature = nextTrackSignature;
+
+                // On the very first reveal: wait for the background art to finish loading
+                // before fading the splash away. Without this, the splash fades while
+                // #backdrop and #art-blur-light are still empty, causing a black flash.
+                // On subsequent reveals (body already has 'ready') this is a no-op.
+                if (!document.body.classList.contains('ready') && snapshot.artUrl) {
+                    console.log('[reveal] waiting for background before first reveal');
+                    await new Promise(resolve => {
+                        const probe = new Image();
+                        probe.onload = probe.onerror = () => resolve();
+                        probe.src = snapshot.artUrl;
+                    });
+                }
+
                 revealUiOnce();
 
                 lastAcceptedContentId = incomingContentId;
