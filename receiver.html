@@ -380,9 +380,11 @@
 
         function revealUiOnce() {
             if (document.body.classList.contains('ready')) {
+                console.log('[reveal] already revealed — no-op');
                 return;
             }
 
+            console.log('[reveal] hiding splash, showing UI');
             document.body.classList.add('ready');
         }
 
