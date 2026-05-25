@@ -41,6 +41,18 @@
         /* #backdrop removed — was the most expensive compositor layer (single tiles: 300–481ms) */
         #backdrop { display: none; }
 
+        /* HLS background video — overrides global video{opacity:0} from CAF audio element */
+        #hls-bg {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            z-index: 1;
+            opacity: 1;
+            display: none;
+        }
+
         #skin-root {
             position: absolute;
             inset: 0;
@@ -1157,5 +1169,22 @@
       }());
     </script>
     <!-- ═══════════════════ END PERF DEMO ════════════════════════════════════ -->
+
+    <!-- HLS video background — muted, hidden until stream is ready -->
+    <video id="hls-bg" muted playsinline autoplay></video>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+    <script>
+      (function () {
+        var video = document.getElementById('hls-bg');
+        if (!window.Hls || !Hls.isSupported()) return;
+        var hls = new Hls({ lowLatencyMode: true });
+        hls.loadSource('/cast/stream/stream.m3u8');
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, function () {
+          video.style.display = 'block';
+          video.play();
+        });
+      }());
+    </script>
 </body>
 </html>
