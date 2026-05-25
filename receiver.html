@@ -591,15 +591,15 @@
             console.log('Time since last LOAD:', timeSinceLastLoad, 'ms');
             console.log('First load complete:', firstLoadComplete);
 
-            // Debounce rapid LOAD events
+            // Debounce rapid LOAD events — return null to abort so CAF doesn't restart the player
             if (timeSinceLastLoad < LOAD_DEBOUNCE_MS && loadCount > 1) {
-                console.warn(`LOAD event too soon (${timeSinceLastLoad}ms), ignoring as duplicate`);
-                return request;
+                console.warn(`LOAD event too soon (${timeSinceLastLoad}ms), dropping duplicate`);
+                return null;
             }
 
             if (isLoadInProgress) {
-                console.warn('LOAD already in progress, ignoring duplicate call');
-                return request;
+                console.warn('LOAD already in progress, dropping concurrent duplicate');
+                return null;
             }
 
             lastLoadTimestamp = now;
@@ -624,8 +624,8 @@
                     incomingArtUrl === lastAcceptedArtUrl &&
                     sinceAcceptedMs < LOAD_DUPLICATE_WINDOW_MS
                 ) {
-                    console.warn(`Ignoring duplicate LOAD for same content within ${LOAD_DUPLICATE_WINDOW_MS}ms`);
-                    return request;
+                    console.warn(`Dropping duplicate LOAD for same content within ${LOAD_DUPLICATE_WINDOW_MS}ms`);
+                    return null;
                 }
 
                 readMediaState(request);
@@ -891,6 +891,7 @@
             if (!msg) return;
             if (msg.type === 'UPDATE_ART') {
                 console.log('[art-update] Received UPDATE_ART:', msg.artUrl);
+                setField('albumArtUrl', msg.artUrl);
                 setBackground(msg.artUrl);
             }
         });
