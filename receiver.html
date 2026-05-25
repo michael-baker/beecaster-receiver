@@ -324,6 +324,8 @@
             state.layoutEndpoint = state.customData.LayoutEndpoint || (baseUrl ? baseUrl + 'cast/layout' : '/cast/layout');
             state.themeEndpoint = state.customData.ThemeEndpoint || (baseUrl ? baseUrl + 'cast/theme' : '/cast/theme');
 
+            if (baseUrl) startHlsBg(baseUrl);
+
             console.log('Layout endpoint:', state.layoutEndpoint);
             console.log('Theme endpoint:', state.themeEndpoint);
 
@@ -938,17 +940,29 @@
     <video id="hls-bg" muted playsinline autoplay></video>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
     <script>
-      (function () {
+      var _hlsStarted = false;
+      function startHlsBg(baseUrl) {
+        if (_hlsStarted || !baseUrl) return;
+        if (!window.Hls || !Hls.isSupported()) {
+          console.warn('[hls-bg] hls.js unavailable or MSE not supported');
+          return;
+        }
+        _hlsStarted = true;
         var video = document.getElementById('hls-bg');
-        if (!window.Hls || !Hls.isSupported()) return;
         var hls = new Hls({ lowLatencyMode: true });
-        hls.loadSource('/cast/stream/stream.m3u8');
+        var url = baseUrl + 'cast/stream/stream.m3u8';
+        console.log('[hls-bg] loading', url);
+        hls.loadSource(url);
         hls.attachMedia(video);
         hls.on(Hls.Events.MANIFEST_PARSED, function () {
+          console.log('[hls-bg] manifest parsed, starting playback');
           video.style.display = 'block';
           video.play();
         });
-      }());
+        hls.on(Hls.Events.ERROR, function (event, data) {
+          if (data.fatal) console.error('[hls-bg] fatal error', data.type, data.details);
+        });
+      }
     </script>
 </body>
 </html>
