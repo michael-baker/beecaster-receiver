@@ -930,19 +930,15 @@
         font-family: 'Segoe UI', Roboto, Arial, sans-serif; color: #f0f0ff;
       }
       #pd-bg {
+        /* Static gradient — no filter animation (filter:hue-rotate kills Vivante GPU) */
         position: absolute; inset: 0;
         background: linear-gradient(135deg, #3d2645 0%, #1a0a2e 50%, #0a1a3d 100%);
-        animation: pd-bgShift 10s ease-in-out infinite alternate;
-        will-change: filter;
-      }
-      @keyframes pd-bgShift {
-        from { filter: hue-rotate(0deg) brightness(0.9); }
-        to   { filter: hue-rotate(45deg) brightness(1.1); }
       }
       .pd-orb { position: absolute; border-radius: 50%; will-change: transform; }
-      .pd-orb-a { width: 44vw; height: 44vw; background: radial-gradient(circle, rgba(233,75,158,0.55), transparent 70%); filter: blur(32px); animation: pd-orbA 13s ease-in-out infinite alternate; }
-      .pd-orb-b { width: 52vw; height: 52vw; background: radial-gradient(circle, rgba(107,114,255,0.50), transparent 70%); filter: blur(28px); animation: pd-orbB 17s ease-in-out infinite alternate; }
-      .pd-orb-c { width: 38vw; height: 38vw; background: radial-gradient(circle, rgba(166,77,255,0.45), transparent 70%); filter: blur(36px); animation: pd-orbC 11s ease-in-out infinite alternate; }
+      /* No filter:blur() — confirmed 300–481ms per tile on Chromecast v2 */
+      .pd-orb-a { width: 44vw; height: 44vw; background: radial-gradient(circle, rgba(233,75,158,0.45), transparent 70%); animation: pd-orbA 13s ease-in-out infinite alternate; }
+      .pd-orb-b { width: 52vw; height: 52vw; background: radial-gradient(circle, rgba(107,114,255,0.40), transparent 70%); animation: pd-orbB 17s ease-in-out infinite alternate; }
+      .pd-orb-c { width: 38vw; height: 38vw; background: radial-gradient(circle, rgba(166,77,255,0.40), transparent 70%); animation: pd-orbC 11s ease-in-out infinite alternate; }
       @keyframes pd-orbA { from { transform: translate(4vw,8vh);   } to { transform: translate(56vw,55vh); } }
       @keyframes pd-orbB { from { transform: translate(48vw,4vh);  } to { transform: translate(8vw,52vh);  } }
       @keyframes pd-orbC { from { transform: translate(28vw,42vh); } to { transform: translate(64vw,8vh);  } }
@@ -951,7 +947,8 @@
       @keyframes pd-rigSpin { from { transform: translate(-50%,-50%) rotateX(15deg) rotateY(0deg); } to { transform: translate(-50%,-50%) rotateX(15deg) rotateY(360deg); } }
       .pd-cube { position: relative; width: 180px; height: 180px; transform-style: preserve-3d; animation: pd-cubeWobble 4s ease-in-out infinite alternate; }
       @keyframes pd-cubeWobble { from { transform: rotateX(0deg) rotateZ(0deg); } to { transform: rotateX(30deg) rotateZ(15deg); } }
-      .pd-face { position: absolute; width: 180px; height: 180px; border: 1.5px solid rgba(255,255,255,0.25); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: rgba(255,255,255,0.5); text-transform: uppercase; backdrop-filter: blur(6px); }
+      /* No backdrop-filter — confirmed fatal on Vivante GPU */
+      .pd-face { position: absolute; width: 180px; height: 180px; border: 1.5px solid rgba(255,255,255,0.25); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: rgba(255,255,255,0.6); text-transform: uppercase; }
       .pd-face-f { transform: translateZ(90px);                background: rgba(233, 75,158,0.10); }
       .pd-face-b { transform: rotateY(180deg) translateZ(90px); background: rgba(107,114,255,0.10); }
       .pd-face-l { transform: rotateY(-90deg) translateZ(90px); background: rgba(166, 77,255,0.10); }
@@ -969,7 +966,8 @@
       .pd-sphere-1 { transform: translateX(200px); background: radial-gradient(circle at 35% 35%, #fff, #e94b9e); box-shadow: 0 0 18px rgba(233,75,158,0.9); }
       .pd-sphere-2 { transform: translateX(260px); background: radial-gradient(circle at 35% 35%, #fff, #6b72ff); box-shadow: 0 0 18px rgba(107,114,255,0.9); }
       .pd-sphere-3 { transform: translateX(230px); background: radial-gradient(circle at 35% 35%, #fff, #1db954); box-shadow: 0 0 18px rgba( 29,185, 84,0.9); }
-      .pd-card { position: absolute; border-radius: 18px; padding: 18px 22px; border: 1px solid rgba(255,255,255,0.14); backdrop-filter: blur(14px) saturate(160%); background: rgba(255,255,255,0.05); will-change: transform; }
+      /* No backdrop-filter on cards either */
+      .pd-card { position: absolute; border-radius: 18px; padding: 18px 22px; border: 1px solid rgba(255,255,255,0.18); background: rgba(0,0,0,0.55); will-change: transform; }
       .pd-card-tag { font-size: 10px; color: rgba(255,255,255,0.45); text-transform: uppercase; letter-spacing: 0.12em; }
       .pd-card-val { font-size: 22px; font-weight: 700; margin-top: 6px; }
       .pd-card-1 { left: 4%;  top: 14%; width: 210px; animation: pd-fc1 7s   ease-in-out infinite alternate; }
@@ -1042,10 +1040,10 @@
         <div class="pd-h-row"><span class="pd-h-label">p95 frame</span><span class="pd-h-val" id="pd-p95-val">--</span></div>
         <hr class="pd-h-divider">
         <div id="pd-feature-list">
-          ● Animated gradient bg<br>
-          ● 3× blurred orbs (blur 28–36px)<br>
+          ● Static gradient bg (no filter)<br>
+          ● 3× radial-gradient orbs (no blur)<br>
           ● CSS 3D cube + 3 orbit rings<br>
-          ● backdrop-filter on 7 elements<br>
+          ● Solid cards (no backdrop-filter)<br>
           ● 80-pt canvas particle net<br>
           ● 9× scaleX progress bars @ 60fps
         </div>
