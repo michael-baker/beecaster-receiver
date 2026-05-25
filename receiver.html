@@ -223,7 +223,6 @@
   background: linear-gradient(90deg, var(--np-accent), #63e29f);
   transform-origin: left center;
   transform: scaleX(0);
-  transition: transform 0.28s linear;
   will-change: transform;
 }
 
@@ -482,25 +481,36 @@
             return bgPromise;
         }
 
-        let progressRafPending = false;
-        let lastProgressMs = 0;
-        const PROGRESS_MIN_INTERVAL_MS = 250;
-
-        function scheduleProgressRender() {
-            if (progressRafPending) {
-                return;
+        // Continuous transform-only RAF loop — compositor-only, never triggers layout
+        let _lastFillScaleStr = null;
+        (function startProgressFillLoop() {
+            function tick() {
+                if (state.durationSec > 0) {
+                    const ratio = Math.min(1, Math.max(0, state.currentTimeSec / state.durationSec));
+                    const scaleStr = `scaleX(${ratio.toFixed(4)})`;
+                    if (scaleStr !== _lastFillScaleStr) {
+                        _lastFillScaleStr = scaleStr;
+                        const nodes = getFieldNodes('progressFill');
+                        for (let i = 0; i < nodes.length; i++) nodes[i].style.transform = scaleStr;
+                    }
+                }
+                requestAnimationFrame(tick);
             }
+            requestAnimationFrame(tick);
+        }());
 
-            progressRafPending = true;
-            requestAnimationFrame(() => {
-                progressRafPending = false;
-                const now = performance.now();
-                if (now - lastProgressMs < PROGRESS_MIN_INTERVAL_MS) return;
-                lastProgressMs = now;
-                const snapshot = buildSnapshot();
-                applyProgressOnly(snapshot);
-            });
-        }
+        // Time text at 500ms — decoupled from animation frames to avoid layout thrash
+        let _lastTimeDisplaySec = -1;
+        setInterval(() => {
+            const whole = Math.floor(state.currentTimeSec);
+            if (whole === _lastTimeDisplaySec) return;
+            _lastTimeDisplaySec = whole;
+            const text = formatSeconds(state.currentTimeSec);
+            const nodes = getFieldNodes('currentPositionText');
+            for (let i = 0; i < nodes.length; i++) {
+                if (nodes[i].textContent !== text) nodes[i].textContent = text;
+            }
+        }, 500);
 
         async function loadTheme() {
             try {
@@ -707,7 +717,6 @@
         const playerDataBinder = new cast.framework.ui.PlayerDataBinder(playerData);
         playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
             state.currentTimeSec = Number(e.value || 0);
-            scheduleProgressRender();
         });
 
         // Listen for player state changes
