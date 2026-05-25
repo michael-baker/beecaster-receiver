@@ -922,5 +922,242 @@
             console.error('[CRASH] context.start() threw:', e);
         }
     </script>
+
+    <!-- ═══════════════════ PERF DEMO — remove when done ════════════════════ -->
+    <style>
+      #perf-demo {
+        position: fixed; inset: 0; z-index: 50; overflow: hidden;
+        font-family: 'Segoe UI', Roboto, Arial, sans-serif; color: #f0f0ff;
+      }
+      #pd-bg {
+        position: absolute; inset: 0;
+        background: linear-gradient(135deg, #3d2645 0%, #1a0a2e 50%, #0a1a3d 100%);
+        animation: pd-bgShift 10s ease-in-out infinite alternate;
+        will-change: filter;
+      }
+      @keyframes pd-bgShift {
+        from { filter: hue-rotate(0deg) brightness(0.9); }
+        to   { filter: hue-rotate(45deg) brightness(1.1); }
+      }
+      .pd-orb { position: absolute; border-radius: 50%; will-change: transform; }
+      .pd-orb-a { width: 44vw; height: 44vw; background: radial-gradient(circle, rgba(233,75,158,0.55), transparent 70%); filter: blur(32px); animation: pd-orbA 13s ease-in-out infinite alternate; }
+      .pd-orb-b { width: 52vw; height: 52vw; background: radial-gradient(circle, rgba(107,114,255,0.50), transparent 70%); filter: blur(28px); animation: pd-orbB 17s ease-in-out infinite alternate; }
+      .pd-orb-c { width: 38vw; height: 38vw; background: radial-gradient(circle, rgba(166,77,255,0.45), transparent 70%); filter: blur(36px); animation: pd-orbC 11s ease-in-out infinite alternate; }
+      @keyframes pd-orbA { from { transform: translate(4vw,8vh);   } to { transform: translate(56vw,55vh); } }
+      @keyframes pd-orbB { from { transform: translate(48vw,4vh);  } to { transform: translate(8vw,52vh);  } }
+      @keyframes pd-orbC { from { transform: translate(28vw,42vh); } to { transform: translate(64vw,8vh);  } }
+      #pd-scene3d { position: absolute; inset: 0; perspective: 900px; perspective-origin: 50% 48%; }
+      #pd-cube-rig { position: absolute; left: 50%; top: 50%; transform-style: preserve-3d; animation: pd-rigSpin 6s linear infinite; }
+      @keyframes pd-rigSpin { from { transform: translate(-50%,-50%) rotateX(15deg) rotateY(0deg); } to { transform: translate(-50%,-50%) rotateX(15deg) rotateY(360deg); } }
+      .pd-cube { position: relative; width: 180px; height: 180px; transform-style: preserve-3d; animation: pd-cubeWobble 4s ease-in-out infinite alternate; }
+      @keyframes pd-cubeWobble { from { transform: rotateX(0deg) rotateZ(0deg); } to { transform: rotateX(30deg) rotateZ(15deg); } }
+      .pd-face { position: absolute; width: 180px; height: 180px; border: 1.5px solid rgba(255,255,255,0.25); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: rgba(255,255,255,0.5); text-transform: uppercase; backdrop-filter: blur(6px); }
+      .pd-face-f { transform: translateZ(90px);                background: rgba(233, 75,158,0.10); }
+      .pd-face-b { transform: rotateY(180deg) translateZ(90px); background: rgba(107,114,255,0.10); }
+      .pd-face-l { transform: rotateY(-90deg) translateZ(90px); background: rgba(166, 77,255,0.10); }
+      .pd-face-r { transform: rotateY( 90deg) translateZ(90px); background: rgba( 29,185, 84,0.10); }
+      .pd-face-t { transform: rotateX( 90deg) translateZ(90px); background: rgba(100,220,255,0.10); }
+      .pd-face-d { transform: rotateX(-90deg) translateZ(90px); background: rgba(255,180, 80,0.08); }
+      .pd-ring { position: absolute; left: 50%; top: 50%; transform-style: preserve-3d; }
+      .pd-ring-1 { animation: pd-ring1 2.8s linear infinite; }
+      .pd-ring-2 { animation: pd-ring2 4.2s linear infinite; }
+      .pd-ring-3 { animation: pd-ring3 6.0s linear infinite; }
+      @keyframes pd-ring1 { from { transform: translate(-50%,-50%) rotateX(75deg) rotateZ(0deg);                  } to { transform: translate(-50%,-50%) rotateX(75deg) rotateZ(360deg);                  } }
+      @keyframes pd-ring2 { from { transform: translate(-50%,-50%) rotateY(70deg) rotateX(20deg) rotateZ(0deg);   } to { transform: translate(-50%,-50%) rotateY(70deg) rotateX(20deg) rotateZ(360deg);   } }
+      @keyframes pd-ring3 { from { transform: translate(-50%,-50%) rotateX(40deg) rotateY(55deg) rotateZ(0deg);   } to { transform: translate(-50%,-50%) rotateX(40deg) rotateY(55deg) rotateZ(360deg);   } }
+      .pd-sphere { position: absolute; width: 18px; height: 18px; border-radius: 50%; will-change: transform; }
+      .pd-sphere-1 { transform: translateX(200px); background: radial-gradient(circle at 35% 35%, #fff, #e94b9e); box-shadow: 0 0 18px rgba(233,75,158,0.9); }
+      .pd-sphere-2 { transform: translateX(260px); background: radial-gradient(circle at 35% 35%, #fff, #6b72ff); box-shadow: 0 0 18px rgba(107,114,255,0.9); }
+      .pd-sphere-3 { transform: translateX(230px); background: radial-gradient(circle at 35% 35%, #fff, #1db954); box-shadow: 0 0 18px rgba( 29,185, 84,0.9); }
+      .pd-card { position: absolute; border-radius: 18px; padding: 18px 22px; border: 1px solid rgba(255,255,255,0.14); backdrop-filter: blur(14px) saturate(160%); background: rgba(255,255,255,0.05); will-change: transform; }
+      .pd-card-tag { font-size: 10px; color: rgba(255,255,255,0.45); text-transform: uppercase; letter-spacing: 0.12em; }
+      .pd-card-val { font-size: 22px; font-weight: 700; margin-top: 6px; }
+      .pd-card-1 { left: 4%;  top: 14%; width: 210px; animation: pd-fc1 7s   ease-in-out infinite alternate; }
+      .pd-card-2 { right: 4%; top: 18%; width: 195px; animation: pd-fc2 9s   ease-in-out infinite alternate; }
+      .pd-card-3 { left: 8%;  bottom: 14%; width: 185px; animation: pd-fc3 5.5s ease-in-out infinite alternate; }
+      .pd-card-4 { right: 8%; bottom: 12%; width: 200px; animation: pd-fc4 8s   ease-in-out infinite alternate; }
+      @keyframes pd-fc1 { from { transform: translateY(0) rotate(-1.5deg); } to { transform: translateY(-28px) rotate(2deg);   } }
+      @keyframes pd-fc2 { from { transform: translateY(0) rotate(1deg);    } to { transform: translateY(22px)  rotate(-2deg);  } }
+      @keyframes pd-fc3 { from { transform: translateY(0) rotate(0.5deg);  } to { transform: translateY(-18px) rotate(-1.5deg);} }
+      @keyframes pd-fc4 { from { transform: translateY(0) rotate(-1deg);   } to { transform: translateY(16px)  rotate(1.5deg); } }
+      #pd-canvas { position: absolute; inset: 0; pointer-events: none; will-change: transform; }
+      #pd-pbar-zone { position: absolute; bottom: 18px; left: 18px; right: 260px; }
+      .pd-pbar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+      .pd-pbar-track { flex: 1; height: 7px; border-radius: 999px; background: rgba(255,255,255,0.12); overflow: hidden; contain: paint layout; }
+      .pd-pbar-fill { height: 100%; transform-origin: left center; transform: scaleX(0); border-radius: 999px; will-change: transform; }
+      .pd-pbar-fill-a { background: linear-gradient(90deg, #e94b9e, #a64dff); }
+      .pd-pbar-fill-b { background: linear-gradient(90deg, #6b72ff, #1db954); }
+      .pd-pbar-fill-c { background: linear-gradient(90deg, #f5a623, #e94b9e); }
+      .pd-pbar-time { font-size: 11px; font-variant-numeric: tabular-nums; color: rgba(255,255,255,0.5); width: 36px; text-align: right; }
+      #pd-pbar-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(255,255,255,0.3); margin-bottom: 6px; }
+      #pd-hud { position: absolute; top: 18px; right: 18px; background: rgba(0,0,0,0.72); border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; padding: 16px 20px; width: 230px; }
+      .pd-h-label { font-size: 10px; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 0.1em; margin-top: 10px; }
+      .pd-h-label:first-child { margin-top: 0; }
+      .pd-h-val { font-size: 15px; font-weight: 600; margin-top: 2px; }
+      #pd-fps-val { font-size: 42px; font-weight: 800; line-height: 1; margin-top: 2px; }
+      #pd-fps-val.ok   { color: #1db954; }
+      #pd-fps-val.warn { color: #f5a623; }
+      #pd-fps-val.bad  { color: #e94b4b; }
+      .pd-h-row { display: flex; justify-content: space-between; align-items: baseline; margin-top: 8px; }
+      .pd-h-row .pd-h-label { margin-top: 0; }
+      .pd-h-divider { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 10px 0 0; }
+      #pd-feature-list { font-size: 10px; color: rgba(255,255,255,0.35); margin-top: 8px; line-height: 1.7; }
+    </style>
+
+    <div id="perf-demo">
+      <div id="pd-bg"></div>
+      <div class="pd-orb pd-orb-a"></div>
+      <div class="pd-orb pd-orb-b"></div>
+      <div class="pd-orb pd-orb-c"></div>
+      <div class="pd-card pd-card-1"><div class="pd-card-tag">CSS backdrop-filter</div><div class="pd-card-val">blur(14px)</div></div>
+      <div class="pd-card pd-card-2"><div class="pd-card-tag">CSS 3D transforms</div><div class="pd-card-val">preserve-3d</div></div>
+      <div class="pd-card pd-card-3"><div class="pd-card-tag">Animated orbs</div><div class="pd-card-val">blur + scale</div></div>
+      <div class="pd-card pd-card-4"><div class="pd-card-tag">Particle canvas</div><div class="pd-card-val">80 pts</div></div>
+      <div id="pd-scene3d">
+        <div id="pd-cube-rig">
+          <div class="pd-cube">
+            <div class="pd-face pd-face-f">front</div>
+            <div class="pd-face pd-face-b">back</div>
+            <div class="pd-face pd-face-l">left</div>
+            <div class="pd-face pd-face-r">right</div>
+            <div class="pd-face pd-face-t">top</div>
+            <div class="pd-face pd-face-d">btm</div>
+          </div>
+        </div>
+        <div class="pd-ring pd-ring-1"><div class="pd-sphere pd-sphere-1"></div></div>
+        <div class="pd-ring pd-ring-2"><div class="pd-sphere pd-sphere-2"></div></div>
+        <div class="pd-ring pd-ring-3"><div class="pd-sphere pd-sphere-3"></div></div>
+      </div>
+      <canvas id="pd-canvas"></canvas>
+      <div id="pd-pbar-zone">
+        <div id="pd-pbar-label">scaleX progress bars — 9× our NowPlaying use case</div>
+        <div id="pd-pbar-rows"></div>
+      </div>
+      <div id="pd-hud">
+        <div class="pd-h-label">Frames / sec</div>
+        <div id="pd-fps-val" class="ok">--</div>
+        <hr class="pd-h-divider">
+        <div class="pd-h-row"><span class="pd-h-label">Frame time</span><span class="pd-h-val" id="pd-ft-val">--</span></div>
+        <div class="pd-h-row"><span class="pd-h-label">Jank (&gt;50ms)</span><span class="pd-h-val" id="pd-jank-val">0</span></div>
+        <div class="pd-h-row"><span class="pd-h-label">p95 frame</span><span class="pd-h-val" id="pd-p95-val">--</span></div>
+        <hr class="pd-h-divider">
+        <div id="pd-feature-list">
+          ● Animated gradient bg<br>
+          ● 3× blurred orbs (blur 28–36px)<br>
+          ● CSS 3D cube + 3 orbit rings<br>
+          ● backdrop-filter on 7 elements<br>
+          ● 80-pt canvas particle net<br>
+          ● 9× scaleX progress bars @ 60fps
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const fpsEl  = document.getElementById('pd-fps-val');
+        const ftEl   = document.getElementById('pd-ft-val');
+        const jankEl = document.getElementById('pd-jank-val');
+        const p95El  = document.getElementById('pd-p95-val');
+        const WINDOW = 90;
+        const frameTimes = [];
+        let prevNow = performance.now(), jankCount = 0;
+
+        function hudTick(now) {
+          const dt = now - prevNow; prevNow = now;
+          if (dt > 0) {
+            frameTimes.push(dt);
+            if (frameTimes.length > WINDOW) frameTimes.shift();
+            if (dt > 50) jankCount++;
+          }
+          if (frameTimes.length > 1) {
+            const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+            const fps = 1000 / avg;
+            const sorted = frameTimes.slice().sort((a, b) => b - a);
+            const p95 = sorted[Math.floor(sorted.length * 0.05)] || avg;
+            fpsEl.textContent = fps.toFixed(0);
+            fpsEl.className = fps >= 50 ? 'ok' : fps >= 25 ? 'warn' : 'bad';
+            ftEl.textContent = avg.toFixed(1) + 'ms';
+            jankEl.textContent = jankCount;
+            p95El.textContent = p95.toFixed(1) + 'ms';
+          }
+          requestAnimationFrame(hudTick);
+        }
+        requestAnimationFrame(hudTick);
+
+        const pdCanvas = document.getElementById('pd-canvas');
+        const ctx = pdCanvas.getContext('2d');
+        const N = 80;
+        function resizePdCanvas() { pdCanvas.width = window.innerWidth; pdCanvas.height = window.innerHeight; }
+        resizePdCanvas();
+        window.addEventListener('resize', resizePdCanvas);
+        const pts = Array.from({ length: N }, () => ({
+          x: Math.random() * window.innerWidth, y: Math.random() * window.innerHeight,
+          vx: (Math.random() - 0.5) * 1.4, vy: (Math.random() - 0.5) * 1.4,
+          r: Math.random() * 2.5 + 1, h: Math.random() * 60 + 255,
+        }));
+        function drawCanvas() {
+          const W = pdCanvas.width, H = pdCanvas.height;
+          ctx.clearRect(0, 0, W, H);
+          ctx.lineWidth = 0.6;
+          for (let i = 0; i < N; i++) {
+            for (let j = i + 1; j < N; j++) {
+              const dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y;
+              const d = Math.sqrt(dx * dx + dy * dy);
+              if (d < 130) {
+                ctx.strokeStyle = `rgba(180,140,255,${0.28 * (1 - d / 130)})`;
+                ctx.beginPath(); ctx.moveTo(pts[i].x, pts[i].y); ctx.lineTo(pts[j].x, pts[j].y); ctx.stroke();
+              }
+            }
+          }
+          for (const p of pts) {
+            p.x += p.vx; p.y += p.vy;
+            if (p.x < 0 || p.x > W) p.vx *= -1;
+            if (p.y < 0 || p.y > H) p.vy *= -1;
+            ctx.fillStyle = `hsla(${p.h},80%,72%,0.65)`;
+            ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.2832); ctx.fill();
+          }
+          requestAnimationFrame(drawCanvas);
+        }
+        requestAnimationFrame(drawCanvas);
+
+        const pbarRows = document.getElementById('pd-pbar-rows');
+        const fills = [], timeCells = [];
+        const grads = ['pd-pbar-fill-a', 'pd-pbar-fill-b', 'pd-pbar-fill-c'];
+        for (let i = 0; i < 9; i++) {
+          const row = document.createElement('div'); row.className = 'pd-pbar-row';
+          const track = document.createElement('div'); track.className = 'pd-pbar-track';
+          const fill = document.createElement('div'); fill.className = `pd-pbar-fill ${grads[i % 3]}`;
+          track.appendChild(fill);
+          const time = document.createElement('div'); time.className = 'pd-pbar-time'; time.textContent = '0:00';
+          row.appendChild(track); row.appendChild(time);
+          pbarRows.appendChild(row);
+          fills.push(fill); timeCells.push(time);
+        }
+        (function () {
+          function tick(now) {
+            for (let i = 0; i < fills.length; i++) {
+              const ratio = Math.sin(now / 5000 + (i / fills.length) * Math.PI * 2) * 0.5 + 0.5;
+              const s = `scaleX(${ratio.toFixed(4)})`;
+              if (fills[i].style.transform !== s) fills[i].style.transform = s;
+            }
+            requestAnimationFrame(tick);
+          }
+          requestAnimationFrame(tick);
+        }());
+        const _lastSecs = new Array(9).fill(-1);
+        setInterval(() => {
+          const now = performance.now() / 1000;
+          for (let i = 0; i < timeCells.length; i++) {
+            const t = (now + (i / timeCells.length) * 30) % 240;
+            const whole = Math.floor(t);
+            if (whole === _lastSecs[i]) continue;
+            _lastSecs[i] = whole;
+            const m = Math.floor(t / 60), s = Math.floor(t % 60);
+            timeCells[i].textContent = `${m}:${String(s).padStart(2, '0')}`;
+          }
+        }, 500);
+      }());
+    </script>
+    <!-- ═══════════════════ END PERF DEMO ════════════════════════════════════ -->
 </body>
 </html>
