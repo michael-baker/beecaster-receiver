@@ -943,25 +943,42 @@
       var _hlsStarted = false;
       function startHlsBg(baseUrl) {
         if (_hlsStarted || !baseUrl) return;
-        if (!window.Hls || !Hls.isSupported()) {
-          console.warn('[hls-bg] hls.js unavailable or MSE not supported');
-          return;
-        }
-        _hlsStarted = true;
         var video = document.getElementById('hls-bg');
-        var hls = new Hls({ lowLatencyMode: true });
+        if (!video) return;
+        _hlsStarted = true;
         var url = baseUrl + 'cast/stream/stream.m3u8';
-        console.log('[hls-bg] loading', url);
-        hls.loadSource(url);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, function () {
-          console.log('[hls-bg] manifest parsed, starting playback');
-          video.style.display = 'block';
-          video.play();
-        });
-        hls.on(Hls.Events.ERROR, function (event, data) {
-          if (data.fatal) console.error('[hls-bg] fatal error', data.type, data.details);
-        });
+        console.log('[hls-bg] starting with url:', url);
+
+        // Chromecast supports HLS natively — try that first
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          console.log('[hls-bg] using native HLS');
+          video.src = url;
+          video.addEventListener('canplay', function onCanPlay() {
+            video.removeEventListener('canplay', onCanPlay);
+            console.log('[hls-bg] native HLS canplay, showing video');
+            video.style.display = 'block';
+            video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
+          });
+          video.addEventListener('error', function(e) {
+            console.error('[hls-bg] native HLS error:', video.error);
+          });
+          video.load();
+        } else if (window.Hls && Hls.isSupported()) {
+          console.log('[hls-bg] using hls.js');
+          var hls = new Hls({ lowLatencyMode: true });
+          hls.loadSource(url);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED, function () {
+            console.log('[hls-bg] hls.js manifest parsed, showing video');
+            video.style.display = 'block';
+            video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
+          });
+          hls.on(Hls.Events.ERROR, function (event, data) {
+            console.error('[hls-bg] hls.js error fatal=' + data.fatal, data.type, data.details);
+          });
+        } else {
+          console.warn('[hls-bg] no HLS support available (native:', !!video.canPlayType('application/vnd.apple.mpegurl'), 'hls.js:', !!(window.Hls && Hls.isSupported()), ')');
+        }
       }
     </script>
 </body>
