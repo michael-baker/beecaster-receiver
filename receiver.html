@@ -31,8 +31,9 @@
             z-index: 0;
             background-size: cover;
             background-position: center;
-            filter: blur(14px) saturate(150%) hue-rotate(-10deg);
+            filter: blur(14px) saturate(150%);
             transform: scale(1.06);
+            will-change: transform;
         }
 
         #backdrop {
@@ -42,8 +43,9 @@
             background-size: cover;
             background-position: center;
             opacity: 0.35;
-            filter: blur(42px) saturate(160%) hue-rotate(-10deg);
+            filter: blur(22px) saturate(140%);
             transform: scale(1.08);
+            will-change: transform;
         }
 
         #skin-root {
@@ -53,6 +55,7 @@
             opacity: 0;
             transition: opacity 260ms ease;
             will-change: opacity;
+            contain: layout paint style;
         }
 
         body.ready #skin-root {
@@ -99,6 +102,7 @@
             pointer-events: none;
             opacity: 0;
             transition: opacity 600ms ease;
+            will-change: transform;
         }
         #spectrum-canvas.visible {
             opacity: 1;
@@ -188,6 +192,7 @@
   object-fit: cover;
   border-radius: 22px;
   box-shadow: 0 26px 70px rgba(0,0,0,0.5);
+  will-change: transform;
 }
 
 .np-main { align-self: center; }
@@ -209,6 +214,7 @@
   height: 8px;
   border-radius: 999px;
   overflow: hidden;
+  contain: paint layout;
 }
 
 .np-progress-fill {
@@ -222,7 +228,6 @@
 }
 
 .np-time { font-variant-numeric: tabular-nums; color: var(--np-text-muted); }
-
 .np-detail-grid {
   margin-top: 2.1rem;
   display: grid;
