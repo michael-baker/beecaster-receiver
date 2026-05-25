@@ -25,28 +25,21 @@
             pointer-events: none;
         }
 
+        /* No filter: blur() — Vivante GC1000+ cannot HW-accelerate Gaussian blur;
+           each full-screen blurred tile cost 260–481ms on the raster thread.
+           The gradient already composited by setBackground() darkens for readability. */
         #art-blur-light {
             position: absolute;
             inset: 0;
             z-index: 0;
             background-size: cover;
             background-position: center;
-            filter: blur(14px) saturate(150%);
-            transform: scale(1.06);
-            will-change: transform;
+            transform: scale(1.08);
+            opacity: 0.6;
         }
 
-        #backdrop {
-            position: absolute;
-            inset: 0;
-            z-index: 1;
-            background-size: cover;
-            background-position: center;
-            opacity: 0.35;
-            filter: blur(22px) saturate(140%);
-            transform: scale(1.08);
-            will-change: transform;
-        }
+        /* #backdrop removed — was the most expensive compositor layer (single tiles: 300–481ms) */
+        #backdrop { display: none; }
 
         #skin-root {
             position: absolute;
