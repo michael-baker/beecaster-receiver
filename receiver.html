@@ -57,7 +57,7 @@
            Hides all HTML overlay elements so only the HLS video is visible */
         #skin-root, #art-blur-light, #spectrum-canvas { display: none !important; }
         #hls-bg { display: block !important; }
-        /* === END DIAGNOSTIC ===
+          /* === END DIAGNOSTIC === */
 
         #skin-root {
             position: absolute;
@@ -869,13 +869,14 @@
     <video id="hls-bg" muted playsinline autoplay></video>
     <script>
       var _hlsStarted = false;
-
-      function _hlsReset(video) {
             var _hlsInstance = null;
 
-            function _hlsReset(video) {
+      function _hlsReset(video) {
                 _hlsStarted = false;
-                if (_hlsInstance) { try { _hlsInstance.destroy(); } catch(e) {} _hlsInstance = null; }
+                if (_hlsInstance) {
+                    try { _hlsInstance.destroy(); } catch (e) {}
+                    _hlsInstance = null;
+                }
                 video.style.display = 'none';
                 console.warn('[hls-bg] stream failed — hiding HLS video, HTML overlay remains');
             }
@@ -884,6 +885,7 @@
                 if (_hlsStarted || !baseUrl) return;
                 var video = document.getElementById('hls-bg');
                 if (!video) return;
+
                 _hlsStarted = true;
                 var url = baseUrl + 'cast/stream/stream.m3u8';
                 console.log('[hls-bg] starting with url:', url);
@@ -891,14 +893,20 @@
                 if (typeof Hls !== 'undefined' && Hls.isSupported()) {
                     // MSE path — required on Chromecast (canPlayType returns false for HLS)
                     console.log('[hls-bg] using hls.js (MSE)');
-                    _hlsInstance = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 6, maxBufferLength: 10 });
+                    _hlsInstance = new Hls({
+                        liveSyncDurationCount: 3,
+                        liveMaxLatencyDurationCount: 6,
+                        maxBufferLength: 10
+                    });
                     _hlsInstance.loadSource(url);
                     _hlsInstance.attachMedia(video);
-                    _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function() {
+                    _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
                         console.log('[hls-bg] manifest parsed — starting playback');
-                        video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
+                        video.play().catch(function (e) {
+                            console.warn('[hls-bg] play() rejected:', e);
+                        });
                     });
-                    _hlsInstance.on(Hls.Events.ERROR, function(event, data) {
+                    _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
                         if (data.fatal) {
                             console.error('[hls-bg] hls.js fatal error:', data.type, data.details);
                             _hlsReset(video);
@@ -911,7 +919,9 @@
                     video.addEventListener('canplay', function onCanPlay() {
                         video.removeEventListener('canplay', onCanPlay);
                         console.log('[hls-bg] native HLS canplay — video is playing');
-                        video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
+                        video.play().catch(function (e) {
+                            console.warn('[hls-bg] play() rejected:', e);
+                        });
                     });
                     video.addEventListener('error', function onError() {
                         video.removeEventListener('error', onError);
