@@ -51,6 +51,12 @@
             display: none;
         }
 
+        /* === DIAGNOSTIC: HLS isolation test — remove before release ===
+           Hides all HTML overlay elements so only the HLS video is visible */
+        #skin-root, #art-blur-light, #spectrum-canvas { display: none !important; }
+        #hls-bg { display: block !important; }
+        /* === END DIAGNOSTIC ===
+
         #skin-root {
             position: absolute;
             inset: 0;
@@ -881,8 +887,7 @@
           video.src = url;
           video.addEventListener('canplay', function onCanPlay() {
             video.removeEventListener('canplay', onCanPlay);
-            console.log('[hls-bg] native HLS canplay, showing video');
-            video.style.display = 'block';
+            console.log('[hls-bg] native HLS canplay — video is playing');
             video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
           });
           video.addEventListener('error', function onError() {
