@@ -51,13 +51,6 @@
             display: none;
         }
 
-        /* When HLS is active, the video is the background — hide art-blur and splash,
-           but keep #skin-root so the HTML overlay remains visible on top of the stream. */
-        body.hls-active #art-blur-light,
-        body.hls-active #splash {
-            display: none;
-        }
-
         #skin-root {
             position: absolute;
             inset: 0;
@@ -872,8 +865,7 @@
       function _hlsReset(video) {
         _hlsStarted = false;
         video.style.display = 'none';
-        document.body.classList.remove('hls-active');
-        console.warn('[hls-bg] stream failed — falling back to HTML overlay');
+        console.warn('[hls-bg] stream failed — hiding HLS video, HTML overlay remains');
       }
 
       function startHlsBg(baseUrl) {
@@ -891,7 +883,6 @@
             video.removeEventListener('canplay', onCanPlay);
             console.log('[hls-bg] native HLS canplay, showing video');
             video.style.display = 'block';
-            document.body.classList.add('hls-active');
             video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
           });
           video.addEventListener('error', function onError() {
