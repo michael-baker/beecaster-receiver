@@ -123,9 +123,9 @@
                 console.log('[hls-bg] using hls.js (MSE)');
                 _hlsInstance = new Hls({
                     lowLatencyMode: false,
-                    liveSyncDurationCount: 3,
-                    liveMaxLatencyDurationCount: 6,
-                    maxBufferLength: 12,
+                    liveSyncDurationCount: 2,
+                    liveMaxLatencyDurationCount: 5,
+                    maxBufferLength: 8,
                     backBufferLength: 0,
                     maxLiveSyncPlaybackRate: 1.1
                 });
