@@ -51,6 +51,13 @@
             display: none;
         }
 
+        /* When HLS is active, the video is the background — hide art-blur and splash,
+           but keep #skin-root so the HTML overlay remains visible on top of the stream. */
+        body.hls-active #art-blur-light,
+        body.hls-active #splash {
+            display: none;
+        }
+
         #skin-root {
             position: absolute;
             inset: 0;
@@ -839,10 +846,18 @@
         }
     </script>
     <!-- HLS video background — muted, hidden until stream is ready -->
+    <!-- Chromecast supports HLS natively; hls.js fallback removed as unnecessary -->
     <video id="hls-bg" muted playsinline autoplay></video>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
     <script>
       var _hlsStarted = false;
+
+      function _hlsReset(video) {
+        _hlsStarted = false;
+        video.style.display = 'none';
+        document.body.classList.remove('hls-active');
+        console.warn('[hls-bg] stream failed — falling back to HTML overlay');
+      }
+
       function startHlsBg(baseUrl) {
         if (_hlsStarted || !baseUrl) return;
         var video = document.getElementById('hls-bg');
@@ -851,7 +866,6 @@
         var url = baseUrl + 'cast/stream/stream.m3u8';
         console.log('[hls-bg] starting with url:', url);
 
-        // Chromecast supports HLS natively — try that first
         if (video.canPlayType('application/vnd.apple.mpegurl')) {
           console.log('[hls-bg] using native HLS');
           video.src = url;
@@ -859,27 +873,18 @@
             video.removeEventListener('canplay', onCanPlay);
             console.log('[hls-bg] native HLS canplay, showing video');
             video.style.display = 'block';
+            document.body.classList.add('hls-active');
             video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
           });
-          video.addEventListener('error', function(e) {
+          video.addEventListener('error', function onError() {
+            video.removeEventListener('error', onError);
             console.error('[hls-bg] native HLS error:', video.error);
+            _hlsReset(video);
           });
           video.load();
-        } else if (window.Hls && Hls.isSupported()) {
-          console.log('[hls-bg] using hls.js');
-          var hls = new Hls({ lowLatencyMode: true });
-          hls.loadSource(url);
-          hls.attachMedia(video);
-          hls.on(Hls.Events.MANIFEST_PARSED, function () {
-            console.log('[hls-bg] hls.js manifest parsed, showing video');
-            video.style.display = 'block';
-            video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
-          });
-          hls.on(Hls.Events.ERROR, function (event, data) {
-            console.error('[hls-bg] hls.js error fatal=' + data.fatal, data.type, data.details);
-          });
         } else {
-          console.warn('[hls-bg] no HLS support available (native:', !!video.canPlayType('application/vnd.apple.mpegurl'), 'hls.js:', !!(window.Hls && Hls.isSupported()), ')');
+          console.warn('[hls-bg] native HLS not supported on this device');
+          _hlsStarted = false;
         }
       }
     </script>
