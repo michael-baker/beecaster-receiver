@@ -25,25 +25,30 @@
             pointer-events: none;
         }
 
+        /* No filter: blur() — Vivante GC1000+ cannot HW-accelerate Gaussian blur;
+           each full-screen blurred tile cost 260–481ms on the raster thread.
+           The gradient already composited by setBackground() darkens for readability. */
         #art-blur-light {
             position: absolute;
             inset: 0;
             z-index: 0;
             background-size: cover;
             background-position: center;
-            filter: blur(14px) saturate(150%) hue-rotate(-10deg);
-            transform: scale(1.06);
+            transform: scale(1.08);
+            opacity: 0.6;
         }
 
-        #backdrop {
+
+        /* HLS background video — overrides global video{opacity:0} from CAF audio element */
+        #hls-bg {
             position: absolute;
             inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
             z-index: 1;
-            background-size: cover;
-            background-position: center;
-            opacity: 0.35;
-            filter: blur(42px) saturate(160%) hue-rotate(-10deg);
-            transform: scale(1.08);
+            opacity: 1;
+            display: none;
         }
 
         #skin-root {
@@ -53,6 +58,7 @@
             opacity: 0;
             transition: opacity 260ms ease;
             will-change: opacity;
+            contain: layout paint style;
         }
 
         body.ready #skin-root {
@@ -99,6 +105,7 @@
             pointer-events: none;
             opacity: 0;
             transition: opacity 600ms ease;
+            will-change: transform;
         }
         #spectrum-canvas.visible {
             opacity: 1;
@@ -110,7 +117,6 @@
     <!-- instead of passing options.mediaElement explicitly (which is discouraged per CAF docs) -->
     <video id="receiverVideoElement" class="castMediaElement"></video>
     <div id="art-blur-light"></div>
-    <div id="backdrop"></div>
     <div id="skin-root"></div>
     <div id="splash">BeeCaster</div>
     <canvas id="spectrum-canvas"></canvas>
@@ -188,6 +194,7 @@
   object-fit: cover;
   border-radius: 22px;
   box-shadow: 0 26px 70px rgba(0,0,0,0.5);
+  will-change: transform;
 }
 
 .np-main { align-self: center; }
@@ -209,16 +216,19 @@
   height: 8px;
   border-radius: 999px;
   overflow: hidden;
+  contain: paint layout;
 }
 
 .np-progress-fill {
-  width: 0%;
+  width: 100%;
   height: 100%;
   background: linear-gradient(90deg, var(--np-accent), #63e29f);
+  transform-origin: left center;
+  transform: scaleX(0);
+  will-change: transform;
 }
 
 .np-time { font-variant-numeric: tabular-nums; color: var(--np-text-muted); }
-
 .np-detail-grid {
   margin-top: 2.1rem;
   display: grid;
@@ -244,7 +254,6 @@
         // Track last art URL to prevent redundant background updates
         let lastBackgroundUrl = null;
         const artBlurLight = document.getElementById('art-blur-light');
-        const backdropEl = document.getElementById('backdrop');
 
         // Returns a Promise that resolves once the background DOM has been updated
         // (or immediately if the URL is unchanged/empty, or on load failure).
@@ -269,7 +278,6 @@
                     const gradient = `linear-gradient(135deg, rgba(61,38,69,0.75) 0%, rgba(74,48,82,0.65) 50%, rgba(90,74,110,0.75) 100%)`;
                     // Use dedicated #art-blur-light — NOT the CAF video element
                     artBlurLight.style.backgroundImage = `${gradient}, url("${artUrl}")`;
-                    backdropEl.style.backgroundImage = `url("${artUrl}")`;
                     lastBackgroundUrl = artUrl;
                     console.log('[bg] Applied:', artUrl);
                     resolve();
@@ -310,6 +318,8 @@
 
             state.layoutEndpoint = state.customData.LayoutEndpoint || (baseUrl ? baseUrl + 'cast/layout' : '/cast/layout');
             state.themeEndpoint = state.customData.ThemeEndpoint || (baseUrl ? baseUrl + 'cast/theme' : '/cast/theme');
+
+            if (baseUrl) startHlsBg(baseUrl);
 
             console.log('Layout endpoint:', state.layoutEndpoint);
             console.log('Theme endpoint:', state.themeEndpoint);
@@ -373,8 +383,9 @@
                     };
                     preload.src = newSrc;
                 } else if (name === 'progressFill') {
-                    // Progress bar always updates
-                    node.style.width = value || '0%';
+                    // Use scaleX transform — compositor-only, never triggers layout
+                    const ratio = Math.min(1, Math.max(0, parseFloat(value) / 100 || 0));
+                    node.style.transform = `scaleX(${ratio.toFixed(4)})`;
                 } else {
                     // Only update text if it changed
                     const newText = value || '';
@@ -465,30 +476,50 @@
             if (animate) {
                 const root = document.getElementById('skin-root');
                 root.classList.remove('track-transition');
-                void root.offsetWidth;
-                root.classList.add('track-transition');
+                // Defer to next frame — avoids forcing a synchronous full-page reflow
+                requestAnimationFrame(() => root.classList.add('track-transition'));
             }
 
             return bgPromise;
         }
 
-        let progressRafPending = false;
-        function scheduleProgressRender() {
-            if (progressRafPending) {
-                return;
+        // Continuous transform-only RAF loop — compositor-only, never triggers layout
+        let _lastFillScaleStr = null;
+        (function startProgressFillLoop() {
+            function tick() {
+                if (state.durationSec > 0) {
+                    const ratio = Math.min(1, Math.max(0, state.currentTimeSec / state.durationSec));
+                    const scaleStr = `scaleX(${ratio.toFixed(4)})`;
+                    if (scaleStr !== _lastFillScaleStr) {
+                        _lastFillScaleStr = scaleStr;
+                        const nodes = getFieldNodes('progressFill');
+                        for (let i = 0; i < nodes.length; i++) nodes[i].style.transform = scaleStr;
+                    }
+                }
+                requestAnimationFrame(tick);
             }
+            requestAnimationFrame(tick);
+        }());
 
-            progressRafPending = true;
-            requestAnimationFrame(() => {
-                progressRafPending = false;
-                const snapshot = buildSnapshot();
-                applyProgressOnly(snapshot);
-            });
-        }
+        // Time text at 500ms — decoupled from animation frames to avoid layout thrash
+        let _lastTimeDisplaySec = -1;
+        setInterval(() => {
+            const whole = Math.floor(state.currentTimeSec);
+            if (whole === _lastTimeDisplaySec) return;
+            _lastTimeDisplaySec = whole;
+            const text = formatSeconds(state.currentTimeSec);
+            const nodes = getFieldNodes('currentPositionText');
+            for (let i = 0; i < nodes.length; i++) {
+                if (nodes[i].textContent !== text) nodes[i].textContent = text;
+            }
+        }, 500);
 
         async function loadTheme() {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 5000);
             try {
-                const resp = await fetch(state.themeEndpoint, { cache: 'default' });
+                const resp = await fetch(state.themeEndpoint, { cache: 'default', signal: controller.signal });
+                clearTimeout(timeoutId);
                 if (!resp.ok) {
                     console.log('Theme endpoint not available, using default theme');
                     applyDefaultTheme();
@@ -506,6 +537,7 @@
                 style.textContent = css;
             } catch (err) {
                 console.log('Failed to load theme, using default:', err);
+                clearTimeout(timeoutId);
                 applyDefaultTheme();
             }
         }
@@ -528,9 +560,11 @@
             console.log(`=== loadLayout called (count: ${layoutLoadCount}) ===`);
 
             let html = defaultLayout;
+            const layoutController = new AbortController();
+            const layoutTimeoutId = setTimeout(() => layoutController.abort(), 5000);
             try {
                 console.log('Fetching layout from:', state.layoutEndpoint);
-                const resp = await fetch(state.layoutEndpoint, { cache: 'default', mode: 'cors' });
+                const resp = await fetch(state.layoutEndpoint, { cache: 'default', mode: 'cors', signal: layoutController.signal });
                 console.log('Layout response status:', resp.status);
                 if (resp.ok) {
                     html = await resp.text();
@@ -538,7 +572,9 @@
                 } else {
                     console.warn('Layout endpoint returned', resp.status, '- using default layout');
                 }
+                clearTimeout(layoutTimeoutId);
             } catch (err) {
+                clearTimeout(layoutTimeoutId);
                 console.error('Failed to load layout, using default:', err);
             }
 
@@ -591,15 +627,15 @@
             console.log('Time since last LOAD:', timeSinceLastLoad, 'ms');
             console.log('First load complete:', firstLoadComplete);
 
-            // Debounce rapid LOAD events
+            // Debounce rapid LOAD events — return null to abort so CAF doesn't restart the player
             if (timeSinceLastLoad < LOAD_DEBOUNCE_MS && loadCount > 1) {
-                console.warn(`LOAD event too soon (${timeSinceLastLoad}ms), ignoring as duplicate`);
-                return request;
+                console.warn(`LOAD event too soon (${timeSinceLastLoad}ms), dropping duplicate`);
+                return null;
             }
 
             if (isLoadInProgress) {
-                console.warn('LOAD already in progress, ignoring duplicate call');
-                return request;
+                console.warn('LOAD already in progress, dropping concurrent duplicate');
+                return null;
             }
 
             lastLoadTimestamp = now;
@@ -624,8 +660,8 @@
                     incomingArtUrl === lastAcceptedArtUrl &&
                     sinceAcceptedMs < LOAD_DUPLICATE_WINDOW_MS
                 ) {
-                    console.warn(`Ignoring duplicate LOAD for same content within ${LOAD_DUPLICATE_WINDOW_MS}ms`);
-                    return request;
+                    console.warn(`Dropping duplicate LOAD for same content within ${LOAD_DUPLICATE_WINDOW_MS}ms`);
+                    return null;
                 }
 
                 readMediaState(request);
@@ -679,6 +715,7 @@
                 console.log('=== LOAD interceptor complete ===');
             } catch (error) {
                 console.error('Error in LOAD interceptor:', error);
+                revealUiOnce(); // ensure splash is never left stuck on error
             } finally {
                 isLoadInProgress = false;
             }
@@ -691,7 +728,6 @@
         const playerDataBinder = new cast.framework.ui.PlayerDataBinder(playerData);
         playerDataBinder.addEventListener(cast.framework.ui.PlayerDataEventType.CURRENT_TIME_CHANGED, e => {
             state.currentTimeSec = Number(e.value || 0);
-            scheduleProgressRender();
         });
 
         // Listen for player state changes
@@ -773,99 +809,6 @@
         // const SPECTRUM_NS = 'urn:x-cast:com.beecaster.spectrum';
         // options.customNamespaces[SPECTRUM_NS] = cast.framework.system.MessageType.JSON;
 
-        // ── Spectrum renderer — DISABLED for debugging ────────────────────────
-        (function () {
-            return; // disabled — re-enable once cast page load is confirmed working
-            const FAKE_DATA = true;  // TODO: remove — drives canvas with synthetic data for layout testing
-
-            const canvas  = document.getElementById('spectrum-canvas');
-            const ctx     = canvas.getContext('2d');
-            const BANDS   = 24;
-            const BAR_GAP = 0.18;  // fraction of bar width used as gap
-
-            let bins      = new Float32Array(BANDS);   // latest data from plugin
-            let hasData   = false;
-
-            // ── Fake data generator (testing only) ────────────────────────────
-            if (FAKE_DATA) {
-                const fakeSmoothed = new Float32Array(BANDS);
-                let t = 0;
-                setInterval(() => {
-                    t += 0.07;
-                    for (let i = 0; i < BANDS; i++) {
-                        // Bass hump at low bands, roll-off toward highs
-                        const bassCurve  = Math.max(0, 1 - i / 6);
-                        const midBump    = Math.exp(-Math.pow((i - 10) / 4, 2)) * 0.55;
-                        const noise      = Math.random() * 0.25;
-                        const wave       = (Math.sin(t + i * 0.4) * 0.5 + 0.5) * 0.45;
-                        const raw        = Math.min(1, bassCurve * 0.7 + midBump + wave + noise);
-                        // Fast attack, slow decay
-                        fakeSmoothed[i]  = raw > fakeSmoothed[i]
-                            ? raw * 0.6 + fakeSmoothed[i] * 0.4
-                            : fakeSmoothed[i] * 0.82;
-                        bins[i] = fakeSmoothed[i];
-                    }
-                    if (!hasData) { hasData = true; canvas.classList.add('visible'); }
-                }, 64); // ~15 fps, matching real analyzer cadence
-            }
-
-            // Resize canvas to its CSS pixel size (account for devicePixelRatio)
-            function resizeCanvas() {
-                const dpr = window.devicePixelRatio || 1;
-                canvas.width  = canvas.offsetWidth  * dpr;
-                canvas.height = canvas.offsetHeight * dpr;
-                ctx.scale(dpr, dpr);
-            }
-            resizeCanvas();
-            window.addEventListener('resize', () => { ctx.resetTransform(); resizeCanvas(); });
-
-            // Receive spectrum data from the plugin
-            context.addCustomMessageListener(SPECTRUM_NS, event => {
-                const msg = event.data;
-                if (!msg || !Array.isArray(msg.bins) || msg.bins.length !== BANDS) return;
-                for (let i = 0; i < BANDS; i++) bins[i] = msg.bins[i];
-                if (!hasData) {
-                    hasData = true;
-                    canvas.classList.add('visible');
-                }
-            });
-
-            // rAF render loop — decoupled from message receive rate
-            function render() {
-                requestAnimationFrame(render);
-                if (!hasData) return;
-
-                const W = canvas.offsetWidth;
-                const H = canvas.offsetHeight;
-                ctx.clearRect(0, 0, W, H);
-
-                const totalGap  = W * 0.02;           // 1% padding each side
-                const drawW     = W - totalGap * 2;
-                const barW      = drawW / BANDS;
-                const gapW      = barW * BAR_GAP;
-                const fillW     = barW - gapW;
-
-                for (let i = 0; i < BANDS; i++) {
-                    const v   = Math.max(0, Math.min(1, bins[i]));
-                    const bH  = Math.max(2, v * H * 0.92);
-                    const x   = totalGap + i * barW + gapW * 0.5;
-                    const y   = H - bH;
-
-                    // Gradient: brighter at the top, softer at the base
-                    const grad = ctx.createLinearGradient(0, y, 0, H);
-                    grad.addColorStop(0,   'rgba(220, 200, 255, 0.55)');
-                    grad.addColorStop(0.5, 'rgba(180, 140, 230, 0.30)');
-                    grad.addColorStop(1,   'rgba(140, 100, 200, 0.10)');
-
-                    ctx.fillStyle = grad;
-                    ctx.beginPath();
-                    ctx.roundRect(x, y, fillW, bH, [3, 3, 0, 0]);
-                    ctx.fill();
-                }
-            }
-            render();
-        })();
-
         // Enable detailed logs for debugging
         options.disableIdleTimeout = false;
         options.maxInactivity = 3600; // 1 hour
@@ -891,9 +834,19 @@
             if (!msg) return;
             if (msg.type === 'UPDATE_ART') {
                 console.log('[art-update] Received UPDATE_ART:', msg.artUrl);
+                setField('albumArtUrl', msg.artUrl);
                 setBackground(msg.artUrl);
             }
         });
+
+        // Safety-net: if the LOAD interceptor never fires or hangs, ensure the splash
+        // is eventually removed so the receiver is not stuck on a blank/splash screen.
+        setTimeout(() => {
+            if (!document.body.classList.contains('ready')) {
+                console.warn('[safety-net] 10s elapsed without reveal — forcing revealUiOnce()');
+                revealUiOnce();
+            }
+        }, 10000);
 
         console.log('Starting Cast receiver context with options:', options);
         try {
@@ -902,6 +855,47 @@
         } catch (e) {
             console.error('[CRASH] context.start() threw:', e);
         }
+    </script>
+    <!-- HLS video background — muted, hidden until stream is ready -->
+    <!-- Chromecast supports HLS natively; hls.js fallback removed as unnecessary -->
+    <video id="hls-bg" muted playsinline autoplay></video>
+    <script>
+      var _hlsStarted = false;
+
+      function _hlsReset(video) {
+        _hlsStarted = false;
+        video.style.display = 'none';
+        console.warn('[hls-bg] stream failed — hiding HLS video, HTML overlay remains');
+      }
+
+      function startHlsBg(baseUrl) {
+        if (_hlsStarted || !baseUrl) return;
+        var video = document.getElementById('hls-bg');
+        if (!video) return;
+        _hlsStarted = true;
+        var url = baseUrl + 'cast/stream/stream.m3u8';
+        console.log('[hls-bg] starting with url:', url);
+
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          console.log('[hls-bg] using native HLS');
+          video.src = url;
+          video.addEventListener('canplay', function onCanPlay() {
+            video.removeEventListener('canplay', onCanPlay);
+            console.log('[hls-bg] native HLS canplay, showing video');
+            video.style.display = 'block';
+            video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
+          });
+          video.addEventListener('error', function onError() {
+            video.removeEventListener('error', onError);
+            console.error('[hls-bg] native HLS error:', video.error);
+            _hlsReset(video);
+          });
+          video.load();
+        } else {
+          console.warn('[hls-bg] native HLS not supported on this device');
+          _hlsStarted = false;
+        }
+      }
     </script>
 </body>
 </html>
