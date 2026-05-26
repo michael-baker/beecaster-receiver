@@ -53,12 +53,6 @@
             display: none;
         }
 
-        /* === DIAGNOSTIC: HLS isolation test — remove before release ===
-           Hides all HTML overlay elements so only the HLS video is visible */
-        #skin-root, #art-blur-light, #spectrum-canvas { display: none !important; }
-        #hls-bg { display: block !important; }
-          /* === END DIAGNOSTIC === */
-
         #skin-root {
             position: absolute;
             inset: 0;
@@ -902,6 +896,7 @@
                     _hlsInstance.attachMedia(video);
                     _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
                         console.log('[hls-bg] manifest parsed — starting playback');
+                        video.style.display = 'block';
                         video.play().catch(function (e) {
                             console.warn('[hls-bg] play() rejected:', e);
                         });
