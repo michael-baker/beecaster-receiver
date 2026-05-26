@@ -51,6 +51,13 @@
             display: none;
         }
 
+        /* When HLS is active, it is the full UI — hide the HTML overlay */
+        body.hls-active #skin-root,
+        body.hls-active #art-blur-light,
+        body.hls-active #splash {
+            display: none;
+        }
+
         #skin-root {
             position: absolute;
             inset: 0;
@@ -859,6 +866,7 @@
             video.removeEventListener('canplay', onCanPlay);
             console.log('[hls-bg] native HLS canplay, showing video');
             video.style.display = 'block';
+            document.body.classList.add('hls-active');
             video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
           });
           video.addEventListener('error', function(e) {
@@ -873,6 +881,7 @@
           hls.on(Hls.Events.MANIFEST_PARSED, function () {
             console.log('[hls-bg] hls.js manifest parsed, showing video');
             video.style.display = 'block';
+            document.body.classList.add('hls-active');
             video.play().catch(function(e) { console.warn('[hls-bg] play() rejected:', e); });
           });
           hls.on(Hls.Events.ERROR, function (event, data) {
