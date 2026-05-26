@@ -2,8 +2,176 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>BeeCaster Receiver</title>
+    <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <!-- hls.js: Chromecast video element does not expose native HLS via canPlayType; MSE (hls.js) is required -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+    <style>
+        body {
+            overflow: hidden;
+            margin: 0;
+            padding: 0;
+            background: #000;
+        }
+
+        /* CAF audio element — invisible but functional for audio playback */
+        video {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        /* HLS background video — full screen, shown after manifest loads */
+        #hls-bg {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            opacity: 1;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <!-- CAF audio element; class="castMediaElement" lets CAF auto-discover it -->
+    <video id="receiverVideoElement" class="castMediaElement"></video>
+    <!-- HLS background: shows the WebView2 preview stream captured by FFmpeg -->
+    <video id="hls-bg" muted playsinline autoplay></video>
+
+    <script>
+        const CHANNEL = 'urn:x-cast:com.google.cast.media';
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const playerManager = context.getPlayerManager();
+
+        playerManager.setSupportedMediaCommands(
+            cast.framework.messages.Command.ALL_BASIC_MEDIA |
+            cast.framework.messages.Command.PAUSE |
+            cast.framework.messages.Command.QUEUE_NEXT |
+            cast.framework.messages.Command.QUEUE_PREV
+        );
+
+        // Suppress UI updates for preloaded (queued-next) tracks
+        playerManager.setMessageInterceptor(
+            cast.framework.messages.MessageType.PRELOAD,
+            request => request
+        );
+
+        // On LOAD: extract MediaBaseUrl from customData and start the HLS background stream
+        playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
+            const baseUrl = (request.media?.customData?.MediaBaseUrl) || '';
+            if (baseUrl) startHlsBg(baseUrl);
+            return request;
+        });
+
+        // Forward next/previous queue jumps back to the plugin
+        playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, event => {
+            const next = event.requestData && event.requestData.jump == 1;
+            context.sendCustomMessage(CHANNEL, undefined, {
+                type: next ? 'NEXT' : 'PREVIOUS',
+                message: next ? 'NEXT' : 'PREVIOUS'
+            });
+        });
+
+        context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
+            context.stop();
+        });
+
+        const options = new cast.framework.CastReceiverOptions();
+        options.customNamespaces = {};
+        options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
+        options.disableIdleTimeout = false;
+        options.maxInactivity = 3600;
+        options.mediaElement = document.getElementById('receiverVideoElement');
+
+        window.onerror = (msg, src, line, col, err) =>
+            console.error('[CRASH] Uncaught error:', msg, 'at', src, line + ':' + col, err);
+        window.addEventListener('unhandledrejection', e =>
+            console.error('[CRASH] Unhandled promise rejection:', e.reason));
+
+        context.start(options);
+    </script>
+
+    <script>
+        var _hlsStarted = false;
+        var _hlsInstance = null;
+
+        function _hlsReset(video) {
+            _hlsStarted = false;
+            if (_hlsInstance) {
+                try { _hlsInstance.destroy(); } catch (e) {}
+                _hlsInstance = null;
+            }
+            video.style.display = 'none';
+            console.warn('[hls-bg] stream reset — waiting for restart');
+        }
+
+        function startHlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            if (!video) return;
+
+            _hlsStarted = true;
+            var url = baseUrl + 'cast/stream/stream.m3u8';
+            console.log('[hls-bg] starting:', url);
+
+            if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+                console.log('[hls-bg] using hls.js (MSE)');
+                _hlsInstance = new Hls({
+                    lowLatencyMode: false,
+                    liveSyncDurationCount: 3,
+                    liveMaxLatencyDurationCount: 6,
+                    maxBufferLength: 12,
+                    backBufferLength: 0,
+                    maxLiveSyncPlaybackRate: 1.1
+                });
+                _hlsInstance.loadSource(url);
+                _hlsInstance.attachMedia(video);
+                _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
+                    console.log('[hls-bg] manifest parsed — starting playback');
+                    video.style.display = 'block';
+                    video.play().catch(e => console.warn('[hls-bg] play() rejected:', e));
+                });
+                _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
+                    if (!data.fatal) return;
+                    console.error('[hls-bg] fatal error type:', data.type, 'details:', data.details);
+                    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                        console.warn('[hls-bg] attempting recoverMediaError()');
+                        _hlsInstance.recoverMediaError();
+                    } else {
+                        // Network or unrecoverable — auto-restart after 2s
+                        console.warn('[hls-bg] restarting HLS stream in 2s');
+                        _hlsReset(video);
+                        setTimeout(function () {
+                            _hlsStarted = false;
+                            startHlsBg(baseUrl);
+                        }, 2000);
+                    }
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                console.log('[hls-bg] using native HLS');
+                video.src = url;
+                video.addEventListener('canplay', function onCanPlay() {
+                    video.removeEventListener('canplay', onCanPlay);
+                    video.style.display = 'block';
+                    video.play().catch(e => console.warn('[hls-bg] play() rejected:', e));
+                });
+                video.addEventListener('error', function onError() {
+                    video.removeEventListener('error', onError);
+                    console.error('[hls-bg] native HLS error:', video.error);
+                    _hlsReset(video);
+                });
+                video.load();
+            } else {
+                console.warn('[hls-bg] HLS not supported (no hls.js, no native HLS)');
+                _hlsStarted = false;
+            }
+        }
+    </script>
+</body>
+</html>
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
         <!-- hls.js: Chromecast video element does not expose native HLS via canPlayType; MSE (hls.js) is required -->
         <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
@@ -888,12 +1056,12 @@
                     // MSE path — required on Chromecast (canPlayType returns false for HLS)
                     console.log('[hls-bg] using hls.js (MSE)');
                     _hlsInstance = new Hls({
-                        lowLatencyMode: true,
-                        liveSyncDurationCount: 1,
-                        liveMaxLatencyDurationCount: 2,
-                        maxBufferLength: 2,
+                        lowLatencyMode: false,
+                        liveSyncDurationCount: 3,
+                        liveMaxLatencyDurationCount: 6,
+                        maxBufferLength: 12,
                         backBufferLength: 0,
-                        maxLiveSyncPlaybackRate: 1.5
+                        maxLiveSyncPlaybackRate: 1.1
                     });
                     _hlsInstance.loadSource(url);
                     _hlsInstance.attachMedia(video);
@@ -905,9 +1073,21 @@
                         });
                     });
                     _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
-                        if (data.fatal) {
-                            console.error('[hls-bg] hls.js fatal error:', data.type, data.details);
+                        if (!data.fatal) return;
+                        console.error('[hls-bg] fatal error type:', data.type, 'details:', data.details);
+                        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                            // Try in-place recovery first (codec stall, decode error, etc.)
+                            console.warn('[hls-bg] attempting recoverMediaError()');
+                            _hlsInstance.recoverMediaError();
+                        } else {
+                            // Network errors or unrecoverable — destroy and restart after 2s
+                            // so the video returns automatically without waiting for next track load
+                            console.warn('[hls-bg] restarting HLS stream in 2s');
                             _hlsReset(video);
+                            setTimeout(function () {
+                                _hlsStarted = false;
+                                startHlsBg(baseUrl);
+                            }, 2000);
                         }
                     });
                 } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
