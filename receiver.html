@@ -38,8 +38,6 @@
             opacity: 0.6;
         }
 
-        /* #backdrop removed — was the most expensive compositor layer (single tiles: 300–481ms) */
-        #backdrop { display: none; }
 
         /* HLS background video — overrides global video{opacity:0} from CAF audio element */
         #hls-bg {
@@ -119,7 +117,6 @@
     <!-- instead of passing options.mediaElement explicitly (which is discouraged per CAF docs) -->
     <video id="receiverVideoElement" class="castMediaElement"></video>
     <div id="art-blur-light"></div>
-    <div id="backdrop"></div>
     <div id="skin-root"></div>
     <div id="splash">BeeCaster</div>
     <canvas id="spectrum-canvas"></canvas>
@@ -257,7 +254,6 @@
         // Track last art URL to prevent redundant background updates
         let lastBackgroundUrl = null;
         const artBlurLight = document.getElementById('art-blur-light');
-        const backdropEl = document.getElementById('backdrop');
 
         // Returns a Promise that resolves once the background DOM has been updated
         // (or immediately if the URL is unchanged/empty, or on load failure).
@@ -282,7 +278,6 @@
                     const gradient = `linear-gradient(135deg, rgba(61,38,69,0.75) 0%, rgba(74,48,82,0.65) 50%, rgba(90,74,110,0.75) 100%)`;
                     // Use dedicated #art-blur-light — NOT the CAF video element
                     artBlurLight.style.backgroundImage = `${gradient}, url("${artUrl}")`;
-                    backdropEl.style.backgroundImage = `url("${artUrl}")`;
                     lastBackgroundUrl = artUrl;
                     console.log('[bg] Applied:', artUrl);
                     resolve();
@@ -804,99 +799,6 @@
         // Spectrum namespace — receives 24-band FFT data from the plugin
         // const SPECTRUM_NS = 'urn:x-cast:com.beecaster.spectrum';
         // options.customNamespaces[SPECTRUM_NS] = cast.framework.system.MessageType.JSON;
-
-        // ── Spectrum renderer — DISABLED for debugging ────────────────────────
-        (function () {
-            return; // disabled — re-enable once cast page load is confirmed working
-            const FAKE_DATA = true;  // TODO: remove — drives canvas with synthetic data for layout testing
-
-            const canvas  = document.getElementById('spectrum-canvas');
-            const ctx     = canvas.getContext('2d');
-            const BANDS   = 24;
-            const BAR_GAP = 0.18;  // fraction of bar width used as gap
-
-            let bins      = new Float32Array(BANDS);   // latest data from plugin
-            let hasData   = false;
-
-            // ── Fake data generator (testing only) ────────────────────────────
-            if (FAKE_DATA) {
-                const fakeSmoothed = new Float32Array(BANDS);
-                let t = 0;
-                setInterval(() => {
-                    t += 0.07;
-                    for (let i = 0; i < BANDS; i++) {
-                        // Bass hump at low bands, roll-off toward highs
-                        const bassCurve  = Math.max(0, 1 - i / 6);
-                        const midBump    = Math.exp(-Math.pow((i - 10) / 4, 2)) * 0.55;
-                        const noise      = Math.random() * 0.25;
-                        const wave       = (Math.sin(t + i * 0.4) * 0.5 + 0.5) * 0.45;
-                        const raw        = Math.min(1, bassCurve * 0.7 + midBump + wave + noise);
-                        // Fast attack, slow decay
-                        fakeSmoothed[i]  = raw > fakeSmoothed[i]
-                            ? raw * 0.6 + fakeSmoothed[i] * 0.4
-                            : fakeSmoothed[i] * 0.82;
-                        bins[i] = fakeSmoothed[i];
-                    }
-                    if (!hasData) { hasData = true; canvas.classList.add('visible'); }
-                }, 64); // ~15 fps, matching real analyzer cadence
-            }
-
-            // Resize canvas to its CSS pixel size (account for devicePixelRatio)
-            function resizeCanvas() {
-                const dpr = window.devicePixelRatio || 1;
-                canvas.width  = canvas.offsetWidth  * dpr;
-                canvas.height = canvas.offsetHeight * dpr;
-                ctx.scale(dpr, dpr);
-            }
-            resizeCanvas();
-            window.addEventListener('resize', () => { ctx.resetTransform(); resizeCanvas(); });
-
-            // Receive spectrum data from the plugin
-            context.addCustomMessageListener(SPECTRUM_NS, event => {
-                const msg = event.data;
-                if (!msg || !Array.isArray(msg.bins) || msg.bins.length !== BANDS) return;
-                for (let i = 0; i < BANDS; i++) bins[i] = msg.bins[i];
-                if (!hasData) {
-                    hasData = true;
-                    canvas.classList.add('visible');
-                }
-            });
-
-            // rAF render loop — decoupled from message receive rate
-            function render() {
-                requestAnimationFrame(render);
-                if (!hasData) return;
-
-                const W = canvas.offsetWidth;
-                const H = canvas.offsetHeight;
-                ctx.clearRect(0, 0, W, H);
-
-                const totalGap  = W * 0.02;           // 1% padding each side
-                const drawW     = W - totalGap * 2;
-                const barW      = drawW / BANDS;
-                const gapW      = barW * BAR_GAP;
-                const fillW     = barW - gapW;
-
-                for (let i = 0; i < BANDS; i++) {
-                    const v   = Math.max(0, Math.min(1, bins[i]));
-                    const bH  = Math.max(2, v * H * 0.92);
-                    const x   = totalGap + i * barW + gapW * 0.5;
-                    const y   = H - bH;
-
-                    // Gradient: brighter at the top, softer at the base
-                    const grad = ctx.createLinearGradient(0, y, 0, H);
-                    grad.addColorStop(0,   'rgba(220, 200, 255, 0.55)');
-                    grad.addColorStop(0.5, 'rgba(180, 140, 230, 0.30)');
-                    grad.addColorStop(1,   'rgba(140, 100, 200, 0.10)');
-
-                    ctx.fillStyle = grad;
-                    ctx.beginPath();
-                    ctx.roundRect(x, y, fillW, bH, [3, 3, 0, 0]);
-                    ctx.fill();
-                }
-            }
-            render();
-        })();
 
         // Enable detailed logs for debugging
         options.disableIdleTimeout = false;
