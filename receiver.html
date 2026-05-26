@@ -522,8 +522,11 @@
         }, 500);
 
         async function loadTheme() {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 5000);
             try {
-                const resp = await fetch(state.themeEndpoint, { cache: 'default' });
+                const resp = await fetch(state.themeEndpoint, { cache: 'default', signal: controller.signal });
+                clearTimeout(timeoutId);
                 if (!resp.ok) {
                     console.log('Theme endpoint not available, using default theme');
                     applyDefaultTheme();
@@ -541,6 +544,7 @@
                 style.textContent = css;
             } catch (err) {
                 console.log('Failed to load theme, using default:', err);
+                clearTimeout(timeoutId);
                 applyDefaultTheme();
             }
         }
@@ -563,9 +567,11 @@
             console.log(`=== loadLayout called (count: ${layoutLoadCount}) ===`);
 
             let html = defaultLayout;
+            const layoutController = new AbortController();
+            const layoutTimeoutId = setTimeout(() => layoutController.abort(), 5000);
             try {
                 console.log('Fetching layout from:', state.layoutEndpoint);
-                const resp = await fetch(state.layoutEndpoint, { cache: 'default', mode: 'cors' });
+                const resp = await fetch(state.layoutEndpoint, { cache: 'default', mode: 'cors', signal: layoutController.signal });
                 console.log('Layout response status:', resp.status);
                 if (resp.ok) {
                     html = await resp.text();
@@ -573,7 +579,9 @@
                 } else {
                     console.warn('Layout endpoint returned', resp.status, '- using default layout');
                 }
+                clearTimeout(layoutTimeoutId);
             } catch (err) {
+                clearTimeout(layoutTimeoutId);
                 console.error('Failed to load layout, using default:', err);
             }
 
@@ -714,6 +722,7 @@
                 console.log('=== LOAD interceptor complete ===');
             } catch (error) {
                 console.error('Error in LOAD interceptor:', error);
+                revealUiOnce(); // ensure splash is never left stuck on error
             } finally {
                 isLoadInProgress = false;
             }
@@ -836,6 +845,15 @@
                 setBackground(msg.artUrl);
             }
         });
+
+        // Safety-net: if the LOAD interceptor never fires or hangs, ensure the splash
+        // is eventually removed so the receiver is not stuck on a blank/splash screen.
+        setTimeout(() => {
+            if (!document.body.classList.contains('ready')) {
+                console.warn('[safety-net] 10s elapsed without reveal — forcing revealUiOnce()');
+                revealUiOnce();
+            }
+        }, 10000);
 
         console.log('Starting Cast receiver context with options:', options);
         try {
