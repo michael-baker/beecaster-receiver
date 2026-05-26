@@ -888,9 +888,12 @@
                     // MSE path — required on Chromecast (canPlayType returns false for HLS)
                     console.log('[hls-bg] using hls.js (MSE)');
                     _hlsInstance = new Hls({
-                        liveSyncDurationCount: 3,
-                        liveMaxLatencyDurationCount: 6,
-                        maxBufferLength: 10
+                        lowLatencyMode: true,
+                        liveSyncDurationCount: 1,
+                        liveMaxLatencyDurationCount: 2,
+                        maxBufferLength: 2,
+                        backBufferLength: 0,
+                        maxLiveSyncPlaybackRate: 1.5
                     });
                     _hlsInstance.loadSource(url);
                     _hlsInstance.attachMedia(video);
