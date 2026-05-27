@@ -77,20 +77,37 @@
             return request;
         });
 
-        // On PAUSE: fade the video to black immediately so the stale HLS buffer
-        // draining underneath is invisible rather than looking like a sync error.
-        // The HLS pipeline has ~11.5 s of latency so there is no way to seek to
-        // "current" content — the overlay is the practical solution.
+        var _pauseRevealTimer = null;
+
+        // On PAUSE: fade to black immediately so the stale HLS buffer drain is hidden.
+        // Then after AutoVideoDelayMs the live stream has caught up to the paused state,
+        // so fade the overlay back out to reveal the idle visual.
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
             var overlay = document.getElementById('pause-overlay');
             if (overlay) overlay.style.opacity = '1';
+            if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
+            fetch('/cast/state')
+                .then(function (r) { return r.json(); })
+                .then(function (s) {
+                    var delayMs = (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 500;
+                    _pauseRevealTimer = setTimeout(function () {
+                        _pauseRevealTimer = null;
+                        if (overlay) overlay.style.opacity = '0';
+                    }, delayMs);
+                })
+                .catch(function () {
+                    _pauseRevealTimer = setTimeout(function () {
+                        _pauseRevealTimer = null;
+                        if (overlay) overlay.style.opacity = '0';
+                    }, 12500);
+                });
         });
 
-        // On PLAYING (resume): seek hls-bg to live edge under the overlay, then
-        // fade the overlay back out so the reveal is clean and in-sync.
+        // On PLAYING (resume): cancel any pending reveal, seek to live edge, fade out.
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
             var bg      = document.getElementById('hls-bg');
             var overlay = document.getElementById('pause-overlay');
+            if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
             if (bg) {
                 var livePos = (_hlsInstance && _hlsInstance.liveSyncPosition) || (bg.seekable.length > 0 ? bg.seekable.end(0) : null);
                 if (livePos) bg.currentTime = livePos;
