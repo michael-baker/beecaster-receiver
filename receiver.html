@@ -136,6 +136,33 @@
                     video.style.display = 'block';
                     video.play().catch(function (e) { console.warn('[hls-bg] play() rejected:', e); });
                 });
+                // A/V sync auto-tuning: measure video pipeline latency via EXT-X-PROGRAM-DATE-TIME.
+                // programDateTime is the wall-clock ms when FFmpeg captured the segment; the
+                // difference from Date.now() is the total end-to-end video delay.
+                var _avEma = 0;           // exponential moving average of latency (ms)
+                var _avFragCount = 0;     // fragments seen since last report
+                var _avSampleCount = 0;   // total samples collected
+                _hlsInstance.on(Hls.Events.FRAG_CHANGED, function (event, data) {
+                    var pdt = data.frag && data.frag.programDateTime;
+                    if (!pdt) return;
+                    var latencyMs = Date.now() - pdt;
+                    if (latencyMs < 0 || latencyMs > 60000) return; // ignore bogus values
+                    // Exponential moving average — alpha=0.15 converges in ~20 fragments
+                    _avEma = _avSampleCount === 0 ? latencyMs : _avEma * 0.85 + latencyMs * 0.15;
+                    _avSampleCount++;
+                    _avFragCount++;
+                    // Wait for 5 samples to stabilise, then report every 3 fragments
+                    if (_avSampleCount >= 5 && _avFragCount >= 3) {
+                        _avFragCount = 0;
+                        var reportMs = Math.round(_avEma);
+                        console.log('[hls-bg] A/V latency EMA:', reportMs, 'ms');
+                        fetch(baseUrl + 'cast/avdelay', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ delayMs: reportMs })
+                        }).catch(function () {});
+                    }
+                });
                 _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
                     if (!data.fatal) return;
                     console.error('[hls-bg] fatal error type:', data.type, 'details:', data.details);
