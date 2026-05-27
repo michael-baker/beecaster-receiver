@@ -66,6 +66,25 @@
             return request;
         });
 
+        // Mirror CAF play/pause to the HLS background video so they stay in lock-step.
+        // Without this, pausing stops audio immediately but the buffered video keeps
+        // playing for 6–12 seconds (the full HLS live buffer).
+        playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
+            var bg = document.getElementById('hls-bg');
+            if (bg) bg.pause();
+        });
+
+        playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
+            var bg = document.getElementById('hls-bg');
+            if (!bg) return;
+            // Seek to the live edge before resuming so we don't replay stale frames
+            // that accumulated in the buffer while the player was paused.
+            if (bg.seekable.length > 0) {
+                bg.currentTime = bg.seekable.end(0);
+            }
+            bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+        });
+
         // Forward next/previous queue jumps back to the plugin
         playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, function (event) {
             var next = event.requestData && event.requestData.jump == 1;
