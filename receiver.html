@@ -14,8 +14,17 @@
             background: #000;
         }
 
-        /* CAF audio element — invisible but functional for audio playback */
-        video {
+        /* Pause overlay — fades to black when audio is paused so the stale
+           HLS buffer drain is hidden rather than looking like a sync error. */
+        #pause-overlay {
+            position: absolute;
+            inset: 0;
+            background: #000;
+            opacity: 0;
+            transition: opacity 0.35s ease;
+            pointer-events: none;
+            z-index: 10;
+        }
             position: absolute;
             width: 1px;
             height: 1px;
@@ -40,6 +49,8 @@
     <video id="receiverVideoElement" class="castMediaElement"></video>
     <!-- HLS background: shows the WebView2 preview stream captured by FFmpeg -->
     <video id="hls-bg" muted playsinline autoplay></video>
+    <!-- Black overlay that fades in on pause to hide the HLS buffer drain -->
+    <div id="pause-overlay"></div>
 
     <script>
         const CHANNEL = 'urn:x-cast:com.google.cast.media';
@@ -66,25 +77,26 @@
             return request;
         });
 
-        // On audio PAUSE: drop buffered content and snap the video to live edge so the
-        // preview immediately shows the current visual state (MusicBee paused screen) rather
-        // than playing through 6-12 seconds of stale buffered frames.
-        // The video stream keeps playing — only audio is paused by CAF.
+        // On PAUSE: fade the video to black immediately so the stale HLS buffer
+        // draining underneath is invisible rather than looking like a sync error.
+        // The HLS pipeline has ~11.5 s of latency so there is no way to seek to
+        // "current" content — the overlay is the practical solution.
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
-            var bg = document.getElementById('hls-bg');
-            if (!bg) return;
-            var livePos = (_hlsInstance && _hlsInstance.liveSyncPosition) || (bg.seekable.length > 0 ? bg.seekable.end(0) : null);
-            if (livePos) bg.currentTime = livePos;
-            if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] play() rejected:', e); });
+            var overlay = document.getElementById('pause-overlay');
+            if (overlay) overlay.style.opacity = '1';
         });
 
-        // On PLAYING (resume): snap to live edge in case any buffer drifted during the pause.
+        // On PLAYING (resume): seek hls-bg to live edge under the overlay, then
+        // fade the overlay back out so the reveal is clean and in-sync.
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
-            var bg = document.getElementById('hls-bg');
-            if (!bg) return;
-            var livePos = (_hlsInstance && _hlsInstance.liveSyncPosition) || (bg.seekable.length > 0 ? bg.seekable.end(0) : null);
-            if (livePos) bg.currentTime = livePos;
-            if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+            var bg      = document.getElementById('hls-bg');
+            var overlay = document.getElementById('pause-overlay');
+            if (bg) {
+                var livePos = (_hlsInstance && _hlsInstance.liveSyncPosition) || (bg.seekable.length > 0 ? bg.seekable.end(0) : null);
+                if (livePos) bg.currentTime = livePos;
+                if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+            }
+            if (overlay) overlay.style.opacity = '0';
         });
 
         // Forward next/previous queue jumps back to the plugin
