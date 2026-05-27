@@ -66,23 +66,25 @@
             return request;
         });
 
-        // Mirror CAF play/pause to the HLS background video so they stay in lock-step.
-        // Without this, pausing stops audio immediately but the buffered video keeps
-        // playing for 6–12 seconds (the full HLS live buffer).
+        // On audio PAUSE: drop buffered content and snap the video to live edge so the
+        // preview immediately shows the current visual state (MusicBee paused screen) rather
+        // than playing through 6-12 seconds of stale buffered frames.
+        // The video stream keeps playing — only audio is paused by CAF.
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
             var bg = document.getElementById('hls-bg');
-            if (bg) bg.pause();
+            if (!bg) return;
+            var livePos = (_hlsInstance && _hlsInstance.liveSyncPosition) || (bg.seekable.length > 0 ? bg.seekable.end(0) : null);
+            if (livePos) bg.currentTime = livePos;
+            if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] play() rejected:', e); });
         });
 
+        // On PLAYING (resume): snap to live edge in case any buffer drifted during the pause.
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
             var bg = document.getElementById('hls-bg');
             if (!bg) return;
-            // Seek to the live edge before resuming so we don't replay stale frames
-            // that accumulated in the buffer while the player was paused.
-            if (bg.seekable.length > 0) {
-                bg.currentTime = bg.seekable.end(0);
-            }
-            bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+            var livePos = (_hlsInstance && _hlsInstance.liveSyncPosition) || (bg.seekable.length > 0 ? bg.seekable.end(0) : null);
+            if (livePos) bg.currentTime = livePos;
+            if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
         });
 
         // Forward next/previous queue jumps back to the plugin
