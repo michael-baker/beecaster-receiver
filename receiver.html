@@ -54,6 +54,8 @@
     <video id="receiverVideoElement" class="castMediaElement"></video>
     <!-- HLS background: shows the WebView2 preview stream captured by FFmpeg -->
     <video id="hls-bg" muted playsinline autoplay></video>
+    <!-- Audio-only element for FLAC fMP4 HLS test stream -->
+    <audio id="flac-audio" preload="none"></audio>
     <!-- Black overlay that fades in on pause to hide the HLS buffer drain -->
     <div id="pause-overlay"></div>
 
@@ -458,7 +460,7 @@
         // you can A/B compare the two paths by ear before committing to the new pipeline.
         function startFlacHlsBg(baseUrl) {
             if (_hlsStarted || !baseUrl) return;
-            var video = document.getElementById('hls-bg');
+            var video = document.getElementById('flac-audio');
             if (!video) return;
             if (typeof Hls === 'undefined' || !Hls.isSupported()) {
                 console.error('[flac-hls] hls.js not available or MSE not supported');
@@ -482,7 +484,11 @@
                 backBufferLength: 0,
                 manifestLoadingMaxRetry: 12,
                 manifestLoadingRetryDelay: 1000,
-                manifestLoadingMaxRetryTimeout: 12000
+                manifestLoadingMaxRetryTimeout: 12000,
+                // Force codec so MSE opens SourceBuffer with the correct type.
+                // Without this, audio-only fMP4 manifests expose codec info as null
+                // and hls.js falls back to audio/mp4 with no codec string.
+                audioPreference: { audioCodec: 'fLaC' },
             });
             _hlsInstance.loadSource(url);
             _hlsInstance.attachMedia(video);
