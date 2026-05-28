@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -184,7 +184,7 @@
     </script>
 
     <script>
-        // ─── Remote logging: mirror console.* back to the plugin server ─────────────
+        // Remote logging: mirror console.* back to the plugin server
         // Messages sent before the LOAD interceptor sets _castBaseUrl are queued and
         // flushed once the URL is known.  Captured by log4net in the plugin process,
         // so you can read Chromecast receiver logs without chrome://inspect.
@@ -236,13 +236,12 @@
                 _sendRemoteLog('error', ['[unhandledrejection] ' + (r && r.message ? r.message : String(r))]);
             });
         })();
-        // ─────────────────────────────────────────────────────────────────────────────
 
         var _hlsStarted = false;
         var _hlsInstance = null;
         var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
 
-        // ─── Dispatcher: choose HLS or MPEG-TS based on server setting ───────────────
+        // Dispatcher: choose HLS or MPEG-TS based on server setting
         function startBgVideo(baseUrl, hlsMode) {
             if (hlsMode === 'mpegts') {
                 startMpegTsBg(baseUrl);
@@ -251,7 +250,7 @@
             }
         }
 
-        // ─── MPEG-TS background (mpegts mode) ────────────────────────────────────────
+        // MPEG-TS background (mpegts mode)
         // The plugin serves a never-ending chunked MPEG-TS stream at /cast/videolive.
         // Chrome dropped native MPEG-TS support, so we use mpegts.js (MSE-based demuxer).
         var _mpegtsPlayer = null;
