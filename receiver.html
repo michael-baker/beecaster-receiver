@@ -79,7 +79,17 @@
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
             const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
             const hlsMode = (request.media && request.media.customData && request.media.customData.HlsStreamingMode) || 'hls_memory';
-            if (baseUrl) { _castBaseUrl = baseUrl; startBgVideo(baseUrl, hlsMode); }
+            console.log('[receiver] LOAD interceptor: baseUrl=' + baseUrl + ' hlsMode=' + hlsMode);
+            if (baseUrl) {
+                _castBaseUrl = baseUrl;
+                try {
+                    startBgVideo(baseUrl, hlsMode);
+                } catch (e) {
+                    // A throw here would abort the Cast LOAD and render chrome-error.
+                    // Log and swallow so the session continues without background video.
+                    console.error('[receiver] startBgVideo threw (non-fatal):', e && e.message ? e.message : String(e));
+                }
+            }
             return request;
         });
 
@@ -193,10 +203,23 @@
 
         function startMpegTsBg(baseUrl) {
             var video = document.getElementById('hls-bg');
-            if (!video) return;
+            if (!video) { console.error('[mpegts-bg] hls-bg element missing'); return; }
 
-            if (typeof mpegts === 'undefined' || !mpegts.isSupported()) {
-                console.error('[mpegts-bg] mpegts.js not available or MSE not supported');
+            if (typeof mpegts === 'undefined') {
+                console.error('[mpegts-bg] mpegts global undefined — CDN script did not load');
+                startHlsBg(baseUrl);  // graceful fallback
+                return;
+            }
+
+            // Diagnostic: log feature list so we can inspect in Cast remote debugger
+            try {
+                var fl = mpegts.getFeatureList();
+                console.log('[mpegts-bg] featureList:', JSON.stringify(fl));
+            } catch (fe) { console.warn('[mpegts-bg] getFeatureList threw:', fe); }
+
+            if (!mpegts.isSupported()) {
+                console.error('[mpegts-bg] mpegts.isSupported()=false — MSE H264 not available; falling back to HLS');
+                startHlsBg(baseUrl);
                 return;
             }
 
@@ -208,22 +231,33 @@
             var url = baseUrl + 'cast/videolive';
             console.log('[mpegts-bg] starting via mpegts.js:', url);
 
-            _mpegtsPlayer = mpegts.createPlayer({
-                type: 'mpegts',
-                isLive: true,
-                url: url
-            }, {
-                // enableWorker: false — the Cast SDK context gives blob workers an HTTPS
-                // origin, which blocks fetches to our HTTP plugin server as mixed content.
-                // Running on the main thread avoids the worker HTTPS context entirely.
-                enableWorker: false,
-                liveBufferLatencyChasing: true,
-                liveBufferLatencyMaxLatency: 3.0,
-                liveBufferLatencyMinRemain: 0.5
-            });
+            try {
+                _mpegtsPlayer = mpegts.createPlayer({
+                    type: 'mpegts',
+                    isLive: true,
+                    url: url
+                }, {
+                    // enableWorker: false — the Cast SDK context gives blob workers an HTTPS
+                    // origin, which blocks fetches to our HTTP plugin server as mixed content.
+                    // Running on the main thread avoids the worker HTTPS context entirely.
+                    enableWorker: false,
+                    liveBufferLatencyChasing: true,
+                    liveBufferLatencyMaxLatency: 3.0,
+                    liveBufferLatencyMinRemain: 0.5
+                });
 
-            _mpegtsPlayer.attachMediaElement(video);
-            _mpegtsPlayer.load();
+                _mpegtsPlayer.attachMediaElement(video);
+                _mpegtsPlayer.load();
+            } catch (setupErr) {
+                // attachMediaElement or load() threw (e.g. ManagedMediaSource /
+                // disableRemotePlayback conflict on some Chromecast hardware).
+                console.error('[mpegts-bg] setup threw:', setupErr && setupErr.message ? setupErr.message : String(setupErr));
+                try { if (_mpegtsPlayer) { _mpegtsPlayer.destroy(); } } catch (e) {}
+                _mpegtsPlayer = null;
+                // Fall back to HLS mode — server always has the /cast/stream route too.
+                startHlsBg(baseUrl);
+                return;
+            }
 
             _mpegtsPlayer.on(mpegts.Events.MEDIA_INFO, function () {
                 console.log('[mpegts-bg] media info received — starting playback');
