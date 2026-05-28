@@ -258,7 +258,12 @@
             fetch('/cast/state')
                 .then(function (r) { return r.json(); })
                 .then(function (s) {
-                    var delayMs = (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 2000;
+                    // During calibration the HLS video runs continuously — only the audio pipeline
+                    // restarts, which takes ~3 s.  Skip the full AutoVideoDelayMs wait so the user
+                    // gets fast feedback after each slider adjustment.
+                    var delayMs = s.calibrationMode
+                        ? 3000
+                        : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 2000;
                     _audioSyncOverlayTimer = setTimeout(function () {
                         _audioSyncOverlayTimer = null;
                         _loadSyncActive = false;
