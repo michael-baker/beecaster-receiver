@@ -87,9 +87,9 @@
                 _lastHlsMode = hlsMode;
                 _flushRemoteQueue(); // send messages that arrived before LOAD
                 _showAudioSyncOverlay();
-                // In flac_hls mode the FLAC stream is the audio source; mute CAF so they don't overlap.
+                // In flac_hls / fmp4_hls mode the HLS stream is the audio source; mute CAF so they don't overlap.
                 var caf = document.getElementById('receiverVideoElement');
-                if (caf) caf.muted = (hlsMode === 'flac_hls');
+                if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls');
                 try {
                     resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
                     startBgVideo(baseUrl, hlsMode);
@@ -274,8 +274,8 @@
                     // gets fast feedback after each slider adjustment.
                     var delayMs = s.calibrationMode
                         ? 3000
-                        : _lastHlsMode === 'flac_hls'
-                            ? 1500
+                        : (_lastHlsMode === 'flac_hls' || _lastHlsMode === 'fmp4_hls')
+                            ? 3000
                             : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 2000;
                     _audioSyncOverlayTimer = setTimeout(function () {
                         _audioSyncOverlayTimer = null;
@@ -298,6 +298,8 @@
                 startMpegTsBg(baseUrl);
             } else if (hlsMode === 'flac_hls') {
                 startFlacHlsBg(baseUrl);
+            } else if (hlsMode === 'fmp4_hls') {
+                startFmp4HlsBg(baseUrl);
             } else {
                 startHlsBg(baseUrl);
             }
@@ -509,6 +511,58 @@
                     _hlsReset(video);
                     video.muted = true;
                     setTimeout(function () { startFlacHlsBg(baseUrl); }, 3000);
+                }
+            });
+        }
+
+        // Unified A+V fMP4 HLS mode.
+        // Plays /fmp4hls/stream.m3u8 — muxed H.264 video + FLAC audio in fMP4 segments
+        // produced by a single FFmpeg process (Fmp4HlsRunner on the server).
+        // Uses #hls-bg (full-screen video element) so both tracks display naturally.
+        // CAF's receiverVideoElement is muted in this mode (handled in the LOAD interceptor).
+        function startFmp4HlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            if (!video) { console.error('[fmp4-hls] hls-bg element missing'); return; }
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[fmp4-hls] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+            var url = baseUrl + 'fmp4hls/stream.m3u8';
+            console.log('[fmp4-hls] starting:', url);
+
+            var _mediaErrorCount = 0;
+            _hlsInstance = new Hls({
+                lowLatencyMode: false,
+                liveSyncDurationCount: 3,
+                liveMaxLatencyDurationCount: 6,
+                maxBufferLength: 12,
+                backBufferLength: 0,
+                maxLiveSyncPlaybackRate: 1.1,
+                manifestLoadingMaxRetry: 12,
+                manifestLoadingRetryDelay: 1000,
+                manifestLoadingMaxRetryTimeout: 12000,
+            });
+            _hlsInstance.loadSource(url);
+            _hlsInstance.attachMedia(video);
+            _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[fmp4-hls] manifest parsed');
+                video.style.display = 'block';
+                video.volume = 1;
+                video.play().catch(function (e) { console.warn('[fmp4-hls] play() rejected:', e); });
+            });
+            _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[fmp4-hls] non-fatal error:', data.type, data.details); return; }
+                console.error('[fmp4-hls] fatal error type:', data.type, 'details:', data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && _mediaErrorCount++ < 2) {
+                    console.warn('[fmp4-hls] recoverMediaError() attempt', _mediaErrorCount);
+                    _hlsInstance.recoverMediaError();
+                    _hlsInstance.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startFmp4HlsBg(baseUrl); }, 3000);
                 }
             });
         }
