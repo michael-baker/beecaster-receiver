@@ -468,6 +468,9 @@
             _hlsStarted = true;
             video.muted = false;
             var url = baseUrl + 'flactest/stream.m3u8';
+            var flacSupported = window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="flac"');
+            var flacOpusSupported = window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="opus"');
+            console.log('[flac-hls] MSE codec support — flac:', flacSupported, ' opus:', flacOpusSupported);
             console.log('[flac-hls] starting:', url);
 
             var _mediaErrorCount = 0;
