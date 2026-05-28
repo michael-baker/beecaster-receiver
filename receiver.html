@@ -206,8 +206,7 @@
             if (!video) { console.error('[mpegts-bg] hls-bg element missing'); return; }
 
             if (typeof mpegts === 'undefined') {
-                console.error('[mpegts-bg] mpegts global undefined — CDN script did not load');
-                startHlsBg(baseUrl);  // graceful fallback
+                console.error('[mpegts-bg] mpegts global undefined — CDN script did not load; cannot play mpegts stream');
                 return;
             }
 
@@ -218,8 +217,7 @@
             } catch (fe) { console.warn('[mpegts-bg] getFeatureList threw:', fe); }
 
             if (!mpegts.isSupported()) {
-                console.error('[mpegts-bg] mpegts.isSupported()=false — MSE H264 not available; falling back to HLS');
-                startHlsBg(baseUrl);
+                console.error('[mpegts-bg] mpegts.isSupported()=false — MSE H264 not available on this device; cannot play mpegts stream');
                 return;
             }
 
@@ -254,8 +252,8 @@
                 console.error('[mpegts-bg] setup threw:', setupErr && setupErr.message ? setupErr.message : String(setupErr));
                 try { if (_mpegtsPlayer) { _mpegtsPlayer.destroy(); } } catch (e) {}
                 _mpegtsPlayer = null;
-                // Fall back to HLS mode — server always has the /cast/stream route too.
-                startHlsBg(baseUrl);
+                // Server is in mpegts mode — no HLS segments available, so retry mpegts after 5 s.
+                setTimeout(function () { startMpegTsBg(baseUrl); }, 5000);
                 return;
             }
 
