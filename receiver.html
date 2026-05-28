@@ -123,8 +123,12 @@
             var overlay = document.getElementById('pause-overlay');
             if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
             if (bg) {
-                var livePos = (_hlsInstance && _hlsInstance.liveSyncPosition) || (bg.seekable.length > 0 ? bg.seekable.end(0) : null);
-                if (livePos) bg.currentTime = livePos;
+                // For HLS mode, snap back to live sync position so the background
+                // doesn't drift when audio has been paused for a long time.
+                // For mpegts mode the player follows the live edge automatically.
+                if (_hlsInstance && _hlsInstance.liveSyncPosition) {
+                    bg.currentTime = _hlsInstance.liveSyncPosition;
+                }
                 if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
             }
             if (overlay) overlay.style.opacity = '0';
@@ -209,7 +213,10 @@
                 isLive: true,
                 url: url
             }, {
-                enableWorker: true,
+                // enableWorker: false — the Cast SDK context gives blob workers an HTTPS
+                // origin, which blocks fetches to our HTTP plugin server as mixed content.
+                // Running on the main thread avoids the worker HTTPS context entirely.
+                enableWorker: false,
                 liveBufferLatencyChasing: true,
                 liveBufferLatencyMaxLatency: 3.0,
                 liveBufferLatencyMinRemain: 0.5
@@ -254,13 +261,20 @@
 
             if (typeof Hls !== 'undefined' && Hls.isSupported()) {
                 console.log('[hls-bg] using hls.js (MSE)');
+                var _mediaErrorCount = 0;
                 _hlsInstance = new Hls({
                     lowLatencyMode: false,
                     liveSyncDurationCount: 3,
                     liveMaxLatencyDurationCount: 6,
                     maxBufferLength: 12,
                     backBufferLength: 0,
-                    maxLiveSyncPlaybackRate: 1.1
+                    maxLiveSyncPlaybackRate: 1.1,
+                    // Manifest may not appear until ffmpeg has fully started (~5 s).
+                    // Raise retries so hls.js waits in place rather than firing a
+                    // fatal error that triggers the outer 2 s restart loop.
+                    manifestLoadingMaxRetry: 8,
+                    manifestLoadingRetryDelay: 1000,
+                    manifestLoadingMaxRetryTimeout: 8000
                 });
                 _hlsInstance.loadSource(url);
                 _hlsInstance.attachMedia(video);
@@ -309,8 +323,18 @@
                     if (!data.fatal) return;
                     console.error('[hls-bg] fatal error type:', data.type, 'details:', data.details);
                     if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                        console.warn('[hls-bg] attempting recoverMediaError()');
-                        _hlsInstance.recoverMediaError();
+                        _mediaErrorCount++;
+                        if (_mediaErrorCount <= 2) {
+                            // hls.js 1.x: recoverMediaError() re-attaches the codec;
+                            // startLoad(-1) is required to resume segment fetching.
+                            console.warn('[hls-bg] recoverMediaError() attempt', _mediaErrorCount);
+                            _hlsInstance.recoverMediaError();
+                            _hlsInstance.startLoad(-1);
+                        } else {
+                            console.warn('[hls-bg] media error unrecoverable after', _mediaErrorCount, 'attempts — restarting');
+                            _hlsReset(video);
+                            setTimeout(function () { startHlsBg(baseUrl); }, 2000);
+                        }
                     } else {
                         // Network or unrecoverable — auto-restart after 2s
                         console.warn('[hls-bg] restarting HLS stream in 2s');
