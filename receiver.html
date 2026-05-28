@@ -485,11 +485,11 @@
             _hlsInstance.attachMedia(video);
             _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
                 console.log('[flac-hls] manifest parsed — codec info:', _hlsInstance.levels && JSON.stringify(_hlsInstance.levels.map(function(l){ return l.audioCodec; })));
-                video.style.display = 'block';
+                video.volume = 1;
                 video.play().catch(function (e) { console.warn('[flac-hls] play() rejected:', e); });
             });
             _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
-                if (!data.fatal) return;
+                if (!data.fatal) { console.warn('[flac-hls] non-fatal error:', data.type, data.details); return; }
                 console.error('[flac-hls] fatal error type:', data.type, 'details:', data.details);
                 if (data.type === Hls.ErrorTypes.MEDIA_ERROR && _mediaErrorCount++ < 2) {
                     console.warn('[flac-hls] recoverMediaError() attempt', _mediaErrorCount);
