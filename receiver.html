@@ -87,9 +87,6 @@
                 _lastHlsMode = hlsMode;
                 _flushRemoteQueue(); // send messages that arrived before LOAD
                 _showAudioSyncOverlay();
-                // In flac_hls mode the FLAC test stream is the audio source; mute CAF so they don't overlap.
-                var caf = document.getElementById('receiverVideoElement');
-                if (caf) caf.muted = (hlsMode === 'flac_hls');
                 try {
                     resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
                     startBgVideo(baseUrl, hlsMode);
@@ -463,7 +460,7 @@
         // you can A/B compare the two paths by ear before committing to the new pipeline.
         function startFlacHlsBg(baseUrl) {
             if (_hlsStarted || !baseUrl) return;
-            var video = document.getElementById('flac-audio');
+            var video = document.getElementById('receiverVideoElement');
             if (!video) return;
             if (typeof Hls === 'undefined' || !Hls.isSupported()) {
                 console.error('[flac-hls] hls.js not available or MSE not supported');
