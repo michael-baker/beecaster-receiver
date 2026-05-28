@@ -77,7 +77,6 @@
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
             const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
             if (baseUrl) { _castBaseUrl = baseUrl; startHlsBg(baseUrl); }
-            _loadCompleting = true;
             return request;
         });
 
@@ -117,10 +116,6 @@
 
         // On PLAYING (resume): cancel any pending reveal, seek to live edge, fade out.
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
-            // Capture and clear the load-completing flag first: we don't ack PLAYING
-            // events that are the direct result of a LOAD command (that's not a user resume).
-            var skipAck = _loadCompleting;
-            _loadCompleting = false;
             var bg      = document.getElementById('hls-bg');
             var overlay = document.getElementById('pause-overlay');
             if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
@@ -130,8 +125,8 @@
                 if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
             }
             if (overlay) overlay.style.opacity = '0';
-            // Notify plugin that CC has entered PLAYING state (genuine resume, not post-LOAD start).
-            if (!skipAck && _castBaseUrl) {
+            // Notify plugin that CC has entered PLAYING state.
+            if (_castBaseUrl) {
                 fetch(_castBaseUrl + 'cast/ack', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -174,7 +169,6 @@
         var _hlsStarted = false;
         var _hlsInstance = null;
         var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
-        var _loadCompleting = false;    // true from LOAD until first PLAYING fires (suppress ack)
 
         function _hlsReset(video) {
             _hlsStarted = false;
