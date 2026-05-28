@@ -82,15 +82,18 @@
             console.log('[receiver] LOAD interceptor: baseUrl=' + baseUrl + ' hlsMode=' + hlsMode);
             if (baseUrl) {
                 _castBaseUrl = baseUrl;
+                _lastHlsMode = hlsMode;
                 _flushRemoteQueue(); // send messages that arrived before LOAD
                 _showAudioSyncOverlay();
                 try {
+                    resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
                     startBgVideo(baseUrl, hlsMode);
                 } catch (e) {
                     // A throw here would abort the Cast LOAD and render chrome-error.
                     // Log and swallow so the session continues without background video.
                     console.error('[receiver] startBgVideo threw (non-fatal):', e && e.message ? e.message : String(e));
                 }
+                _startCalibrationWatch(); // drop buffers the moment Stop Calibration is pressed
             }
             return request;
         });
@@ -245,6 +248,9 @@
         var _hlsStarted = false;
         var _hlsInstance = null;
         var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
+        var _lastHlsMode = 'hls_memory'; // most-recent mode from LOAD; used when restarting after calib reset
+        var _calibPollTimer = null;
+        var _sawCalibrationMode = false;
 
         // Load overlay: shown immediately on LOAD to cover the HLS spectrum video until
         // the audio pipeline's adelay has been consumed. Fades out after AutoVideoDelayMs + 2 s
@@ -263,7 +269,9 @@
                     // gets fast feedback after each slider adjustment.
                     var delayMs = s.calibrationMode
                         ? 3000
-                        : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 2000;
+                        : _lastHlsMode === 'flac_hls'
+                            ? 1500
+                            : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 2000;
                     _audioSyncOverlayTimer = setTimeout(function () {
                         _audioSyncOverlayTimer = null;
                         _loadSyncActive = false;
@@ -283,6 +291,8 @@
         function startBgVideo(baseUrl, hlsMode) {
             if (hlsMode === 'mpegts') {
                 startMpegTsBg(baseUrl);
+            } else if (hlsMode === 'flac_hls') {
+                startFlacHlsBg(baseUrl);
             } else {
                 startHlsBg(baseUrl);
             }
@@ -388,6 +398,109 @@
             }
             video.style.display = 'none';
             console.warn('[hls-bg] stream reset — waiting for restart');
+        }
+
+        // Destroys any active HLS or mpegts player, clearing all MSE source buffers.
+        // Called on every new LOAD so the receiver connects to the fresh FFmpeg pipeline
+        // with no stale frames, and when calibration ends to drop buffered calibration content.
+        function resetBgVideo() {
+            var video = document.getElementById('hls-bg');
+            if (_mpegtsPlayer) {
+                try { _mpegtsPlayer.destroy(); } catch (e) {}
+                _mpegtsPlayer = null;
+                _mpegtsLastStartMs = 0;
+                if (video) { try { video.pause(); } catch (e) {} video.style.display = 'none'; }
+            }
+            if (video && (_hlsStarted || _hlsInstance)) {
+                _hlsReset(video);
+            }
+            console.log('[receiver] bg video reset — buffers dropped');
+        }
+
+        // Polls /cast/state once per second after a LOAD.  The first time it sees
+        // calibrationMode == true it arms itself; when it then sees calibrationMode == false
+        // it calls resetBgVideo() so the TV goes dark immediately on Stop Calibration
+        // rather than draining up to 12 s of stale buffered content.
+        function _startCalibrationWatch() {
+            if (_calibPollTimer) { clearTimeout(_calibPollTimer); }
+            _sawCalibrationMode = false;
+            _calibPollTimer = setTimeout(_calibPoll, 1000);
+        }
+
+        function _calibPoll() {
+            _calibPollTimer = null;
+            if (!_castBaseUrl) return;
+            fetch(_castBaseUrl + 'cast/state')
+                .then(function (r) { return r.json(); })
+                .then(function (s) {
+                    if (s.calibrationMode) {
+                        _sawCalibrationMode = true;
+                        _calibPollTimer = setTimeout(_calibPoll, 1000);
+                    } else if (_sawCalibrationMode) {
+                        _sawCalibrationMode = false;
+                        console.log('[receiver] calibration ended — dropping bg video buffers');
+                        resetBgVideo();
+                        // Do not restart here; the next LOAD (when normal playback resumes)
+                        // will call startBgVideo() with a live pipeline already running.
+                    }
+                    // !_sawCalibrationMode && !s.calibrationMode: not in calib, stop polling.
+                })
+                .catch(function () {
+                    if (_sawCalibrationMode) {
+                        _calibPollTimer = setTimeout(_calibPoll, 2000);
+                    }
+                });
+        }
+
+        // FLAC fMP4 HLS proof-of-concept mode.
+        // Plays /flactest/stream.m3u8 (audio-only, lossless FLAC in fMP4 segments)
+        // through #hls-bg unmuted.  The normal CAF WAV stream continues in parallel so
+        // you can A/B compare the two paths by ear before committing to the new pipeline.
+        function startFlacHlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            if (!video) return;
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[flac-hls] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+            video.muted = false;
+            var url = baseUrl + 'flactest/stream.m3u8';
+            console.log('[flac-hls] starting:', url);
+
+            var _mediaErrorCount = 0;
+            _hlsInstance = new Hls({
+                lowLatencyMode: false,
+                liveSyncDurationCount: 3,
+                liveMaxLatencyDurationCount: 6,
+                maxBufferLength: 12,
+                backBufferLength: 0,
+                manifestLoadingMaxRetry: 12,
+                manifestLoadingRetryDelay: 1000,
+                manifestLoadingMaxRetryTimeout: 12000
+            });
+            _hlsInstance.loadSource(url);
+            _hlsInstance.attachMedia(video);
+            _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[flac-hls] manifest parsed — codec info:', _hlsInstance.levels && JSON.stringify(_hlsInstance.levels.map(function(l){ return l.audioCodec; })));
+                video.style.display = 'block';
+                video.play().catch(function (e) { console.warn('[flac-hls] play() rejected:', e); });
+            });
+            _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) return;
+                console.error('[flac-hls] fatal error type:', data.type, 'details:', data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && _mediaErrorCount++ < 2) {
+                    console.warn('[flac-hls] recoverMediaError() attempt', _mediaErrorCount);
+                    _hlsInstance.recoverMediaError();
+                    _hlsInstance.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    video.muted = true;
+                    setTimeout(function () { startFlacHlsBg(baseUrl); }, 3000);
+                }
+            });
         }
 
         function startHlsBg(baseUrl) {
