@@ -87,6 +87,9 @@
                 _lastHlsMode = hlsMode;
                 _flushRemoteQueue(); // send messages that arrived before LOAD
                 _showAudioSyncOverlay();
+                // In flac_hls mode the FLAC test stream is the audio source; mute CAF so they don't overlap.
+                var caf = document.getElementById('receiverVideoElement');
+                if (caf) caf.muted = (hlsMode === 'flac_hls');
                 try {
                     resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
                     startBgVideo(baseUrl, hlsMode);
