@@ -136,11 +136,11 @@
             if (bg) {
                 // For HLS mode, snap back to live sync position so the background
                 // doesn't drift when audio has been paused for a long time.
-                // For mpegts mode the player follows the live edge automatically.
+                // For mpegts mode the player manages play/pause directly; don't interfere.
                 if (_hlsInstance && _hlsInstance.liveSyncPosition) {
                     bg.currentTime = _hlsInstance.liveSyncPosition;
                 }
-                if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+                if (!_mpegtsPlayer && bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
             }
             if (overlay) overlay.style.opacity = '0';
             // Notify plugin that CC has entered PLAYING state.
@@ -255,10 +255,19 @@
         // The plugin serves a never-ending chunked MPEG-TS stream at /cast/videolive.
         // Chrome dropped native MPEG-TS support, so we use mpegts.js (MSE-based demuxer).
         var _mpegtsPlayer = null;
+        var _mpegtsLastStartMs = 0; // debounce double-LOAD
 
         function startMpegTsBg(baseUrl) {
             var video = document.getElementById('hls-bg');
             if (!video) { console.error('[mpegts-bg] hls-bg element missing'); return; }
+
+            // CAF sometimes fires LOAD twice in quick succession; ignore the duplicate.
+            var now = Date.now();
+            if (now - _mpegtsLastStartMs < 2000) {
+                console.warn('[mpegts-bg] ignoring duplicate start within 2 s');
+                return;
+            }
+            _mpegtsLastStartMs = now;
 
             if (typeof mpegts === 'undefined') {
                 console.error('[mpegts-bg] mpegts global undefined — CDN script did not load; cannot play mpegts stream');
@@ -301,6 +310,13 @@
 
                 _mpegtsPlayer.attachMediaElement(video);
                 _mpegtsPlayer.load();
+
+                // Show and start playback immediately — don't wait for MEDIA_INFO.
+                // The video is muted+playsinline so autoplay policy allows it.
+                // Waiting for MEDIA_INFO causes a black screen because the event fires
+                // asynchronously after the init segment, while the element stays display:none.
+                video.style.display = 'block';
+                video.play().catch(function (e) { console.warn('[mpegts-bg] initial play() rejected:', e); });
             } catch (setupErr) {
                 // attachMediaElement or load() threw (e.g. ManagedMediaSource /
                 // disableRemotePlayback conflict on some Chromecast hardware).
@@ -313,9 +329,9 @@
             }
 
             _mpegtsPlayer.on(mpegts.Events.MEDIA_INFO, function () {
-                console.log('[mpegts-bg] media info received — starting playback');
-                video.style.display = 'block';
-                video.play().catch(function (e) { console.warn('[mpegts-bg] play() rejected:', e); });
+                console.log('[mpegts-bg] media info received');
+                // play()/display already set after load(); retry play() only if still paused.
+                if (video.paused) video.play().catch(function (e) { console.warn('[mpegts-bg] play() rejected on MEDIA_INFO:', e); });
             });
 
             _mpegtsPlayer.on(mpegts.Events.ERROR, function (errType, errDetail, info) {
