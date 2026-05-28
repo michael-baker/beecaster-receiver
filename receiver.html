@@ -73,10 +73,11 @@
             request => request
         );
 
-        // On LOAD: extract MediaBaseUrl from customData and start the HLS background stream
+        // On LOAD: extract MediaBaseUrl and HlsStreamingMode from customData and start background video
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
             const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
-            if (baseUrl) { _castBaseUrl = baseUrl; startHlsBg(baseUrl); }
+            const hlsMode = (request.media && request.media.customData && request.media.customData.HlsStreamingMode) || 'hls_memory';
+            if (baseUrl) { _castBaseUrl = baseUrl; startBgVideo(baseUrl, hlsMode); }
             return request;
         });
 
@@ -169,6 +170,39 @@
         var _hlsStarted = false;
         var _hlsInstance = null;
         var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
+
+        // ─── Dispatcher: choose HLS or MPEG-TS based on server setting ───────────────
+        function startBgVideo(baseUrl, hlsMode) {
+            if (hlsMode === 'mpegts') {
+                startMpegTsBg(baseUrl);
+            } else {
+                startHlsBg(baseUrl);
+            }
+        }
+
+        // ─── MPEG-TS background (mpegts mode) ────────────────────────────────────────
+        // The plugin serves a never-ending chunked MPEG-TS stream at /cast/videolive.
+        // We set it as the <video> src directly; the Cast receiver supports MPEG-TS
+        // natively via the media pipeline without needing MSE.
+        function startMpegTsBg(baseUrl) {
+            var video = document.getElementById('hls-bg');
+            if (!video) return;
+            var url = baseUrl + 'cast/videolive';
+            console.log('[mpegts-bg] starting:', url);
+            video.src = url;
+            video.addEventListener('canplay', function onCanPlay() {
+                video.removeEventListener('canplay', onCanPlay);
+                video.style.display = 'block';
+                video.play().catch(function (e) { console.warn('[mpegts-bg] play() rejected:', e); });
+            });
+            video.addEventListener('error', function onError(e) {
+                video.removeEventListener('error', onError);
+                console.error('[mpegts-bg] video error:', video.error, e);
+                // Retry after 3 s
+                setTimeout(function () { startMpegTsBg(baseUrl); }, 3000);
+            });
+            video.load();
+        }
 
         function _hlsReset(video) {
             _hlsStarted = false;
