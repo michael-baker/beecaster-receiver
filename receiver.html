@@ -76,7 +76,8 @@
         // On LOAD: extract MediaBaseUrl from customData and start the HLS background stream
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
             const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
-            if (baseUrl) startHlsBg(baseUrl);
+            if (baseUrl) { _castBaseUrl = baseUrl; startHlsBg(baseUrl); }
+            _loadCompleting = true;
             return request;
         });
 
@@ -104,10 +105,22 @@
                         if (overlay) overlay.style.opacity = '0';
                     }, 12500);
                 });
+            // Notify plugin that CC has entered PAUSED state.
+            if (_castBaseUrl) {
+                fetch(_castBaseUrl + 'cast/ack', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ state: 'PAUSED' })
+                }).catch(function () {});
+            }
         });
 
         // On PLAYING (resume): cancel any pending reveal, seek to live edge, fade out.
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
+            // Capture and clear the load-completing flag first: we don't ack PLAYING
+            // events that are the direct result of a LOAD command (that's not a user resume).
+            var skipAck = _loadCompleting;
+            _loadCompleting = false;
             var bg      = document.getElementById('hls-bg');
             var overlay = document.getElementById('pause-overlay');
             if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
@@ -117,6 +130,14 @@
                 if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
             }
             if (overlay) overlay.style.opacity = '0';
+            // Notify plugin that CC has entered PLAYING state (genuine resume, not post-LOAD start).
+            if (!skipAck && _castBaseUrl) {
+                fetch(_castBaseUrl + 'cast/ack', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ state: 'PLAYING' })
+                }).catch(function () {});
+            }
         });
 
         // Forward next/previous queue jumps back to the plugin
@@ -152,6 +173,8 @@
     <script>
         var _hlsStarted = false;
         var _hlsInstance = null;
+        var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
+        var _loadCompleting = false;    // true from LOAD until first PLAYING fires (suppress ack)
 
         function _hlsReset(video) {
             _hlsStarted = false;
@@ -195,25 +218,34 @@
                 var _avEma = 0;           // exponential moving average of latency (ms)
                 var _avFragCount = 0;     // fragments seen since last report
                 var _avSampleCount = 0;   // total samples collected
+                var _avLastReported = -1; // last value posted (ms), -1 = never reported
                 _hlsInstance.on(Hls.Events.FRAG_CHANGED, function (event, data) {
                     var pdt = data.frag && data.frag.programDateTime;
                     if (!pdt) return;
                     var latencyMs = Date.now() - pdt;
-                    if (latencyMs < 0 || latencyMs > 60000) return; // ignore bogus values
+                    if (latencyMs < 1000 || latencyMs > 60000) return; // ignore bogus values
                     // Exponential moving average — alpha=0.15 converges in ~20 fragments
                     _avEma = _avSampleCount === 0 ? latencyMs : _avEma * 0.85 + latencyMs * 0.15;
                     _avSampleCount++;
                     _avFragCount++;
-                    // Wait for 5 samples to stabilise, then report every 3 fragments
-                    if (_avSampleCount >= 5 && _avFragCount >= 3) {
+                    // Wait for 20 samples to stabilise, then report once.
+                    // After the first report, only update again if the EMA has shifted
+                    // by more than 1500 ms — this prevents buffer-level noise (from
+                    // maxBufferLength jitter) from constantly changing the stored value.
+                    if (_avSampleCount >= 20 && _avFragCount >= 3) {
                         _avFragCount = 0;
                         var reportMs = Math.round(_avEma);
-                        console.log('[hls-bg] A/V latency EMA:', reportMs, 'ms');
-                        fetch(baseUrl + 'cast/avdelay', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ delayMs: reportMs })
-                        }).catch(function () {});
+                        if (_avLastReported < 0 || Math.abs(reportMs - _avLastReported) > 1500) {
+                            _avLastReported = reportMs;
+                            console.log('[hls-bg] A/V latency EMA:', reportMs, 'ms (reporting)');
+                            fetch(baseUrl + 'cast/avdelay', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ delayMs: reportMs })
+                            }).catch(function () {});
+                        } else {
+                            console.log('[hls-bg] A/V latency EMA:', reportMs, 'ms (stable, no update)');
+                        }
                     }
                 });
                 _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
