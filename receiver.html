@@ -6,6 +6,8 @@
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
     <!-- hls.js: Chromecast does not support HLS via canPlayType; MSE (hls.js) is required -->
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+    <!-- mpegts.js: MSE-based MPEG-TS player for the mpegts streaming mode -->
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
     <style>
         body {
             overflow: hidden;
@@ -182,26 +184,53 @@
 
         // ─── MPEG-TS background (mpegts mode) ────────────────────────────────────────
         // The plugin serves a never-ending chunked MPEG-TS stream at /cast/videolive.
-        // We set it as the <video> src directly; the Cast receiver supports MPEG-TS
-        // natively via the media pipeline without needing MSE.
+        // Chrome dropped native MPEG-TS support, so we use mpegts.js (MSE-based demuxer).
+        var _mpegtsPlayer = null;
+
         function startMpegTsBg(baseUrl) {
             var video = document.getElementById('hls-bg');
             if (!video) return;
+
+            if (typeof mpegts === 'undefined' || !mpegts.isSupported()) {
+                console.error('[mpegts-bg] mpegts.js not available or MSE not supported');
+                return;
+            }
+
+            if (_mpegtsPlayer) {
+                try { _mpegtsPlayer.destroy(); } catch (e) {}
+                _mpegtsPlayer = null;
+            }
+
             var url = baseUrl + 'cast/videolive';
-            console.log('[mpegts-bg] starting:', url);
-            video.src = url;
-            video.addEventListener('canplay', function onCanPlay() {
-                video.removeEventListener('canplay', onCanPlay);
+            console.log('[mpegts-bg] starting via mpegts.js:', url);
+
+            _mpegtsPlayer = mpegts.createPlayer({
+                type: 'mpegts',
+                isLive: true,
+                url: url
+            }, {
+                enableWorker: true,
+                liveBufferLatencyChasing: true,
+                liveBufferLatencyMaxLatency: 3.0,
+                liveBufferLatencyMinRemain: 0.5
+            });
+
+            _mpegtsPlayer.attachMediaElement(video);
+            _mpegtsPlayer.load();
+
+            _mpegtsPlayer.on(mpegts.Events.MEDIA_INFO, function () {
+                console.log('[mpegts-bg] media info received — starting playback');
                 video.style.display = 'block';
                 video.play().catch(function (e) { console.warn('[mpegts-bg] play() rejected:', e); });
             });
-            video.addEventListener('error', function onError(e) {
-                video.removeEventListener('error', onError);
-                console.error('[mpegts-bg] video error:', video.error, e);
-                // Retry after 3 s
+
+            _mpegtsPlayer.on(mpegts.Events.ERROR, function (errType, errDetail, info) {
+                console.error('[mpegts-bg] error type:', errType, 'detail:', errDetail, info);
+                // Network or fatal error — restart after 3 s
+                try { _mpegtsPlayer.destroy(); } catch (e) {}
+                _mpegtsPlayer = null;
                 setTimeout(function () { startMpegTsBg(baseUrl); }, 3000);
             });
-            video.load();
         }
 
         function _hlsReset(video) {
