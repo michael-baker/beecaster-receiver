@@ -86,7 +86,6 @@
                 _castBaseUrl = baseUrl;
                 _lastHlsMode = hlsMode;
                 _flushRemoteQueue(); // send messages that arrived before LOAD
-                _showAudioSyncOverlay();
                 // In flac_hls / fmp4_hls / fmp4_split mode the HLS stream is the audio source; mute CAF so they don't overlap.
                 var caf = document.getElementById('receiverVideoElement');
                 if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls' || hlsMode === 'fmp4_split');
@@ -96,10 +95,16 @@
                     // LOAD.  Only start them if not already running.
                     var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && _splitVideoHls);
                     if (!splitAlreadyRunning) {
+                        _showAudioSyncOverlay();
                         resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
                         startBgVideo(baseUrl, hlsMode);
+                    } else if (!_sawCalibrationMode) {
+                        // Normal track change with split HLS already running — show
+                        // the overlay to drain stale buffers, but don't reset the players.
+                        _showAudioSyncOverlay();
+                        console.log('[receiver] LOAD: split HLS already running — overlay only');
                     } else {
-                        console.log('[receiver] LOAD: split HLS already running — skipping reset');
+                        console.log('[receiver] LOAD: split HLS already running (calibration) — skipping overlay');
                     }
                 } catch (e) {
                     // A throw here would abort the Cast LOAD and render chrome-error.
