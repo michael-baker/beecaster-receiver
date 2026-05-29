@@ -284,6 +284,16 @@
         var _calibPollTimer = null;
         var _sawCalibrationMode = false;
 
+        function _postSplitTelemetry(data) {
+            if (!_castBaseUrl) return;
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', _castBaseUrl + 'cast/telemetry', true);
+                xhr.setRequestHeader('Content-Type', 'application/json');
+                xhr.send(JSON.stringify(data));
+            } catch(e) { /* never let telemetry break the stream */ }
+        }
+
         // Load overlay: shown immediately on LOAD to cover the HLS spectrum video until
         // the audio pipeline's adelay has been consumed. Fades out after AutoVideoDelayMs + 2 s
         // so spectrum and audio become visible together from the user's perspective.
@@ -672,19 +682,36 @@
                 var videoBuf = videoSync - video.currentTime;
                 var drift = videoBuf - audioBuf;
 
+                var rate;
                 // Dead zone: if within 50ms, keep 1.0x
                 if (Math.abs(drift) < 0.05) {
+                    rate = 1.0;
                     if (video.playbackRate !== 1.0) {
                         video.playbackRate = 1.0;
                         console.log('[split-hls] sync: drift=' + (drift * 1000).toFixed(0) + 'ms — rate=1.0');
                     }
-                    return;
+                } else {
+                    // Proportional steering: clamp between 0.90x and 1.10x
+                    rate = 1.0 + Math.max(-0.10, Math.min(0.10, drift));
+                    video.playbackRate = rate;
+                    console.log('[split-hls] sync: drift=' + (drift * 1000).toFixed(0) + 'ms — rate=' + rate.toFixed(3));
                 }
 
-                // Proportional steering: clamp between 0.90x and 1.10x
-                var rate = 1.0 + Math.max(-0.10, Math.min(0.10, drift));
-                video.playbackRate = rate;
-                console.log('[split-hls] sync: drift=' + (drift * 1000).toFixed(0) + 'ms — rate=' + rate.toFixed(3));
+                // Post telemetry for the calibration page
+                _postSplitTelemetry({
+                    driftMs: Math.round(drift * 1000),
+                    rate: rate,
+                    audioCurrentTime: audio.currentTime,
+                    videoCurrentTime: video.currentTime,
+                    audioLiveSync: audioSync,
+                    videoLiveSync: videoSync,
+                    audioBuf: audioBuf,
+                    videoBuf: videoBuf,
+                    audioBufferedEnd: audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0,
+                    videoBufferedEnd: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
+                    audioLevels: _splitAudioHls.levels ? _splitAudioHls.levels.length : 0,
+                    videoLevels: _splitVideoHls.levels ? _splitVideoHls.levels.length : 0
+                });
             }, 500);
         }
 
