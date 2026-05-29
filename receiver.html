@@ -87,9 +87,9 @@
                 _lastHlsMode = hlsMode;
                 _flushRemoteQueue(); // send messages that arrived before LOAD
                 _showAudioSyncOverlay();
-                // In flac_hls / fmp4_hls mode the HLS stream is the audio source; mute CAF so they don't overlap.
+                // In flac_hls / fmp4_hls / fmp4_split mode the HLS stream is the audio source; mute CAF so they don't overlap.
                 var caf = document.getElementById('receiverVideoElement');
-                if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls');
+                if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls' || hlsMode === 'fmp4_split');
                 try {
                     resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
                     startBgVideo(baseUrl, hlsMode);
@@ -153,7 +153,18 @@
                 if (_hlsInstance && _hlsInstance.liveSyncPosition) {
                     bg.currentTime = _hlsInstance.liveSyncPosition;
                 }
-                if (!_mpegtsPlayer && _hlsInstance && bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+                if (_splitVideoHls && _splitVideoHls.liveSyncPosition) {
+                    bg.currentTime = _splitVideoHls.liveSyncPosition;
+                }
+                if (_splitAudioHls && _splitAudioHls.liveSyncPosition) {
+                    var flacAudio = document.getElementById('flac-audio');
+                    if (flacAudio) flacAudio.currentTime = _splitAudioHls.liveSyncPosition;
+                }
+                if (!_mpegtsPlayer && (_hlsInstance || _splitVideoHls) && bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+                if (_splitAudioHls) {
+                    var fa = document.getElementById('flac-audio');
+                    if (fa && fa.paused) fa.play().catch(function (e) { console.warn('[split-hls] audio resume rejected:', e); });
+                }
             }
             if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
             // Notify plugin that CC has entered PLAYING state.
@@ -252,6 +263,9 @@
 
         var _hlsStarted = false;
         var _hlsInstance = null;
+        var _splitVideoHls = null;
+        var _splitAudioHls = null;
+        var _splitSyncTimer = null;
         var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
         var _lastHlsMode = 'hls_memory'; // most-recent mode from LOAD; used when restarting after calib reset
         var _calibPollTimer = null;
@@ -274,7 +288,7 @@
                     // gets fast feedback after each slider adjustment.
                     var delayMs = s.calibrationMode
                         ? 3000
-                        : (_lastHlsMode === 'flac_hls' || _lastHlsMode === 'fmp4_hls')
+                        : (_lastHlsMode === 'flac_hls' || _lastHlsMode === 'fmp4_hls' || _lastHlsMode === 'fmp4_split')
                             ? 3000
                             : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 2000;
                     _audioSyncOverlayTimer = setTimeout(function () {
@@ -300,6 +314,8 @@
                 startFlacHlsBg(baseUrl);
             } else if (hlsMode === 'fmp4_hls') {
                 startFmp4HlsBg(baseUrl);
+            } else if (hlsMode === 'fmp4_split') {
+                startSplitHlsBg(baseUrl);
             } else {
                 startHlsBg(baseUrl);
             }
@@ -403,6 +419,15 @@
                 try { _hlsInstance.destroy(); } catch (e) {}
                 _hlsInstance = null;
             }
+            if (_splitSyncTimer) { clearInterval(_splitSyncTimer); _splitSyncTimer = null; }
+            if (_splitVideoHls) {
+                try { _splitVideoHls.destroy(); } catch (e) {}
+                _splitVideoHls = null;
+            }
+            if (_splitAudioHls) {
+                try { _splitAudioHls.destroy(); } catch (e) {}
+                _splitAudioHls = null;
+            }
             video.style.display = 'none';
             console.warn('[hls-bg] stream reset — waiting for restart');
         }
@@ -412,15 +437,17 @@
         // with no stale frames, and when calibration ends to drop buffered calibration content.
         function resetBgVideo() {
             var video = document.getElementById('hls-bg');
+            var audio = document.getElementById('flac-audio');
             if (_mpegtsPlayer) {
                 try { _mpegtsPlayer.destroy(); } catch (e) {}
                 _mpegtsPlayer = null;
                 _mpegtsLastStartMs = 0;
                 if (video) { try { video.pause(); } catch (e) {} video.style.display = 'none'; }
             }
-            if (video && (_hlsStarted || _hlsInstance)) {
+            if (video && (_hlsStarted || _hlsInstance || _splitVideoHls || _splitAudioHls)) {
                 _hlsReset(video);
             }
+            if (audio) { try { audio.pause(); } catch (e) {} }
             console.log('[receiver] bg video reset — buffers dropped');
         }
 
@@ -513,6 +540,136 @@
                     setTimeout(function () { startFlacHlsBg(baseUrl); }, 3000);
                 }
             });
+        }
+
+        // Split A/V fMP4 HLS mode.
+        // Two separate HLS streams: video-only H.264 (/fmp4hls_video/) and audio-only
+        // FLAC (/fmp4hls_audio/). The audio element is the master clock; the video
+        // element's playbackRate is nudged to keep it in sync, avoiding the CC v2 CPU
+        // overload that occurs when decoding muxed H.264+FLAC in a single MSE pipeline.
+        function startSplitHlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            var audio = document.getElementById('flac-audio');
+            if (!video || !audio) { console.error('[split-hls] missing video/audio elements'); return; }
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[split-hls] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+
+            fetch(baseUrl + 'api/settings')
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .catch(function () { return null; })
+                .then(function (cfg) { _initSplitHls(baseUrl, video, audio, cfg); });
+        }
+
+        function _initSplitHls(baseUrl, video, audio, cfg) {
+            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 7;
+            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 14;
+            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 30;
+
+            var videoUrl = baseUrl + 'fmp4hls_video/stream.m3u8';
+            var audioUrl = baseUrl + 'fmp4hls_audio/stream.m3u8';
+            console.log('[split-hls] starting video:', videoUrl, 'audio:', audioUrl);
+
+            var commonCfg = {
+                lowLatencyMode: false,
+                liveSyncDurationCount: liveSyncDurationCount,
+                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
+                maxBufferLength: maxBufferLength,
+                backBufferLength: 4,
+                manifestLoadingMaxRetry: 12,
+                manifestLoadingRetryDelay: 1000,
+                manifestLoadingMaxRetryTimeout: 12000,
+            };
+
+            var audioMediaErrors = 0;
+            var videoMediaErrors = 0;
+
+            // Audio player (master clock, unmuted)
+            _splitAudioHls = new Hls(Object.assign({}, commonCfg, {
+                audioPreference: { audioCodec: 'fLaC' },
+            }));
+            _splitAudioHls.loadSource(audioUrl);
+            _splitAudioHls.attachMedia(audio);
+            _splitAudioHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[split-hls] audio manifest parsed');
+                audio.muted = false;
+                audio.volume = 1;
+                audio.play().catch(function (e) { console.warn('[split-hls] audio play() rejected:', e); });
+            });
+            _splitAudioHls.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[split-hls] audio non-fatal:', data.type, data.details); return; }
+                console.error('[split-hls] audio fatal:', data.type, data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && audioMediaErrors++ < 2) {
+                    _splitAudioHls.recoverMediaError();
+                    _splitAudioHls.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startSplitHlsBg(baseUrl); }, 3000);
+                }
+            });
+
+            // Video player (muted, playbackRate-steered to chase audio)
+            _splitVideoHls = new Hls(commonCfg);
+            _splitVideoHls.loadSource(videoUrl);
+            _splitVideoHls.attachMedia(video);
+            _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[split-hls] video manifest parsed');
+                video.muted = true;
+                video.style.display = 'block';
+                video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
+            });
+            _splitVideoHls.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[split-hls] video non-fatal:', data.type, data.details); return; }
+                console.error('[split-hls] video fatal:', data.type, data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && videoMediaErrors++ < 2) {
+                    _splitVideoHls.recoverMediaError();
+                    _splitVideoHls.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startSplitHlsBg(baseUrl); }, 3000);
+                }
+            });
+
+            // PlaybackRate steering: every 500ms compare the audio and video live-edge
+            // latency via EXT-X-PROGRAM-DATE-TIME. Both FFmpeg processes write PDT from
+            // the same wall clock, so comparing PDTs gives the A/V drift. Nudge video
+            // playbackRate to converge on the audio position.
+            _splitSyncTimer = setInterval(function () {
+                if (!_splitAudioHls || !_splitVideoHls) return;
+                if (audio.paused || video.paused) return;
+
+                // Use liveSyncPosition as each player's target playback point.
+                // The delta between audio and video liveSyncPosition tells us how far
+                // apart the two streams are in wall-clock time.
+                var audioSync = _splitAudioHls.liveSyncPosition;
+                var videoSync = _splitVideoHls.liveSyncPosition;
+                if (audioSync == null || videoSync == null) return;
+
+                // How far ahead video currentTime is relative to audio currentTime.
+                // Positive = video is ahead, needs to slow down.
+                // Negative = video is behind, needs to speed up.
+                var audioBuf = audioSync - audio.currentTime;
+                var videoBuf = videoSync - video.currentTime;
+                var drift = videoBuf - audioBuf;
+
+                // Dead zone: if within 50ms, keep 1.0x
+                if (Math.abs(drift) < 0.05) {
+                    if (video.playbackRate !== 1.0) {
+                        video.playbackRate = 1.0;
+                        console.log('[split-hls] sync: drift=' + (drift * 1000).toFixed(0) + 'ms — rate=1.0');
+                    }
+                    return;
+                }
+
+                // Proportional steering: clamp between 0.95x and 1.05x
+                var rate = 1.0 - Math.max(-0.05, Math.min(0.05, drift));
+                video.playbackRate = rate;
+                console.log('[split-hls] sync: drift=' + (drift * 1000).toFixed(0) + 'ms — rate=' + rate.toFixed(3));
+            }, 500);
         }
 
         // Unified A+V fMP4 HLS mode.
