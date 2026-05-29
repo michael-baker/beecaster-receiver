@@ -490,7 +490,8 @@
         // rather than draining up to 12 s of stale buffered content.
         function _startCalibrationWatch() {
             if (_calibPollTimer) { clearTimeout(_calibPollTimer); }
-            _sawCalibrationMode = false;
+            // Keep _sawCalibrationMode if already set — avoids repeated live-edge
+            // seeks when LOADs arrive while calibration is active.
             _calibPollTimer = setTimeout(_calibPoll, 1000);
         }
 
