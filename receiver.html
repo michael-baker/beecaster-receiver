@@ -675,8 +675,11 @@
             var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
             var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
             var audioCfg = Object.assign({}, commonCfg, {
-                maxBufferLength: 8,
-                backBufferLength: 0,
+                liveSyncDurationCount: liveSyncDurationCount * 2,
+                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount * 2,
+                maxBufferLength: 30,
+                backBufferLength: 4,
+                maxLiveSyncPlaybackRate: 1.0,
             });
             if (hlsCodec) audioCfg.audioPreference = { audioCodec: hlsCodec };
             _splitAudioHls = new Hls(audioCfg);
