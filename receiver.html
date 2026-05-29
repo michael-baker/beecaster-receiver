@@ -137,7 +137,7 @@
                 if (fa) try { fa.pause(); } catch (e) {}
             }
 
-            fetch('/cast/state')
+            fetch(_castBaseUrl + 'cast/state')
                 .then(function (r) { return r.json(); })
                 .then(function (s) {
                     // Split mode has no adelay — lift overlay after a short settle time.
@@ -313,7 +313,7 @@
             if (_audioSyncOverlayTimer) { clearTimeout(_audioSyncOverlayTimer); _audioSyncOverlayTimer = null; }
             _loadSyncActive = true;
             overlay.style.opacity = '1';
-            fetch('/cast/state')
+            fetch(_castBaseUrl + 'cast/state')
                 .then(function (r) { return r.json(); })
                 .then(function (s) {
                     // During calibration the HLS video runs continuously — only the audio pipeline
@@ -501,14 +501,35 @@
                 .then(function (r) { return r.json(); })
                 .then(function (s) {
                     if (s.calibrationMode) {
-                        _sawCalibrationMode = true;
+                        if (!_sawCalibrationMode) {
+                            _sawCalibrationMode = true;
+                            // In split mode, seek video to live edge after a short delay
+                            // so the Chromecast drops buffered pre-calibration frames and
+                            // shows the calibration display as soon as FFmpeg encodes it.
+                            if (_lastHlsMode === 'fmp4_split' && _splitVideoHls) {
+                                setTimeout(function () {
+                                    var bg = document.getElementById('hls-bg');
+                                    if (bg && _splitVideoHls && _splitVideoHls.liveSyncPosition) {
+                                        bg.currentTime = _splitVideoHls.liveSyncPosition;
+                                        console.log('[receiver] calibration start — video seeked to live edge ' + _splitVideoHls.liveSyncPosition.toFixed(2));
+                                    }
+                                }, 3000);
+                            }
+                        }
                         _calibPollTimer = setTimeout(_calibPoll, 1000);
                     } else if (_sawCalibrationMode) {
                         _sawCalibrationMode = false;
                         console.log('[receiver] calibration ended');
-                        // In split mode the HLS pipeline is continuous — don't destroy it.
-                        // In other modes, drop stale buffers so the next LOAD starts fresh.
-                        if (_lastHlsMode !== 'fmp4_split') {
+                        if (_lastHlsMode === 'fmp4_split') {
+                            // Seek video to live edge to flush calibration frames quickly.
+                            setTimeout(function () {
+                                var bg = document.getElementById('hls-bg');
+                                if (bg && _splitVideoHls && _splitVideoHls.liveSyncPosition) {
+                                    bg.currentTime = _splitVideoHls.liveSyncPosition;
+                                    console.log('[receiver] calibration end — video seeked to live edge ' + _splitVideoHls.liveSyncPosition.toFixed(2));
+                                }
+                            }, 3000);
+                        } else {
                             resetBgVideo();
                         }
                     }
@@ -662,9 +683,12 @@
             });
             _splitAudioHls.on(Hls.Events.LEVEL_LOADED, function () {
                 if (!_audioReady) {
-                    _audioReady = true;
-                    console.log('[split-hls] audio level loaded, liveSyncPosition=' + (_splitAudioHls.liveSyncPosition ?? 'null'));
-                    _trySplitStart();
+                    var pos = _splitAudioHls.liveSyncPosition;
+                    console.log('[split-hls] audio level loaded, liveSyncPosition=' + (pos ?? 'null'));
+                    if (pos != null && pos > 0) {
+                        _audioReady = true;
+                        _trySplitStart();
+                    }
                 }
             });
             _splitAudioHls.on(Hls.Events.ERROR, function (event, data) {
@@ -690,9 +714,12 @@
             });
             _splitVideoHls.on(Hls.Events.LEVEL_LOADED, function () {
                 if (!_videoReady) {
-                    _videoReady = true;
-                    console.log('[split-hls] video level loaded, liveSyncPosition=' + (_splitVideoHls.liveSyncPosition ?? 'null'));
-                    _trySplitStart();
+                    var pos = _splitVideoHls.liveSyncPosition;
+                    console.log('[split-hls] video level loaded, liveSyncPosition=' + (pos ?? 'null'));
+                    if (pos != null && pos > 0) {
+                        _videoReady = true;
+                        _trySplitStart();
+                    }
                 }
             });
             _splitVideoHls.on(Hls.Events.ERROR, function (event, data) {
