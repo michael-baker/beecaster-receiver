@@ -153,7 +153,7 @@
                 if (_hlsInstance && _hlsInstance.liveSyncPosition) {
                     bg.currentTime = _hlsInstance.liveSyncPosition;
                 }
-                if (!_mpegtsPlayer && bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+                if (!_mpegtsPlayer && _hlsInstance && bg.paused && bg.readyState > 0) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
             }
             if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
             // Notify plugin that CC has entered PLAYING state.
