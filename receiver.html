@@ -232,10 +232,9 @@
 
     <script>
         // Remote logging — gated by the EnableReceiverLog server setting.
-        // Fetched once from api/settings on the first LOAD; off by default so no
-        // HTTP traffic is generated on Chromecast v2 during normal playback.
+        // Re-fetched on every LOAD so the checkbox in settings takes effect without
+        // restarting the cast session. Off by default — zero HTTP traffic until enabled.
         var _remoteLogEnabled = false;
-        var _remoteLogSettingFetched = false;
 
         function _postRemoteLog(entry) {
             if (!_remoteLogEnabled || !_castBaseUrl) return;
@@ -276,8 +275,6 @@
         })();
 
         function _fetchRemoteLogSetting(baseUrl) {
-            if (_remoteLogSettingFetched) return;
-            _remoteLogSettingFetched = true;
             try {
                 fetch(baseUrl + 'api/settings')
                     .then(function(r) { return r.ok ? r.json() : null; })
@@ -677,7 +674,10 @@
             // Map the server's codec setting to the hls.js audioPreference fourcc.
             var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
             var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
-            var audioCfg = Object.assign({}, commonCfg);
+            var audioCfg = Object.assign({}, commonCfg, {
+                maxBufferLength: 8,
+                backBufferLength: 0,
+            });
             if (hlsCodec) audioCfg.audioPreference = { audioCodec: hlsCodec };
             _splitAudioHls = new Hls(audioCfg);
             _splitAudioHls.loadSource(audioUrl);
@@ -744,7 +744,14 @@
             // latency via EXT-X-PROGRAM-DATE-TIME. Both FFmpeg processes write PDT from
             // the same wall clock, so comparing PDTs gives the A/V drift. Nudge video
             // playbackRate to converge on the audio position.
-            var _lastLoggedRate = 1.0; // track last emitted rate to suppress redundant logs
+            //
+            // Telemetry is decoupled from the steering tick to reduce XHR load on CC v2:
+            //   - Hard-seeks: always POST immediately (buffer anomaly, one-shot)
+            //   - Calibration page open: POST at most every 1000ms (chart does not need 500ms)
+            //   - Outside calibration, drift > 500ms: POST at most every 2000ms (alert only)
+            //   - Dead zone or normal in-range drift outside calibration: never POST
+            var _lastLoggedRate = 1.0;  // last emitted rate, to suppress redundant logs
+            var _lastTelemetryMs = 0;   // wall-clock ms of last telemetry POST
             _splitSyncTimer = setInterval(function () {
                 if (!_splitAudioHls || !_splitVideoHls) return;
                 if (audio.paused || video.paused) return;
@@ -763,14 +770,16 @@
                 var videoBuf = videoSync - video.currentTime;
                 var drift = videoBuf - audioBuf;
 
-                // Large drift (>2s): rate steering can't recover in time, hard-seek instead.
-                if (Math.abs(drift) > 2.0) {
+                // Large drift (>1s): rate steering (10%) needs 10+ s to recover — hard-seek
+                // before both MSE buffers drain past the live edge.
+                if (Math.abs(drift) > 1.0) {
                     var targetTime = video.currentTime + drift;
                     console.log('[split-hls] sync: hard-seek — drift=' + (drift * 1000).toFixed(0) + 'ms, seeking video to ' + targetTime.toFixed(2));
                     video.currentTime = targetTime;
                     video.playbackRate = 1.0;
                     _lastLoggedRate = 1.0;
-                    // Hard-seeks are buffer anomalies — always post regardless of calibration state.
+                    // Hard-seeks are buffer anomalies — always POST regardless of calibration state.
+                    _lastTelemetryMs = Date.now();
                     _postSplitTelemetry({
                         driftMs: Math.round(drift * 1000),
                         rate: 1.0,
@@ -790,8 +799,8 @@
                 }
 
                 var rate;
-                // Dead zone: if within 50ms, keep 1.0x — nothing to post.
-                if (Math.abs(drift) < 0.05) {
+                // Dead zone: if within 150ms, keep 1.0x — nothing to post.
+                if (Math.abs(drift) < 0.15) {
                     rate = 1.0;
                     if (video.playbackRate !== 1.0) {
                         video.playbackRate = 1.0;
@@ -803,8 +812,8 @@
                     // Dead zone: nothing interesting — skip telemetry POST.
                     return;
                 } else {
-                    // Proportional steering: clamp between 0.90x and 1.10x
-                    rate = 1.0 + Math.max(-0.10, Math.min(0.10, drift));
+                    // Proportional steering: half-gain to dampen oscillation, clamp +/-0.10x
+                    rate = 1.0 + Math.max(-0.10, Math.min(0.10, drift * 0.5));
                     video.playbackRate = rate;
                     // Log only on rate transitions to avoid console spam.
                     var roundedRate = Math.round(rate * 1000);
@@ -815,10 +824,14 @@
                     }
                 }
 
-                // Post telemetry for the calibration page when active, or on large drift
-                // that signals an approaching buffer stall (>500ms) even outside calibration.
+                // Throttled telemetry: calibration page gets 1 update/s; outside calibration
+                // only post on notable drift (>500ms) at most every 2s.
+                var now = Date.now();
+                var throttleMs = _sawCalibrationMode ? 1000 : 2000;
                 if (!_sawCalibrationMode && Math.abs(drift) < 0.5) return;
+                if ((now - _lastTelemetryMs) < throttleMs) return;
 
+                _lastTelemetryMs = now;
                 _postSplitTelemetry({
                     driftMs: Math.round(drift * 1000),
                     rate: rate,
