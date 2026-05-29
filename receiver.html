@@ -536,14 +536,13 @@
             var _mediaErrorCount = 0;
             _hlsInstance = new Hls({
                 lowLatencyMode: false,
-                // Stay 7 segments (14 s) behind the live edge. The two-process pipeline
-                // encoder warms up over ~80 s from 0.897x to ~1.0x, accumulating ~4 s of
-                // PTS deficit. 7 segments (14 s) absorbs that warm-up without a stall and
-                // still leaves ~10 s of steady-state headroom.
-                liveSyncDurationCount: 7,
-                liveMaxLatencyDurationCount: 14,
-                maxBufferLength: 30,
-                backBufferLength: 0,
+                // Stay 4 segments (8 s) behind the live edge. The single-process pipeline
+                // reaches 1.0x speed within seconds; 4 segments provides comfortable
+                // headroom for any transient jitter without excessive visual latency.
+                liveSyncDurationCount: 4,
+                liveMaxLatencyDurationCount: 8,
+                maxBufferLength: 12,
+                backBufferLength: 4,
                 manifestLoadingMaxRetry: 12,
                 manifestLoadingRetryDelay: 1000,
                 manifestLoadingMaxRetryTimeout: 12000,
