@@ -589,9 +589,12 @@
             var videoMediaErrors = 0;
 
             // Audio player (master clock, unmuted)
-            _splitAudioHls = new Hls(Object.assign({}, commonCfg, {
-                audioPreference: { audioCodec: 'fLaC' },
-            }));
+            // Map the server's codec setting to the hls.js audioPreference fourcc.
+            var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
+            var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
+            var audioCfg = Object.assign({}, commonCfg);
+            if (hlsCodec) audioCfg.audioPreference = { audioCodec: hlsCodec };
+            _splitAudioHls = new Hls(audioCfg);
             _splitAudioHls.loadSource(audioUrl);
             _splitAudioHls.attachMedia(audio);
             _splitAudioHls.on(Hls.Events.MANIFEST_PARSED, function () {
