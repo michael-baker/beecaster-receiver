@@ -85,7 +85,6 @@
             if (baseUrl) {
                 _castBaseUrl = baseUrl;
                 _lastHlsMode = hlsMode;
-                _flushRemoteQueue(); // send messages that arrived before LOAD
                 // In flac_hls / fmp4_hls / fmp4_split mode the HLS stream is the audio source; mute CAF so they don't overlap.
                 var caf = document.getElementById('receiverVideoElement');
                 if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls' || hlsMode === 'fmp4_split');
@@ -231,59 +230,6 @@
     </script>
 
     <script>
-        // Remote logging: mirror console.* back to the plugin server
-        // Messages sent before the LOAD interceptor sets _castBaseUrl are queued and
-        // flushed once the URL is known.  Captured by log4net in the plugin process,
-        // so you can read Chromecast receiver logs without chrome://inspect.
-        var _remoteLogQueue = [];
-
-        function _postRemoteLog(entry) {
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', _castBaseUrl + 'cast/log', true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.send(JSON.stringify(entry));
-            } catch(e) { /* never let remote logging break the app */ }
-        }
-
-        function _flushRemoteQueue() {
-            var q = _remoteLogQueue.splice(0);
-            for (var i = 0; i < q.length; i++) { _postRemoteLog(q[i]); }
-        }
-
-        function _sendRemoteLog(level, args) {
-            var msg;
-            try {
-                msg = Array.prototype.map.call(args, function(a) {
-                    if (a == null) return String(a);
-                    try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
-                    catch(e) { return '[unserializable]'; }
-                }).join(' ');
-            } catch(e) { msg = '[log serialization error]'; }
-
-            var entry = { level: level, message: msg, ts: new Date().toISOString() };
-            if (_castBaseUrl) {
-                _postRemoteLog(entry);
-            } else if (_remoteLogQueue.length < 100) {
-                _remoteLogQueue.push(entry);
-            }
-        }
-
-        (function() {
-            ['log', 'info', 'warn', 'error'].forEach(function(m) {
-                var _orig = console[m].bind(console);
-                console[m] = function() { _orig.apply(console, arguments); _sendRemoteLog(m, arguments); };
-            });
-            window.onerror = function(msg, src, line) {
-                _sendRemoteLog('error', ['[uncaught] ' + msg + ' (' + src + ':' + line + ')']);
-                return false;
-            };
-            window.addEventListener('unhandledrejection', function(e) {
-                var r = e.reason;
-                _sendRemoteLog('error', ['[unhandledrejection] ' + (r && r.message ? r.message : String(r))]);
-            });
-        })();
-
         var _hlsStarted = false;
         var _hlsInstance = null;
         var _splitVideoHls = null;
@@ -600,8 +546,8 @@
         }
 
         // Split A/V fMP4 HLS mode.
-        // Two separate HLS streams: video-only H.264 (/fmp4hls_video/) and audio-only
-        // FLAC (/fmp4hls_audio/). The audio element is the master clock; the video
+        // Two separate HLS streams: video-only H.264 (/cast/split_video/) and audio-only
+        // FLAC (/cast/split_audio/). The audio element is the master clock; the video
         // element's playbackRate is nudged to keep it in sync, avoiding the CC v2 CPU
         // overload that occurs when decoding muxed H.264+FLAC in a single MSE pipeline.
         function startSplitHlsBg(baseUrl) {
@@ -627,8 +573,8 @@
             var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 14;
             var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 30;
 
-            var videoUrl = baseUrl + 'fmp4hls_video/stream.m3u8';
-            var audioUrl = baseUrl + 'fmp4hls_audio/stream.m3u8';
+            var videoUrl = baseUrl + 'cast/split_video/stream.m3u8';
+            var audioUrl = baseUrl + 'cast/split_audio/stream.m3u8';
             console.log('[split-hls] starting video:', videoUrl, 'audio:', audioUrl);
 
             var commonCfg = {
