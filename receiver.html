@@ -91,8 +91,16 @@
                 var caf = document.getElementById('receiverVideoElement');
                 if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls' || hlsMode === 'fmp4_split');
                 try {
-                    resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
-                    startBgVideo(baseUrl, hlsMode);
+                    // In split/fmp4 modes the HLS pipeline runs continuously across
+                    // track changes — don't destroy and recreate the players on every
+                    // LOAD.  Only start them if not already running.
+                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && _splitVideoHls);
+                    if (!splitAlreadyRunning) {
+                        resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
+                        startBgVideo(baseUrl, hlsMode);
+                    } else {
+                        console.log('[receiver] LOAD: split HLS already running — skipping reset');
+                    }
                 } catch (e) {
                     // A throw here would abort the Cast LOAD and render chrome-error.
                     // Log and swallow so the session continues without background video.
