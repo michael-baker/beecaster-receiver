@@ -153,7 +153,7 @@
                 if (_hlsInstance && _hlsInstance.liveSyncPosition) {
                     bg.currentTime = _hlsInstance.liveSyncPosition;
                 }
-                if (!_mpegtsPlayer && _hlsInstance && bg.paused && bg.readyState > 0) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+                if (!_mpegtsPlayer && _hlsInstance && bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
             }
             if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
             // Notify plugin that CC has entered PLAYING state.
@@ -536,11 +536,14 @@
             var _mediaErrorCount = 0;
             _hlsInstance = new Hls({
                 lowLatencyMode: false,
+                // Comfortable latency: stay 3 segments (6 s) behind the live edge.
+                // maxLiveSyncPlaybackRate is intentionally left at the default (1.0) so
+                // hls.js never speeds up playback to chase the edge — speed changes on
+                // FLAC audio are audible as glitches.
                 liveSyncDurationCount: 3,
-                liveMaxLatencyDurationCount: 6,
-                maxBufferLength: 12,
+                liveMaxLatencyDurationCount: 8,
+                maxBufferLength: 20,
                 backBufferLength: 0,
-                maxLiveSyncPlaybackRate: 1.1,
                 manifestLoadingMaxRetry: 12,
                 manifestLoadingRetryDelay: 1000,
                 manifestLoadingMaxRetryTimeout: 12000,
@@ -548,9 +551,10 @@
             _hlsInstance.loadSource(url);
             _hlsInstance.attachMedia(video);
             _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
-                console.log('[fmp4-hls] manifest parsed');
-                video.style.display = 'block';
+                console.log('[fmp4-hls] manifest parsed — levels:', _hlsInstance.levels && JSON.stringify(_hlsInstance.levels.map(function(l){ return { v: l.videoCodec, a: l.audioCodec }; })));
+                video.muted = false;
                 video.volume = 1;
+                video.style.display = 'block';
                 video.play().catch(function (e) { console.warn('[fmp4-hls] play() rejected:', e); });
             });
             _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
