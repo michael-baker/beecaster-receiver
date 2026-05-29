@@ -536,13 +536,14 @@
             var _mediaErrorCount = 0;
             _hlsInstance = new Hls({
                 lowLatencyMode: false,
-                // Comfortable latency: stay 3 segments (6 s) behind the live edge.
-                // maxLiveSyncPlaybackRate is intentionally left at the default (1.0) so
-                // hls.js never speeds up playback to chase the edge — speed changes on
-                // FLAC audio are audible as glitches.
-                liveSyncDurationCount: 3,
-                liveMaxLatencyDurationCount: 8,
-                maxBufferLength: 20,
+                // Stay 5 segments (10 s) behind the live edge. The FFmpeg pipeline runs at
+                // ~0.978x real-time; each 2s segment takes ~2.04s to produce. With only 3
+                // segments ahead of playback hls.js hits the end of available segments every
+                // few seconds. 5 segments gives ~10s headroom so the live edge can drift
+                // ~200 s before the buffer is exhausted.
+                liveSyncDurationCount: 5,
+                liveMaxLatencyDurationCount: 12,
+                maxBufferLength: 30,
                 backBufferLength: 0,
                 manifestLoadingMaxRetry: 12,
                 manifestLoadingRetryDelay: 1000,
