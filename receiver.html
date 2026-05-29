@@ -98,13 +98,10 @@
                         _showAudioSyncOverlay();
                         resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
                         startBgVideo(baseUrl, hlsMode);
-                    } else if (!_sawCalibrationMode) {
-                        // Normal track change with split HLS already running — show
-                        // the overlay to drain stale buffers, but don't reset the players.
-                        _showAudioSyncOverlay();
-                        console.log('[receiver] LOAD: split HLS already running — overlay only');
                     } else {
-                        console.log('[receiver] LOAD: split HLS already running (calibration) — skipping overlay');
+                        // Split pipeline is continuous — no overlay needed for track
+                        // changes or calibration since nothing resets.
+                        console.log('[receiver] LOAD: split HLS already running — skipping reset');
                     }
                 } catch (e) {
                     // A throw here would abort the Cast LOAD and render chrome-error.
@@ -145,7 +142,7 @@
                 .then(function (s) {
                     // Split mode has no adelay — lift overlay after a short settle time.
                     var isSplit = _lastHlsMode === 'fmp4_split';
-                    var delayMs = isSplit ? 1500 : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 500;
+                    var delayMs = isSplit ? 1500 : 3500;
                     _pauseRevealTimer = setTimeout(function () {
                         _pauseRevealTimer = null;
                         if (overlay) overlay.style.opacity = '0';
@@ -326,7 +323,7 @@
                         ? 3000
                         : (_lastHlsMode === 'flac_hls' || _lastHlsMode === 'fmp4_hls' || _lastHlsMode === 'fmp4_split')
                             ? 3000
-                            : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 2000;
+                            : 14000;
                     _audioSyncOverlayTimer = setTimeout(function () {
                         _audioSyncOverlayTimer = null;
                         _loadSyncActive = false;
@@ -508,10 +505,12 @@
                         _calibPollTimer = setTimeout(_calibPoll, 1000);
                     } else if (_sawCalibrationMode) {
                         _sawCalibrationMode = false;
-                        console.log('[receiver] calibration ended — dropping bg video buffers');
-                        resetBgVideo();
-                        // Do not restart here; the next LOAD (when normal playback resumes)
-                        // will call startBgVideo() with a live pipeline already running.
+                        console.log('[receiver] calibration ended');
+                        // In split mode the HLS pipeline is continuous — don't destroy it.
+                        // In other modes, drop stale buffers so the next LOAD starts fresh.
+                        if (_lastHlsMode !== 'fmp4_split') {
+                            resetBgVideo();
+                        }
                     }
                     // !_sawCalibrationMode && !s.calibrationMode: not in calib, stop polling.
                 })
