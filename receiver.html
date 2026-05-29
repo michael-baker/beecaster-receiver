@@ -116,10 +116,23 @@
             _loadSyncActive = false;
             if (overlay) overlay.style.opacity = '1';
             if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
+
+            // Split mode: pause both elements so they don't drift during the pause.
+            if (_splitVideoHls) {
+                var bg = document.getElementById('hls-bg');
+                if (bg) try { bg.pause(); } catch (e) {}
+            }
+            if (_splitAudioHls) {
+                var fa = document.getElementById('flac-audio');
+                if (fa) try { fa.pause(); } catch (e) {}
+            }
+
             fetch('/cast/state')
                 .then(function (r) { return r.json(); })
                 .then(function (s) {
-                    var delayMs = (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 500;
+                    // Split mode has no adelay — lift overlay after a short settle time.
+                    var isSplit = _lastHlsMode === 'fmp4_split';
+                    var delayMs = isSplit ? 1500 : (s.AutoVideoDelayMs > 0 ? s.AutoVideoDelayMs : 12000) + 500;
                     _pauseRevealTimer = setTimeout(function () {
                         _pauseRevealTimer = null;
                         if (overlay) overlay.style.opacity = '0';
@@ -158,15 +171,15 @@
                 }
                 if (_splitAudioHls && _splitAudioHls.liveSyncPosition) {
                     var flacAudio = document.getElementById('flac-audio');
-                    if (flacAudio) flacAudio.currentTime = _splitAudioHls.liveSyncPosition;
+                    if (flacAudio) {
+                        flacAudio.currentTime = _splitAudioHls.liveSyncPosition;
+                        if (flacAudio.paused) flacAudio.play().catch(function (e) { console.warn('[split-hls] audio resume rejected:', e); });
+                    }
                 }
                 if (!_mpegtsPlayer && (_hlsInstance || _splitVideoHls) && bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
-                if (_splitAudioHls) {
-                    var fa = document.getElementById('flac-audio');
-                    if (fa && fa.paused) fa.play().catch(function (e) { console.warn('[split-hls] audio resume rejected:', e); });
-                }
             }
-            if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
+            // Split mode: lift overlay immediately — no adelay to wait for.
+            if (overlay && (_lastHlsMode === 'fmp4_split' || !_loadSyncActive)) overlay.style.opacity = '0';
             // Notify plugin that CC has entered PLAYING state.
             if (_castBaseUrl) {
                 fetch(_castBaseUrl + 'cast/ack', {
