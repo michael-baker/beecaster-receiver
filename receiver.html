@@ -530,19 +530,31 @@
             }
 
             _hlsStarted = true;
+
+            // Fetch configurable HLS buffer settings, then create the player.
+            fetch(baseUrl + 'api/settings')
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .catch(function () { return null; })
+                .then(function (cfg) { _initFmp4Hls(baseUrl, video, cfg); });
+        }
+
+        function _initFmp4Hls(baseUrl, video, cfg) {
+            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 7;
+            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 14;
+            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 30;
+
             var url = baseUrl + 'fmp4hls/stream.m3u8';
-            console.log('[fmp4-hls] starting:', url);
+            console.log('[fmp4-hls] starting:', url,
+                'liveSyncDurationCount=' + liveSyncDurationCount,
+                'liveMaxLatencyDurationCount=' + liveMaxLatencyDurationCount,
+                'maxBufferLength=' + maxBufferLength);
 
             var _mediaErrorCount = 0;
             _hlsInstance = new Hls({
                 lowLatencyMode: false,
-                // Stay 7 segments (14 s) behind the live edge. The pipeline runs at
-                // ~0.998x–0.999x real-time due to encoder overhead; 7 segments provides
-                // enough buffer to absorb the 0.1–0.2% production deficit and transient
-                // jitter without the receiver entering BUFFERING state.
-                liveSyncDurationCount: 7,
-                liveMaxLatencyDurationCount: 14,
-                maxBufferLength: 30,
+                liveSyncDurationCount: liveSyncDurationCount,
+                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
+                maxBufferLength: maxBufferLength,
                 backBufferLength: 4,
                 manifestLoadingMaxRetry: 12,
                 manifestLoadingRetryDelay: 1000,
