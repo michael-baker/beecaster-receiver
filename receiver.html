@@ -682,6 +682,31 @@
                 var videoBuf = videoSync - video.currentTime;
                 var drift = videoBuf - audioBuf;
 
+                // Large drift (>2s): rate steering can't recover in time, hard-seek instead.
+                if (Math.abs(drift) > 2.0) {
+                    var targetTime = video.currentTime + drift;
+                    console.log('[split-hls] sync: hard-seek — drift=' + (drift * 1000).toFixed(0) + 'ms, seeking video to ' + targetTime.toFixed(2));
+                    video.currentTime = targetTime;
+                    video.playbackRate = 1.0;
+                    // Post telemetry even for hard-seek so the calibration page shows the event
+                    _postSplitTelemetry({
+                        driftMs: Math.round(drift * 1000),
+                        rate: 1.0,
+                        hardSeek: true,
+                        audioCurrentTime: audio.currentTime,
+                        videoCurrentTime: video.currentTime,
+                        audioLiveSync: audioSync,
+                        videoLiveSync: videoSync,
+                        audioBuf: audioBuf,
+                        videoBuf: videoBuf,
+                        audioBufferedEnd: audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0,
+                        videoBufferedEnd: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
+                        audioLevels: _splitAudioHls.levels ? _splitAudioHls.levels.length : 0,
+                        videoLevels: _splitVideoHls.levels ? _splitVideoHls.levels.length : 0
+                    });
+                    return;
+                }
+
                 var rate;
                 // Dead zone: if within 50ms, keep 1.0x
                 if (Math.abs(drift) < 0.05) {
