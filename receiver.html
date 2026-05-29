@@ -536,13 +536,12 @@
             var _mediaErrorCount = 0;
             _hlsInstance = new Hls({
                 lowLatencyMode: false,
-                // Stay 5 segments (10 s) behind the live edge. The FFmpeg pipeline runs at
-                // ~0.978x real-time; each 2s segment takes ~2.04s to produce. With only 3
-                // segments ahead of playback hls.js hits the end of available segments every
-                // few seconds. 5 segments gives ~10s headroom so the live edge can drift
-                // ~200 s before the buffer is exhausted.
-                liveSyncDurationCount: 5,
-                liveMaxLatencyDurationCount: 12,
+                // Stay 7 segments (14 s) behind the live edge. The two-process pipeline
+                // encoder warms up over ~80 s from 0.897x to ~1.0x, accumulating ~4 s of
+                // PTS deficit. 7 segments (14 s) absorbs that warm-up without a stall and
+                // still leaves ~10 s of steady-state headroom.
+                liveSyncDurationCount: 7,
+                liveMaxLatencyDurationCount: 14,
                 maxBufferLength: 30,
                 backBufferLength: 0,
                 manifestLoadingMaxRetry: 12,
