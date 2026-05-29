@@ -611,6 +611,29 @@
             var audioMediaErrors = 0;
             var videoMediaErrors = 0;
 
+            // Startup gate: wait for both players to have a valid liveSyncPosition
+            // before playing. Without this, play() fires before hls.js knows the
+            // live edge, and both players race ahead of liveSyncPosition (negative
+            // buffers, zero safety margin for segment delivery jitter).
+            var _audioReady = false;
+            var _videoReady = false;
+
+            function _trySplitStart() {
+                if (!_audioReady || !_videoReady) return;
+                var aSync = _splitAudioHls.liveSyncPosition;
+                var vSync = _splitVideoHls.liveSyncPosition;
+                if (aSync != null) {
+                    audio.currentTime = aSync;
+                    console.log('[split-hls] audio seeking to liveSyncPosition ' + aSync.toFixed(2));
+                }
+                if (vSync != null) {
+                    video.currentTime = vSync;
+                    console.log('[split-hls] video seeking to liveSyncPosition ' + vSync.toFixed(2));
+                }
+                audio.play().catch(function (e) { console.warn('[split-hls] audio play() rejected:', e); });
+                video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
+            }
+
             // Audio player (master clock, unmuted)
             // Map the server's codec setting to the hls.js audioPreference fourcc.
             var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
@@ -624,7 +647,13 @@
                 console.log('[split-hls] audio manifest parsed');
                 audio.muted = false;
                 audio.volume = 1;
-                audio.play().catch(function (e) { console.warn('[split-hls] audio play() rejected:', e); });
+            });
+            _splitAudioHls.on(Hls.Events.LEVEL_LOADED, function () {
+                if (!_audioReady) {
+                    _audioReady = true;
+                    console.log('[split-hls] audio level loaded, liveSyncPosition=' + (_splitAudioHls.liveSyncPosition ?? 'null'));
+                    _trySplitStart();
+                }
             });
             _splitAudioHls.on(Hls.Events.ERROR, function (event, data) {
                 if (!data.fatal) { console.warn('[split-hls] audio non-fatal:', data.type, data.details); return; }
@@ -646,7 +675,13 @@
                 console.log('[split-hls] video manifest parsed');
                 video.muted = true;
                 video.style.display = 'block';
-                video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
+            });
+            _splitVideoHls.on(Hls.Events.LEVEL_LOADED, function () {
+                if (!_videoReady) {
+                    _videoReady = true;
+                    console.log('[split-hls] video level loaded, liveSyncPosition=' + (_splitVideoHls.liveSyncPosition ?? 'null'));
+                    _trySplitStart();
+                }
             });
             _splitVideoHls.on(Hls.Events.ERROR, function (event, data) {
                 if (!data.fatal) { console.warn('[split-hls] video non-fatal:', data.type, data.details); return; }
