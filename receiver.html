@@ -652,9 +652,9 @@
                 var videoSync = _splitVideoHls.liveSyncPosition;
                 if (audioSync == null || videoSync == null) return;
 
-                // How far ahead video currentTime is relative to audio currentTime.
-                // Positive = video is ahead, needs to slow down.
-                // Negative = video is behind, needs to speed up.
+                // How far behind its live-sync target each player is.
+                // drift > 0: video has more buffer to consume (further behind live) → speed up
+                // drift < 0: video has less buffer (closer to live than audio) → slow down
                 var audioBuf = audioSync - audio.currentTime;
                 var videoBuf = videoSync - video.currentTime;
                 var drift = videoBuf - audioBuf;
@@ -668,8 +668,8 @@
                     return;
                 }
 
-                // Proportional steering: clamp between 0.95x and 1.05x
-                var rate = 1.0 - Math.max(-0.05, Math.min(0.05, drift));
+                // Proportional steering: clamp between 0.90x and 1.10x
+                var rate = 1.0 + Math.max(-0.10, Math.min(0.10, drift));
                 video.playbackRate = rate;
                 console.log('[split-hls] sync: drift=' + (drift * 1000).toFixed(0) + 'ms — rate=' + rate.toFixed(3));
             }, 500);
