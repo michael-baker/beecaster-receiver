@@ -8,8 +8,8 @@
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
     <!-- mpegts.js: MSE-based MPEG-TS player for the mpegts streaming mode -->
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
-    <!-- libflac.js: WASM FLAC decoder used by the WASM audio pipeline (fmp4_split mode) -->
-    <script src="https://cdn.jsdelivr.net/npm/libflac.js@5.4.0/dist/libflac.min.js"></script>
+    <!-- libflacjs: WASM FLAC decoder used by the WASM audio pipeline (fmp4_split mode) -->
+    <script src="https://cdn.jsdelivr.net/npm/libflacjs@5.4.0/dist/libflac.min.js"></script>
     <style>
         body {
             overflow: hidden;
@@ -1421,7 +1421,7 @@
             var audioUrl = baseUrl + 'cast/split_audio/stream.m3u8';
             var segBase  = baseUrl + 'cast/split_audio/';
             // CDN URL used by the page — the Worker uses importScripts() to load the same build.
-            var libflacUrl = 'https://cdn.jsdelivr.net/npm/libflac.js@5.4.0/dist/libflac.min.js';
+            var libflacUrl = 'https://cdn.jsdelivr.net/npm/libflacjs@5.4.0/dist/libflac.min.js';
 
             var w = {
                 stopped: false, worker: null, audioCtx: null, gainNode: null, workletNode: null,
@@ -1504,7 +1504,7 @@
                     }
                 } else if (d.type === 'error') {
                     console.error('[wasm-audio] worker error:', d.msg);
-                    if (!w.ready && typeof onReady === 'function') onReady(null);
+                    if (!w.ready) { window._wasmAudioStop(); if (typeof onReady === 'function') onReady(null); }
                 } else if (d.type === 'log') {
                     if (d.level === 'error') console.error(d.msg);
                     else if (d.level === 'warn') console.warn(d.msg);
@@ -1513,7 +1513,7 @@
             };
             w.worker.onerror = function (e) {
                 console.error('[wasm-audio] worker uncaught error:', e.message);
-                if (!w.ready && typeof onReady === 'function') onReady(null);
+                if (!w.ready) { window._wasmAudioStop(); if (typeof onReady === 'function') onReady(null); }
             };
             w.worker.postMessage({ type: 'start', audioUrl: audioUrl, segBase: segBase,
                                    libflacUrl: libflacUrl, liveSyncCount: liveSyncCount });
