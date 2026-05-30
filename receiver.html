@@ -1096,7 +1096,7 @@
         const PCM_MAGIC    = 0x50434DFF; // 'P','C','M',0xFF
         const PCM_HDR_SIZE = 16;
         const PCM_SAMPLE_RATE = 48000;
-        const PCM_PREROLL_SAMPLES = 48000; // 1 s pre-roll
+        const PCM_PREROLL_SAMPLES = 96000; // 2 s pre-roll
 
         function _pcmStop() {
             if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
@@ -1186,17 +1186,24 @@
                             _pcmLastFrameAudioTimeMs = msg.audioTimeMs;
                             _pcmSamplesPlayedAtFrame = msg.samplesPlayedAtFrame;
                             _pcmSamplesPlayed = msg.samplesPlayed;
+                            if (msg.ringFill !== undefined) {
+                                var fillMs = (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                var capMs  = (msg.ringCapacity / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                document.title = 'PCM ring: ' + fillMs + ' / ' + capMs + ' ms';
+                            }
                         } else if (msg.type === 'underrun') {
-                            console.warn('[pcm-stream] AudioWorklet underrun — re-buffering');
+                            var fillMs = msg.ringFill !== undefined ? (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0) : '?';
+                            console.warn('[pcm-stream] AudioWorklet underrun — re-buffering (ring was ' + fillMs + ' ms)');
                             // Re-arm pre-roll so we buffer before re-starting output
                             _pcmPrerollSamples = 0;
+                            _pcmPrerollGate = false;
                         }
                     };
 
                     console.log('[pcm-stream] AudioWorklet ready — starting PCM fetch');
                     if (_pcmAudioCtx.state === 'suspended') _pcmAudioCtx.resume().catch(function () {});
                     _pcmFetchLoop(baseUrl);
-                    _pcmStartVideoSync();
+                    // Sync timer starts after pre-roll (see _pcmConsumeChunk)
                 })
                 .catch(function (err) {
                     console.error('[pcm-stream] addModule failed:', err);
@@ -1302,6 +1309,7 @@
                     if (_pcmWorkletNode) {
                         _pcmWorkletNode.port.postMessage({ type: 'start' });
                         console.log('[pcm-stream] pre-roll complete (' + _pcmPrerollSamples + ' samples) — worklet started');
+                        _pcmStartVideoSync();
                     }
                 }
 
@@ -1316,12 +1324,20 @@
         }
         var _pcmPrerollGate = false; // separate from _pcmPrerollSamples for clarity
 
-        // A/V sync: every 500 ms compare the PCM audio clock with the video live-sync
-        // position and steer video.playbackRate exactly as the split-HLS sync timer does.
+        // A/V sync: every 500 ms steer video.playbackRate to keep video near its live-sync
+        // target. Both audio (PCM ring) and video (HLS) are live streams; we simply maintain
+        // the video buffer level at ~1 s behind liveSyncPosition with very gentle rate steering.
+        //
+        // Gains are conservative: CC v2 GC pauses cause ≥100 ms timer jitter so aggressive
+        // corrections overshoot and oscillate. Hard-seeks are disabled — they stall the HLS
+        // pipeline and cause large audio gaps.
+        //
+        // The timer does not start until pre-roll completes, and an 8 s startup grace period
+        // further avoids reacting to HLS initial-latch transients.
         function _pcmStartVideoSync() {
             if (_pcmSyncTimer) clearInterval(_pcmSyncTimer);
             var _lastLoggedRate = 1.0;
-            var _seekCooldownUntil = 0;
+            var _graceUntil = Date.now() + 8000; // ignore first 8 s after pre-roll
 
             _pcmSyncTimer = setInterval(function () {
                 if (!_splitVideoHls || !_pcmWorkletNode) return;
@@ -1329,51 +1345,37 @@
                 if (!video || video.paused) return;
 
                 var now = Date.now();
-                if (now < _seekCooldownUntil) return;
-
-                // Estimate the audio playback wall-clock position from the worklet clock.
-                // _pcmLastFrameAudioTimeMs is the server-side audio clock at the last frame.
-                // Samples consumed since then convert to additional milliseconds.
-                var samplesAfterFrame = _pcmSamplesPlayed - _pcmSamplesPlayedAtFrame;
-                if (samplesAfterFrame < 0) return; // clock not yet valid
-                var estimatedAudioMs = _pcmLastFrameAudioTimeMs + (samplesAfterFrame * 1000 / PCM_SAMPLE_RATE);
+                if (now < _graceUntil) return;
 
                 var videoSync = _splitVideoHls.liveSyncPosition;
                 if (videoSync == null) return;
 
-                // videoBuf: how far ahead of its live-sync target the video is buffered.
-                // audioBuf: estimated headroom in the PCM worklet ring.
-                var videoTime = video.currentTime;
-                var videoBuf = videoSync - videoTime;
+                // drift = how far video currentTime is from the target position.
+                // Target: 1 s behind liveSyncPosition (stable buffer, not too close to live edge).
+                var targetBuf = 1.0;
+                var videoBuf  = videoSync - video.currentTime;
+                var drift     = videoBuf - targetBuf;
 
-                // For drift we use: how far behind live is video vs audio.
-                // We don't have a direct audioTime in video-timeline units, so we use
-                // a simpler proxy: drift = videoBuf - target (0.5 s), which steers video
-                // to keep ~0.5 s of forward buffer.
-                var targetBuf = 0.5;
-                var drift = videoBuf - targetBuf;
-
+                // Discard obvious glitches (liveSyncPosition can jump on segment boundary).
                 if (Math.abs(drift) > 8.0) {
                     console.warn('[pcm-stream] sync: ignoring anomalous drift=' + (drift * 1000).toFixed(0) + 'ms');
                     return;
                 }
-                if (Math.abs(drift) > 1.0) {
-                    video.currentTime = videoTime + drift;
-                    video.playbackRate = 1.0;
-                    _lastLoggedRate = 1.0;
-                    _seekCooldownUntil = now + 2500;
-                    console.log('[pcm-stream] sync: hard-seek drift=' + (drift * 1000).toFixed(0) + 'ms');
+
+                // Dead zone — no correction needed.
+                if (Math.abs(drift) < 0.40) {
+                    if (video.playbackRate !== 1.0) {
+                        video.playbackRate = 1.0;
+                        console.log('[pcm-stream] sync: back in dead zone \u2014 rate=1.0');
+                    }
                     return;
                 }
-                if (Math.abs(drift) < 0.15) {
-                    if (video.playbackRate !== 1.0) video.playbackRate = 1.0;
-                    _lastLoggedRate = 1.0;
-                    return;
-                }
-                var rate = 1.0 + Math.max(-0.10, Math.min(0.10, drift * 0.5));
+
+                // Proportional rate adjustment capped at ±4 %.
+                var rate = 1.0 + Math.max(-0.04, Math.min(0.04, drift * 0.12));
                 video.playbackRate = rate;
                 var roundedRate = Math.round(rate * 1000);
-                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 5) {
+                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 2) {
                     console.log('[pcm-stream] sync: drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
                     _lastLoggedRate = rate;
                 }

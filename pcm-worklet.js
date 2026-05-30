@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const RING_FRAMES = 96000;  // 2 s ring buffer at 48 kHz
+const RING_FRAMES = 192000; // 4 s ring buffer at 48 kHz
 const FADE_SAMPLES = 240;   // 5 ms fade-out on underrun to avoid clicks
 const CLOCK_INTERVAL = 1024; // post clock message every ~21 ms
 
@@ -114,7 +114,7 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
                 this._underrun = true;
                 this._fadeSamplesLeft = FADE_SAMPLES;
                 this._fadeGain = 1.0;
-                this.port.postMessage({ type: 'underrun' });
+                this.port.postMessage({ type: 'underrun', ringFill: buffered });
             }
 
             if (this._fadeSamplesLeft > 0) {
@@ -166,11 +166,14 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
         // Periodically post the clock so the main thread can steer video playbackRate
         if ((this._samplesPlayed - this._lastClockSamples) >= CLOCK_INTERVAL) {
             this._lastClockSamples = this._samplesPlayed;
+            const fill = (this._writeHead - this._readHead + RING_FRAMES) % RING_FRAMES;
             this.port.postMessage({
                 type: 'clock',
                 audioTimeMs: this._lastFrameAudioTimeMs,
                 samplesPlayedAtFrame: this._samplesPlayedAtLastFrame,
                 samplesPlayed: this._samplesPlayed,
+                ringFill: fill,
+                ringCapacity: RING_FRAMES,
             });
         }
 
