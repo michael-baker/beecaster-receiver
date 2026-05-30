@@ -651,7 +651,7 @@
                 liveSyncDurationCount: liveSyncDurationCount,
                 liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
                 maxBufferLength: maxBufferLength,
-                backBufferLength: 4,
+                backBufferLength: 0,
                 manifestLoadingMaxRetry: 12,
                 manifestLoadingRetryDelay: 1000,
                 manifestLoadingMaxRetryTimeout: 12000,
@@ -691,9 +691,12 @@
             // the same position in the HLS timeline on startup. Diverging values cause
             // _audioReady to fire much later than _videoReady (blocking playback) and
             // seeking each player to a different PTS at _trySplitStart (A/V desync).
+            // maxBufferLength is kept small (10s) to avoid MSE bufferFullError on the
+            // memory-constrained CC v2 — a 30s FLAC buffer fills the SourceBuffer and
+            // hls.js stalls appending, which causes a BUFFERING glitch.
             var audioCfg = Object.assign({}, commonCfg, {
-                maxBufferLength: 30,
-                backBufferLength: 4,
+                maxBufferLength: 10,
+                backBufferLength: 0,
                 maxLiveSyncPlaybackRate: 1.0,
             });
             if (hlsCodec) audioCfg.audioPreference = { audioCodec: hlsCodec };
