@@ -637,9 +637,9 @@
         }
 
         function _initSplitHls(baseUrl, video, audio, cfg) {
-            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 7;
-            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 14;
-            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 30;
+            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 3;
+            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
+            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 12;
             var audioOnly = !!(cfg && cfg.splitHlsAudioOnly);
 
             var videoUrl = baseUrl + 'cast/split_video/stream.m3u8';
@@ -902,9 +902,9 @@
         }
 
         function _initFmp4Hls(baseUrl, video, cfg) {
-            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 7;
-            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 14;
-            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 30;
+            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 3;
+            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
+            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 12;
 
             var url = baseUrl + 'fmp4hls/stream.m3u8';
             console.log('[fmp4-hls] starting:', url,
