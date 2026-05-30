@@ -8,8 +8,6 @@
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
     <!-- mpegts.js: MSE-based MPEG-TS player for the mpegts streaming mode -->
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
-    <!-- libflacjs: WASM FLAC decoder used by the WASM audio pipeline (fmp4_split mode) -->
-    <script src="https://cdn.jsdelivr.net/npm/libflacjs@5.4.0/dist/libflac.min.js"></script>
     <style>
         body {
             overflow: hidden;
@@ -96,7 +94,7 @@
                     // track changes — don't destroy and recreate the players on every
                     // LOAD.  Only start them if not already running.
                     // In audio-only mode _splitVideoHls is always null, so check audio alone.
-                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && (_splitAudioHls || window._wasmAudio) && (_splitVideoHls || _splitAudioOnlyMode));
+                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && (_splitVideoHls || _splitAudioOnlyMode));
                     if (!splitAlreadyRunning) {
                         _showAudioSyncOverlay();
                         resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
@@ -138,9 +136,6 @@
             if (_splitAudioHls) {
                 var fa = document.getElementById('flac-audio');
                 if (fa) try { fa.pause(); } catch (e) {}
-            }
-            if (window._wasmAudio && window._wasmAudio.audioCtx) {
-                window._wasmAudio.audioCtx.suspend().catch(function () {});
             }
 
             fetch(_castBaseUrl + 'cast/state')
@@ -184,17 +179,6 @@
                 }
                 if (_splitVideoHls && _splitVideoHls.liveSyncPosition) {
                     bg.currentTime = _splitVideoHls.liveSyncPosition;
-                }
-                if (window._wasmAudio && window._wasmAudio.audioCtx) {
-                    var _wr = window._wasmAudio;
-                    _wr.audioCtx.resume().then(function () {
-                        if (window._wasmAudio === _wr) {
-                            // Re-anchor the drift reference so suspended time is not counted as drift.
-                            _wr.startAudioCtxTime = _wr.audioCtx.currentTime;
-                            var _bg = document.getElementById('hls-bg');
-                            _wr.startVideoTime = _bg ? _bg.currentTime : 0;
-                        }
-                    }).catch(function (e) { console.warn('[wasm-audio] resume rejected:', e); });
                 }
                 if (_splitAudioHls && _splitAudioHls.liveSyncPosition) {
                     var flacAudio = document.getElementById('flac-audio');
@@ -314,6 +298,17 @@
         var _calibPollTimer = null;
         var _sawCalibrationMode = false;
 
+        // PCM stream state (pcm_stream mode)
+        var _pcmAudioCtx = null;      // AudioContext
+        var _pcmWorkletNode = null;   // AudioWorkletNode connected to destination
+        var _pcmWorker = null;        // Web Worker running pcm-fetch-worker.js
+        var _pcmPrerollSamples = 0;   // samples accumulated before starting worklet output
+        var _pcmLastFrameAudioTimeMs = 0;  // from last frame header
+        var _pcmSamplesPlayedAtFrame = 0;  // worklet sample counter at last frame
+        var _pcmSamplesPlayed = 0;    // latest sample count from worklet clock message
+        var _pcmSyncTimer = null;     // interval for A/V sync steering in pcm_stream mode
+        var _pcmStarted = false;      // true once pcm stream has been initialised for this session
+
         function _postSplitTelemetry(data) {
             if (!_castBaseUrl) return;
             try {
@@ -369,6 +364,8 @@
                 startFmp4HlsBg(baseUrl);
             } else if (hlsMode === 'fmp4_split') {
                 startSplitHlsBg(baseUrl);
+            } else if (hlsMode === 'pcm_stream') {
+                startPcmStream(baseUrl);
             } else {
                 startHlsBg(baseUrl);
             }
@@ -481,7 +478,6 @@
                 try { _splitAudioHls.destroy(); } catch (e) {}
                 _splitAudioHls = null;
             }
-            if (window._wasmAudioStop) window._wasmAudioStop();
             _splitAudioOnlyMode = false;
             if (video) video.style.display = 'none';
             console.warn('[hls-bg] stream reset — waiting for restart');
@@ -499,10 +495,14 @@
                 _mpegtsLastStartMs = 0;
                 if (video) { try { video.pause(); } catch (e) {} video.style.display = 'none'; }
             }
-            if (video && (_hlsStarted || _hlsInstance || _splitVideoHls || _splitAudioHls || window._wasmAudio)) {
+            if (video && (_hlsStarted || _hlsInstance || _splitVideoHls || _splitAudioHls)) {
                 _hlsReset(video);
             }
             if (audio) { try { audio.pause(); } catch (e) {} }
+            // PCM stream teardown
+            if (_pcmStarted) {
+                _pcmStop();
+            }
             console.log('[receiver] bg video reset — buffers dropped');
         }
 
@@ -686,83 +686,69 @@
 
             function _trySplitStart() {
                 if (!_audioReady || !_videoReady) return;
-                var _w = window._wasmAudio;
+                var aSync = _splitAudioHls.liveSyncPosition;
                 var vSync = _splitVideoHls ? _splitVideoHls.liveSyncPosition : null;
-                if (_w) {
-                    // WASM mode: video chases the AudioContext elapsed-time clock.
-                    if (vSync != null && video) {
-                        video.currentTime = vSync;
-                        console.log('[wasm-audio] video seeking to liveSyncPosition ' + vSync.toFixed(2));
-                    }
-                    if (video && !audioOnly) video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
-                    // Record the alignment reference point after the seek settles.
-                    setTimeout(function () {
-                        if (!_w.stopped) {
-                            _w.startAudioCtxTime = _w.audioCtx.currentTime;
-                            _w.startVideoTime    = video ? video.currentTime : 0;
-                            console.log('[wasm-audio] sync anchored: audioCtxTime=' + _w.startAudioCtxTime.toFixed(3) + ' videoTime=' + _w.startVideoTime.toFixed(3));
-                        }
-                    }, 50);
-                } else {
-                    // hls.js fallback mode.
-                    var aSync = _splitAudioHls ? _splitAudioHls.liveSyncPosition : null;
-                    if (aSync != null) {
-                        audio.currentTime = aSync;
-                        console.log('[split-hls] audio seeking to liveSyncPosition ' + aSync.toFixed(2));
-                    }
-                    if (vSync != null && video) {
-                        video.currentTime = vSync;
-                        console.log('[split-hls] video seeking to liveSyncPosition ' + vSync.toFixed(2));
-                    }
-                    audio.play().catch(function (e) { console.warn('[split-hls] audio play() rejected:', e); });
-                    if (video && !audioOnly) video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
+                if (aSync != null) {
+                    audio.currentTime = aSync;
+                    console.log('[split-hls] audio seeking to liveSyncPosition ' + aSync.toFixed(2));
                 }
+                if (vSync != null) {
+                    video.currentTime = vSync;
+                    console.log('[split-hls] video seeking to liveSyncPosition ' + vSync.toFixed(2));
+                }
+                audio.play().catch(function (e) { console.warn('[split-hls] audio play() rejected:', e); });
+                if (video && !audioOnly) video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
             }
 
-            // Audio player: WASM pipeline (libflac.js + AudioWorklet) primary — no MSE SourceBuffer,
-            // eliminates bufferFullError on CC v2. Falls back to hls.js if libflac.js is unavailable.
-            if (window._wasmAudioStart) {
-                window._wasmAudioStart(baseUrl, cfg, function (w) {
-                    if (!w) { _startHlsAudioFallback(); return; }
-                    _audioReady = true;
-                    _trySplitStart();
-                });
-            } else {
-                _startHlsAudioFallback();
-            }
-
-            function _startHlsAudioFallback() {
-                var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
-                var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
-                var audioCfg = Object.assign({}, commonCfg, {
-                    maxBufferLength: 15,
-                    backBufferLength: 0,
-                    maxLiveSyncPlaybackRate: 1.0,
-                });
-                if (hlsCodec) audioCfg.audioPreference = { audioCodec: hlsCodec };
-                _splitAudioHls = new Hls(audioCfg);
-                _splitAudioHls.loadSource(audioUrl);
-                _splitAudioHls.attachMedia(audio);
-                _splitAudioHls.on(Hls.Events.MANIFEST_PARSED, function () {
-                    console.log('[split-hls] audio manifest parsed (hls.js fallback)');
-                    audio.muted = false;
-                    audio.volume = 1;
-                });
-                _splitAudioHls.on(Hls.Events.LEVEL_LOADED, function () {
-                    if (!_audioReady) {
-                        var pos = _splitAudioHls.liveSyncPosition;
-                        console.log('[split-hls] audio level loaded, liveSyncPosition=' + (pos ?? 'null'));
-                        if (pos != null && pos > 0) { _audioReady = true; _trySplitStart(); }
+            // Audio player (master clock, unmuted)
+            // Map the server's codec setting to the hls.js audioPreference fourcc.
+            var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
+            var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
+            // Audio uses the same liveSyncDurationCount as video so both players target
+            // the same position in the HLS timeline on startup. Diverging values cause
+            // _audioReady to fire much later than _videoReady (blocking playback) and
+            // seeking each player to a different PTS at _trySplitStart (A/V desync).
+            // maxBufferLength is kept at 15s to balance two opposing failure modes on CC v2:
+            //   - Too large (>=30s): MSE bufferFullError — SourceBuffer fills, hls.js stalls
+            //     appending, and the player starves.
+            //   - Too small (<=10s): buffer underrun — with liveSyncDurationCount=3 (6s target)
+            //     only 4s of forward buffer remains, which a CC v2 GC pause easily drains.
+            // 15s gives 9s of forward headroom (15 - 6) = ~4 segments of jitter tolerance.
+            var audioCfg = Object.assign({}, commonCfg, {
+                maxBufferLength: 15,
+                backBufferLength: 0,
+                maxLiveSyncPlaybackRate: 1.0,
+            });
+            if (hlsCodec) audioCfg.audioPreference = { audioCodec: hlsCodec };
+            _splitAudioHls = new Hls(audioCfg);
+            _splitAudioHls.loadSource(audioUrl);
+            _splitAudioHls.attachMedia(audio);
+            _splitAudioHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[split-hls] audio manifest parsed');
+                audio.muted = false;
+                audio.volume = 1;
+            });
+            _splitAudioHls.on(Hls.Events.LEVEL_LOADED, function () {
+                if (!_audioReady) {
+                    var pos = _splitAudioHls.liveSyncPosition;
+                    console.log('[split-hls] audio level loaded, liveSyncPosition=' + (pos ?? 'null'));
+                    if (pos != null && pos > 0) {
+                        _audioReady = true;
+                        _trySplitStart();
                     }
-                });
-                _splitAudioHls.on(Hls.Events.ERROR, function (event, data) {
-                    if (!data.fatal) { console.warn('[split-hls] audio non-fatal:', data.type, data.details); return; }
-                    console.error('[split-hls] audio fatal:', data.type, data.details);
-                    if (data.type === Hls.ErrorTypes.MEDIA_ERROR && audioMediaErrors++ < 2) {
-                        _splitAudioHls.recoverMediaError(); _splitAudioHls.startLoad(-1);
-                    } else { _hlsReset(video); setTimeout(function () { startSplitHlsBg(baseUrl); }, 3000); }
-                });
-            }
+                }
+            });
+            _splitAudioHls.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[split-hls] audio non-fatal:', data.type, data.details); return; }
+                console.error('[split-hls] audio fatal:', data.type, data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && audioMediaErrors++ < 2) {
+                    _splitAudioHls.recoverMediaError();
+                    _splitAudioHls.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startSplitHlsBg(baseUrl); }, 3000);
+                }
+            });
 
             // Video player (muted, playbackRate-steered to chase audio)
             if (!audioOnly) {
@@ -806,44 +792,25 @@
             var _seekCooldownUntil = 0; // suppress steering until this timestamp after a hard-seek
             _splitSyncTimer = setInterval(function () {
                 if (audioOnly) return;  // no sync needed in audio-only mode
-                if (!_splitVideoHls) return;
-                var _isWasm = !!(window._wasmAudio && window._wasmAudio.ready);
-                if (!_isWasm && !_splitAudioHls) return;
-
-                var _audioPaused = _isWasm
-                    ? (window._wasmAudio.audioCtx.state === 'suspended')
-                    : audio.paused;
-                if (_audioPaused || video.paused) return;
-
+                if (!_splitAudioHls || !_splitVideoHls) return;
+                if (audio.paused || video.paused) return;
+                                
                 var now = Date.now();
                 if (now < _seekCooldownUntil) return;
 
+                // Use liveSyncPosition as each player's target playback point.
+                // The delta between audio and video liveSyncPosition tells us how far
+                // apart the two streams are in wall-clock time.
+                var audioSync = _splitAudioHls.liveSyncPosition;
                 var videoSync = _splitVideoHls.liveSyncPosition;
-                if (videoSync == null) return;
+                if (audioSync == null || videoSync == null) return;
+
+                // How far behind its live-sync target each player is.
+                // drift > 0: video has more buffer to consume (further behind live) → speed up
+                // drift < 0: video has less buffer (closer to live than audio) → slow down
+                var audioBuf = audioSync - audio.currentTime;
                 var videoBuf = videoSync - video.currentTime;
-
-                // Compute drift. In WASM mode drift = audioElapsed - videoElapsed (positive = audio
-                // ahead = speed up video). In hls.js mode drift = videoBuf - audioBuf (positive =
-                // video further behind live = speed up video). Both: drift > 0 → speed up video.
-                var audioSync, audioBuf, drift;
-                if (_isWasm) {
-                    var _wd = window._wasmAudio;
-                    var _audioElapsed = _wd.audioCtx.currentTime - _wd.startAudioCtxTime;
-                    var _videoElapsed = video.currentTime - _wd.startVideoTime;
-                    drift     = _audioElapsed - _videoElapsed;
-                    audioBuf  = videoBuf - drift;
-                    audioSync = videoSync + drift;
-                } else {
-                    audioSync = _splitAudioHls.liveSyncPosition;
-                    if (audioSync == null) return;
-                    audioBuf  = audioSync - audio.currentTime;
-                    drift     = videoBuf - audioBuf;
-                }
-
-                // Convenience locals for telemetry — abstract over hls.js vs WASM.
-                var _audioCurrentTime = _isWasm ? window._wasmAudio.audioCtx.currentTime : audio.currentTime;
-                var _audioBufferedEnd = _isWasm ? 0 : (audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0);
-                var _audioLevelCount  = _isWasm ? 0 : (_splitAudioHls && _splitAudioHls.levels ? _splitAudioHls.levels.length : 0);
+                var drift = videoBuf - audioBuf;
 
                 // Anomaly guard: liveSyncPosition can spike when HLS.js parses a new
                 // manifest (sequence number reset, etc.). Ignore implausible readings.
@@ -867,15 +834,15 @@
                         driftMs: Math.round(drift * 1000),
                         rate: 1.0,
                         hardSeek: true,
-                        audioCurrentTime: _audioCurrentTime,
+                        audioCurrentTime: audio.currentTime,
                         videoCurrentTime: video.currentTime,
                         audioLiveSync: audioSync,
                         videoLiveSync: videoSync,
                         audioBuf: audioBuf,
                         videoBuf: videoBuf,
-                        audioBufferedEnd: _audioBufferedEnd,
+                        audioBufferedEnd: audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0,
                         videoBufferedEnd: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
-                        audioLevels: _audioLevelCount,
+                        audioLevels: _splitAudioHls.levels ? _splitAudioHls.levels.length : 0,
                         videoLevels: _splitVideoHls.levels ? _splitVideoHls.levels.length : 0
                     });
                     return;
@@ -917,15 +884,15 @@
                 _postSplitTelemetry({
                     driftMs: Math.round(drift * 1000),
                     rate: rate,
-                    audioCurrentTime: _audioCurrentTime,
+                    audioCurrentTime: audio.currentTime,
                     videoCurrentTime: video.currentTime,
                     audioLiveSync: audioSync,
                     videoLiveSync: videoSync,
                     audioBuf: audioBuf,
                     videoBuf: videoBuf,
-                    audioBufferedEnd: _audioBufferedEnd,
+                    audioBufferedEnd: audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0,
                     videoBufferedEnd: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
-                    audioLevels: _audioLevelCount,
+                    audioLevels: _splitAudioHls.levels ? _splitAudioHls.levels.length : 0,
                     videoLevels: _splitVideoHls.levels ? _splitVideoHls.levels.length : 0
                 });
             }, 500);
@@ -1113,786 +1080,225 @@
                 _hlsStarted = false;
             }
         }
-    </script>
 
-    <script>
-    // WASM FLAC audio pipeline for fmp4_split mode.
-    // Replaces hls.js + MSE SourceBuffer audio with:
-    //   Web Worker: HLS manifest poll → fetch fMP4 segment → MP4 demux → libflac.js WASM decode
-    //   Main thread: receive Float32 PCM via postMessage → relay to AudioWorklet ring buffer
-    // Running fetch + decode in a Worker means zero main-thread CPU from FLAC work.
-    // This removes the MSE SourceBuffer from the audio path entirely, eliminating
-    // bufferFullError glitches on CC v2 under FLAC.
-    (function () {
+        // PCM stream mode (pcm_stream)
+        // Audio fetching and frame parsing run entirely in a Web Worker (pcm-fetch-worker.js)
+        // so that video compositor activity on the Chromecast cannot delay PCM delivery.
+        // The Worker posts decoded Float32 chunks; the main thread relays them to the AudioWorklet
+        // and handles pre-roll counting. Video is served by the split-HLS video pipeline.
 
-        // AudioWorklet processor — embedded as a blob URL; no extra file needed.
-        var _WORKLET_SRC = [
-            'class FlacWorkletProcessor extends AudioWorkletProcessor {',
-            '    constructor() {',
-            '        super();',
-            '        this._qL = []; this._qR = [];',
-            '        this._curL = null; this._curR = null; this._curOff = 0;',
-            '        this.port.onmessage = function(e) {',
-            '            if (e.data.type === "pcm") {',
-            '                this._qL.push(e.data.left);',
-            '                this._qR.push(e.data.right);',
-            '            }',
-            '        }.bind(this);',
-            '    }',
-            '    process(inputs, outputs) {',
-            '        var outL = outputs[0][0], outR = outputs[0][1] || outputs[0][0];',
-            '        var needed = outL.length, filled = 0;',
-            '        while (filled < needed) {',
-            '            if (!this._curL) {',
-            '                if (!this._qL.length) break;',
-            '                this._curL = this._qL.shift();',
-            '                this._curR = this._qR.shift();',
-            '                this._curOff = 0;',
-            '            }',
-            '            var take = Math.min(this._curL.length - this._curOff, needed - filled);',
-            '            outL.set(this._curL.subarray(this._curOff, this._curOff + take), filled);',
-            '            outR.set(this._curR.subarray(this._curOff, this._curOff + take), filled);',
-            '            filled += take; this._curOff += take;',
-            '            if (this._curOff >= this._curL.length) { this._curL = null; this._curR = null; }',
-            '        }',
-            '        if (filled < needed)',
-            '            this.port.postMessage({ type: "underrun", missing: needed - filled });',
-            '        if ((currentFrame & 8191) === 0)',
-            '            this.port.postMessage({ type: "clock", frame: currentFrame });',
-            '        return true;',
-            '    }',
-            '}',
-            'registerProcessor("flac-worklet-processor", FlacWorkletProcessor);',
-        ].join('\n');
+        const PCM_SAMPLE_RATE = 48000;
+        const PCM_PREROLL_SAMPLES = 96000; // 2 s pre-roll
+        var _pcmPrerollGate = false;
 
-        var _workletBlobUrl = null;
-        function _getWorkletUrl() {
-            if (!_workletBlobUrl)
-                _workletBlobUrl = URL.createObjectURL(new Blob([_WORKLET_SRC], { type: 'application/javascript' }));
-            return _workletBlobUrl;
+        function _pcmStop() {
+            if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
+            if (_pcmWorker) {
+                try { _pcmWorker.postMessage({ type: 'stop' }); } catch (e) {}
+                try { _pcmWorker.terminate(); } catch (e) {}
+                _pcmWorker = null;
+            }
+            if (_pcmWorkletNode) {
+                try { _pcmWorkletNode.port.postMessage({ type: 'reset' }); } catch (e) {}
+                try { _pcmWorkletNode.disconnect(); } catch (e) {}
+                _pcmWorkletNode = null;
+            }
+            if (_pcmAudioCtx) {
+                try { _pcmAudioCtx.close(); } catch (e) {}
+                _pcmAudioCtx = null;
+            }
+            _pcmPrerollSamples = 0;
+            _pcmPrerollGate = false;
+            _pcmStarted = false;
+            console.log('[pcm-stream] stopped');
         }
 
-        // Web Worker source — runs the entire fetch/demux/decode pipeline off the main thread.
-        // importScripts loads libflac.js from the same CDN URL as the page.
-        // Posted messages to the worker:
-        //   { type: 'start', audioUrl, segBase, libflacUrl, liveSyncCount }
-        //   { type: 'stop' }
-        // Messages from the worker:
-        //   { type: 'sampleRate', value }       — after init segment parsed
-        //   { type: 'pcm', left, right }         — transferable Float32Arrays per decoded frame
-        //   { type: 'ready' }                    — first media segment decoded, pipeline hot
-        //   { type: 'log', level, msg }          — console relay
-        //   { type: 'error', msg }               — fatal error, should fall back to hls.js
-        var _WORKER_SRC = [
-            '"use strict";',
-            'var _stopped = false, _decoder = 0, _lastSeq = -1, _initFetched = false;',
-            'var _liveSyncCount = 3, _audioUrl = "", _segBase = "";',
-            'var _inputBuf = null, _inputPos = 0, _pcmOut = [];',
-            'var _signalledReady = false;',
-            'var _fetchQueue = [], _fetching = false;',
-            'var _pollTimer = null;',
-            '',
-            'function _log(level, msg) { self.postMessage({ type: "log", level: level, msg: msg }); }',
-            '',
-            'function _findBoxes(buffer, type) {',
-            '    var view = new DataView(buffer), results = [], offset = 0;',
-            '    while (offset + 8 <= buffer.byteLength) {',
-            '        var sz = view.getUint32(offset, false);',
-            '        if (sz < 8 || offset + sz > buffer.byteLength) break;',
-            '        var t = String.fromCharCode(view.getUint8(offset+4), view.getUint8(offset+5),',
-            '                                    view.getUint8(offset+6), view.getUint8(offset+7));',
-            '        if (t === type) results.push({ start: offset + 8, size: sz - 8 });',
-            '        offset += sz;',
-            '    }',
-            '    return results;',
-            '}',
-            '',
-            'function _extractMdat(buffer) {',
-            '    var boxes = _findBoxes(buffer, "mdat");',
-            '    if (!boxes.length) return null;',
-            '    var total = 0;',
-            '    for (var i = 0; i < boxes.length; i++) total += boxes[i].size;',
-            '    var out = new Uint8Array(total), pos = 0;',
-            '    for (var i = 0; i < boxes.length; i++) {',
-            '        out.set(new Uint8Array(buffer, boxes[i].start, boxes[i].size), pos);',
-            '        pos += boxes[i].size;',
-            '    }',
-            '    return out;',
-            '}',
-            '',
-            'function _extractDfLa(initBuffer) {',
-            '    var view = new DataView(initBuffer);',
-            '    for (var i = 0; i + 12 <= initBuffer.byteLength; i++) {',
-            '        if (view.getUint8(i+4) === 0x64 && view.getUint8(i+5) === 0x66 &&',
-            '            view.getUint8(i+6) === 0x4C && view.getUint8(i+7) === 0x61) {',
-            '            var sz = view.getUint32(i, false);',
-            '            if (sz < 12 || i + sz > initBuffer.byteLength) continue;',
-            '            return new Uint8Array(initBuffer, i + 12, sz - 12);',
-            '        }',
-            '    }',
-            '    return null;',
-            '}',
-            '',
-            'function _dfLaSampleRate(b) {',
-            '    if (b.length < 17) return 44100;',
-            '    return (b[14] << 12) | (b[15] << 4) | (b[16] >> 4);',
-            '}',
-            '',
-            'function _buildFlacHeader(dfLa) {',
-            '    var buf = new Uint8Array(4 + dfLa.length);',
-            '    buf[0]=0x66; buf[1]=0x4C; buf[2]=0x61; buf[3]=0x43;',
-            '    buf.set(dfLa, 4);',
-            '    buf[4] |= 0x80;',
-            '    return buf;',
-            '}',
-            '',
-            'function _parseM3u8(text) {',
-            '    var lines = text.split("\\n"), seqBase = 0, targetDuration = 2;',
-            '    var initUrl = null, segments = [];',
-            '    for (var i = 0; i < lines.length; i++) {',
-            '        var ln = lines[i].trim();',
-            '        if (!ln) continue;',
-            '        if (ln.startsWith("#EXT-X-MEDIA-SEQUENCE:")) seqBase = parseInt(ln.split(":")[1], 10);',
-            '        else if (ln.startsWith("#EXT-X-TARGETDURATION:")) targetDuration = parseFloat(ln.split(":")[1]);',
-            '        else if (ln.startsWith("#EXT-X-MAP:")) { var m = ln.match(/URI="([^"]+)"/); if (m) initUrl = _segBase + m[1]; }',
-            '        else if (!ln.startsWith("#")) segments.push({ seq: seqBase + segments.length, url: _segBase + ln });',
-            '    }',
-            '    return { targetDuration: targetDuration, initUrl: initUrl, segments: segments };',
-            '}',
-            '',
-            'function _readCb(nbytes, bufPtr, bwPtr) {',
-            '    if (!_inputBuf) return 1;',
-            '    var avail = _inputBuf.length - _inputPos;',
-            '    if (avail <= 0) return 1;',
-            '    var n = Math.min(nbytes, avail);',
-            '    Flac.HEAPU8.set(_inputBuf.subarray(_inputPos, _inputPos + n), bufPtr);',
-            '    new Int32Array(Flac.HEAPU8.buffer, bwPtr, 1)[0] = n;',
-            '    _inputPos += n;',
-            '    return 0;',
-            '}',
-            '',
-            'function _writeCb(frame, buffer) {',
-            '    if (!buffer || !buffer.length) return;',
-            '    var bps   = frame.header.bits_per_sample || 16;',
-            '    var scale = 1.0 / (1 << (bps - 1));',
-            '    var n  = buffer[0].length;',
-            '    var L  = new Float32Array(n), R = new Float32Array(n);',
-            '    var s0 = buffer[0], s1 = buffer.length > 1 ? buffer[1] : buffer[0];',
-            '    for (var i = 0; i < n; i++) { L[i] = s0[i] * scale; R[i] = s1[i] * scale; }',
-            '    _pcmOut.push({ L: L, R: R });',
-            '}',
-            '',
-            'function _errCb(code, msg) { _log("error", "[wasm-worker] FLAC decode error " + code + " " + msg); }',
-            '',
-            'function _decode(bytes) {',
-            '    _inputBuf = bytes; _inputPos = 0; _pcmOut = [];',
-            '    while (_inputPos < _inputBuf.length && Flac.FLAC__stream_decoder_process_single(_decoder)) {}',
-            '    _inputBuf = null;',
-            '    return _pcmOut.splice(0);',
-            '}',
-            '',
-            'function _drainQueue() {',
-            '    if (_fetching || !_fetchQueue.length || _stopped) return;',
-            '    var item = _fetchQueue.shift();',
-            '    _fetching = true;',
-            '    fetch(item.url).then(function(r) { return r.arrayBuffer(); })',
-            '        .then(function(buf) {',
-            '            if (_stopped) return;',
-            '            item.isInit ? _onInit(buf) : _onMedia(buf);',
-            '            _fetching = false; _drainQueue();',
-            '        })',
-            '        .catch(function(e) {',
-            '            _log("warn", "[wasm-worker] fetch failed: " + item.url + " " + e);',
-            '            _fetching = false; _drainQueue();',
-            '        });',
-            '}',
-            'function _enqueue(url, isInit) { _fetchQueue.push({ url: url, isInit: !!isInit }); _drainQueue(); }',
-            '',
-            'function _onInit(buf) {',
-            '    var dfLa = _extractDfLa(buf);',
-            '    if (!dfLa) { self.postMessage({ type: "error", msg: "dfLa box not found in init segment" }); return; }',
-            '    var sr = _dfLaSampleRate(dfLa);',
-            '    _log("log", "[wasm-worker] init segment: sampleRate=" + sr);',
-            '    self.postMessage({ type: "sampleRate", value: sr });',
-            '    _decode(_buildFlacHeader(dfLa));',
-            '}',
-            '',
-            'function _onMedia(buf) {',
-            '    var mdat = _extractMdat(buf);',
-            '    if (!mdat || !mdat.length) { _log("warn", "[wasm-worker] empty mdat in segment"); return; }',
-            '    var chunks = _decode(mdat);',
-            '    for (var i = 0; i < chunks.length; i++)',
-            '        self.postMessage({ type: "pcm", left: chunks[i].L, right: chunks[i].R },',
-            '                         [chunks[i].L.buffer, chunks[i].R.buffer]);',
-            '    if (!_signalledReady && chunks.length) {',
-            '        _signalledReady = true;',
-            '        self.postMessage({ type: "ready" });',
-            '    }',
-            '}',
-            '',
-            'function _pollManifest() {',
-            '    if (_stopped) return;',
-            '    fetch(_audioUrl)',
-            '        .then(function(r) { return r.text(); })',
-            '        .then(function(text) {',
-            '            if (_stopped) return;',
-            '            var m = _parseM3u8(text);',
-            '            if (!_initFetched && m.initUrl) { _initFetched = true; _enqueue(m.initUrl, true); }',
-            '            if (_lastSeq < 0 && m.segments.length > 0) {',
-            '                var si = Math.max(0, m.segments.length - _liveSyncCount);',
-            '                if (si > 0) _lastSeq = m.segments[si - 1].seq;',
-            '            }',
-            '            for (var i = 0; i < m.segments.length; i++) {',
-            '                if (m.segments[i].seq > _lastSeq) {',
-            '                    _lastSeq = m.segments[i].seq;',
-            '                    _enqueue(m.segments[i].url, false);',
-            '                }',
-            '            }',
-            // Poll at 40% of segment duration (was 50%) — discover segments ~0.4 segments after they land.
-            '            _pollTimer = setTimeout(_pollManifest, Math.max(200, m.targetDuration * 400));',
-            '        })',
-            '        .catch(function(e) {',
-            '            if (_stopped) return;',
-            '            _pollTimer = setTimeout(_pollManifest, 2000);',
-            '        });',
-            '}',
-            '',
-            'self.onmessage = function(e) {',
-            '    if (e.data.type === "start") {',
-            '        _audioUrl = e.data.audioUrl; _segBase = e.data.segBase;',
-            '        _liveSyncCount = e.data.liveSyncCount || 3;',
-            '        importScripts(e.data.libflacUrl);',
-            '        function _go() {',
-            '            _decoder = Flac.create_libflac_decoder(false);',
-            '            if (!_decoder) { self.postMessage({ type: "error", msg: "create_libflac_decoder failed" }); return; }',
-            '            var st = Flac.init_decoder_stream(_decoder, _readCb, _writeCb, _errCb, null, false);',
-            '            if (st !== 0) { self.postMessage({ type: "error", msg: "FLAC decoder init failed status=" + st }); return; }',
-            '            _pollManifest();',
-            '        }',
-            '        if (Flac.isReady()) { _go(); }',
-            '        else { var _prev = Flac.onready; Flac.onready = function() { if (_prev) _prev(); _go(); }; }',
-            '    } else if (e.data.type === "stop") {',
-            '        _stopped = true;',
-            '        if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }',
-            '        if (_decoder) {',
-            '            try { Flac.FLAC__stream_decoder_finish(_decoder); } catch(e) {}',
-            '            try { Flac.FLAC__stream_decoder_delete(_decoder); } catch(e) {}',
-            '            _decoder = 0;',
-            '        }',
-            '    }',
-            '};',
-        ].join('\n');
+        function startPcmStream(baseUrl) {
+            if (_pcmStarted) return;
+            _pcmStarted = true;
 
-        var _workerBlobUrl = null;
-        function _getWorkerUrl() {
-            if (!_workerBlobUrl)
-                _workerBlobUrl = URL.createObjectURL(new Blob([_WORKER_SRC], { type: 'application/javascript' }));
-            return _workerBlobUrl;
-        }
+            // Video is still the split HLS video stream.
+            // Mute CAF so only our AudioWorklet produces sound.
+            var caf = document.getElementById('receiverVideoElement');
+            if (caf) caf.muted = true;
 
-        // Pipeline globals — set by _wasmAudioStart, cleared by _wasmAudioStop.
-        window._wasmAudio = null;
-
-        window._wasmAudioStop = function () {
-            var w = window._wasmAudio;
-            if (!w) return;
-            window._wasmAudio = null;
-            w.stopped = true;
-            if (w.worker) { try { w.worker.postMessage({ type: 'stop' }); w.worker.terminate(); } catch (e) {} w.worker = null; }
-            if (w.workletNode) { try { w.workletNode.disconnect(); } catch (e) {} w.workletNode = null; }
-            if (w.gainNode)    { try { w.gainNode.disconnect();    } catch (e) {} w.gainNode    = null; }
-            if (w.audioCtx)    { try { w.audioCtx.close();         } catch (e) {} w.audioCtx    = null; }
-            console.log('[wasm-audio] pipeline stopped');
-        };
-
-        window._wasmAudioStart = function (baseUrl, cfg, onReady) {
-            if (typeof Worker === 'undefined') {
-                console.warn('[wasm-audio] Web Worker not available — falling back to hls.js');
-                if (typeof onReady === 'function') onReady(null);
-                return;
-            }
-            _initWasmPipeline(baseUrl, cfg, onReady);
-        };
-
-        function _initWasmPipeline(baseUrl, cfg, onReady) {
-            if (window._wasmAudio) window._wasmAudioStop();
-
-            var liveSyncCount = (cfg && cfg.hlsLiveSyncSegments > 0) ? cfg.hlsLiveSyncSegments : 3;
-            var audioUrl = baseUrl + 'cast/split_audio/stream.m3u8';
-            var segBase  = baseUrl + 'cast/split_audio/';
-            // CDN URL used by the page — the Worker uses importScripts() to load the same build.
-            var libflacUrl = 'https://cdn.jsdelivr.net/npm/libflacjs@5.4.0/dist/libflac.min.js';
-
-            var w = {
-                stopped: false, worker: null, audioCtx: null, gainNode: null, workletNode: null,
-                sampleRate: 44100, ready: false,
-                startAudioCtxTime: 0,
-                startVideoTime: 0,
-                lastWorkletFrame: 0,
-            };
-            window._wasmAudio = w;
-
-            // PCM delivered before the AudioWorklet finishes addModule().
-            var _pendingPcm = [], _workletReady = false;
-
-            function _sendToWorklet(msg) {
-                w.workletNode.port.postMessage(msg, [msg.left.buffer, msg.right.buffer]);
-            }
-
-            function _onPcm(msg) {
-                if (!_workletReady) {
-                    _pendingPcm.push(msg);
-                    if (_pendingPcm.length > 128) _pendingPcm.shift(); // cap at ~3 s
-                    return;
-                }
-                _sendToWorklet(msg);
-            }
-
-            function _createAudioContext(sampleRate) {
-                try {
-                    w.audioCtx = new AudioContext({ latencyHint: 'playback', sampleRate: sampleRate });
-                } catch (e) {
-                    console.error('[wasm-audio] AudioContext creation failed:', e);
-                    if (typeof onReady === 'function') onReady(null);
-                    return;
-                }
-                w.audioCtx.audioWorklet.addModule(_getWorkletUrl())
-                    .then(function () {
-                        w.workletNode = new AudioWorkletNode(w.audioCtx, 'flac-worklet-processor', {
-                            numberOfOutputs: 1, outputChannelCount: [2],
+            // Start the video HLS side using the same split-video endpoint.
+            if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+                fetch(baseUrl + 'api/settings')
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .catch(function () { return null; })
+                    .then(function (cfg) {
+                        var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)  ? cfg.hlsLiveSyncSegments  : 3;
+                        var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
+                        var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)  ? cfg.hlsMaxBufferSeconds  : 12;
+                        var video = document.getElementById('hls-bg');
+                        if (!video) return;
+                        _splitVideoHls = new Hls({
+                            lowLatencyMode: false,
+                            liveSyncDurationCount: liveSyncDurationCount,
+                            liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
+                            maxBufferLength: maxBufferLength,
+                            backBufferLength: 0,
+                            manifestLoadingMaxRetry: 12,
+                            manifestLoadingRetryDelay: 1000,
+                            manifestLoadingMaxRetryTimeout: 12000,
                         });
-                        w.workletNode.port.onmessage = function (e) {
-                            if (e.data.type === 'underrun')
-                                console.warn('[wasm-audio] worklet underrun:', e.data.missing, 'frames');
-                            else if (e.data.type === 'clock')
-                                w.lastWorkletFrame = e.data.frame;
-                        };
-                        w.gainNode = w.audioCtx.createGain();
-                        w.gainNode.gain.value = 1.0;
-                        w.workletNode.connect(w.gainNode);
-                        w.gainNode.connect(w.audioCtx.destination);
-                        _workletReady = true;
-                        var flushed = _pendingPcm.splice(0);
-                        for (var i = 0; i < flushed.length; i++) _sendToWorklet(flushed[i]);
-                        if (flushed.length)
-                            console.log('[wasm-audio] worklet ready — flushed ' + flushed.length + ' pending PCM chunks');
-                        else
-                            console.log('[wasm-audio] AudioWorklet ready, sampleRate=' + w.audioCtx.sampleRate);
-                        // If the worker already signalled ready before the worklet was up, signal now.
-                        if (!w.ready && flushed.length) { w.ready = true; if (typeof onReady === 'function') onReady(w); }
-                    })
-                    .catch(function (e) {
-                        console.error('[wasm-audio] AudioWorklet addModule failed:', e);
-                        if (typeof onReady === 'function') onReady(null);
+                        _splitVideoHls.loadSource(baseUrl + 'cast/split_video/stream.m3u8');
+                        _splitVideoHls.attachMedia(video);
+                        _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                            video.muted = true;
+                            video.style.display = 'block';
+                            var pos = _splitVideoHls.liveSyncPosition;
+                            if (pos != null) { video.currentTime = pos; }
+                            video.play().catch(function (e) { console.warn('[pcm-stream] video play() rejected:', e); });
+                        });
+                        _splitVideoHls.on(Hls.Events.ERROR, function (evt, data) {
+                            if (!data.fatal) return;
+                            console.error('[pcm-stream] video fatal HLS error:', data.type, data.details);
+                            // Non-fatal for audio; just log — don't restart audio
+                        });
                     });
             }
 
-            w.worker = new Worker(_getWorkerUrl());
-            w.worker.onmessage = function (e) {
-                if (w.stopped) return;
-                var d = e.data;
-                if (d.type === 'sampleRate') {
-                    w.sampleRate = d.value;
-                    _createAudioContext(d.value);
-                } else if (d.type === 'pcm') {
-                    _onPcm({ type: 'pcm', left: d.left, right: d.right });
-                } else if (d.type === 'ready') {
-                    if (!w.ready && _workletReady) {
-                        w.ready = true;
-                        console.log('[wasm-audio] pipeline ready — signalling host');
-                        if (typeof onReady === 'function') onReady(w);
+            // AudioWorklet setup — load the worklet module then connect
+            var AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) {
+                console.error('[pcm-stream] AudioContext not available — cannot play PCM stream');
+                return;
+            }
+            _pcmAudioCtx = new AudioContext({ sampleRate: PCM_SAMPLE_RATE });
+
+            _pcmAudioCtx.audioWorklet.addModule('pcm-worklet.js')
+                .then(function () {
+                    _pcmWorkletNode = new AudioWorkletNode(_pcmAudioCtx, 'pcm-sink', {
+                        numberOfInputs: 0,
+                        numberOfOutputs: 1,
+                        outputChannelCount: [2],
+                    });
+                    _pcmWorkletNode.connect(_pcmAudioCtx.destination);
+
+                    // Listen for clock messages from the worklet
+                    _pcmWorkletNode.port.onmessage = function (e) {
+                        var msg = e.data;
+                        if (msg.type === 'clock') {
+                            _pcmLastFrameAudioTimeMs = msg.audioTimeMs;
+                            _pcmSamplesPlayedAtFrame = msg.samplesPlayedAtFrame;
+                            _pcmSamplesPlayed = msg.samplesPlayed;
+                            if (msg.ringFill !== undefined) {
+                                var fillMs = (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                var capMs  = (msg.ringCapacity / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                document.title = 'PCM ring: ' + fillMs + ' / ' + capMs + ' ms';
+                            }
+                        } else if (msg.type === 'underrun') {
+                            var fillMs = msg.ringFill !== undefined ? (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0) : '?';
+                            console.warn('[pcm-stream] AudioWorklet underrun — re-buffering (ring was ' + fillMs + ' ms)');
+                            // Re-arm pre-roll: worker keeps fetching, pre-roll counts up again
+                            _pcmPrerollSamples = 0;
+                            _pcmPrerollGate = false;
+                        }
+                    };
+
+                    console.log('[pcm-stream] AudioWorklet ready — starting PCM Worker');
+                    if (_pcmAudioCtx.state === 'suspended') _pcmAudioCtx.resume().catch(function () {});
+
+                    // Start the fetch Worker — completely off the main thread
+                    _pcmWorker = new Worker('pcm-fetch-worker.js');
+                    _pcmWorker.onmessage = function (e) {
+                        var msg = e.data;
+                        if (msg.type === 'pcm') {
+                            // Relay to worklet (main thread just bounces the message)
+                            if (_pcmWorkletNode) {
+                                _pcmWorkletNode.port.postMessage(msg, [msg.left.buffer, msg.right.buffer]);
+                            }
+                            // Pre-roll counting
+                            _pcmPrerollSamples += msg.left.length;
+                            if (!_pcmPrerollGate && _pcmPrerollSamples >= PCM_PREROLL_SAMPLES) {
+                                _pcmPrerollGate = true;
+                                if (_pcmWorkletNode) {
+                                    _pcmWorkletNode.port.postMessage({ type: 'start' });
+                                    console.log('[pcm-stream] pre-roll complete (' + _pcmPrerollSamples + ' samples) — worklet started');
+                                    _pcmStartVideoSync();
+                                }
+                            }
+                        } else if (msg.type === 'syncLost') {
+                            console.warn('[pcm-stream] frame sync lost in worker');
+                        } else if (msg.type === 'ended') {
+                            console.log('[pcm-stream] stream ended — worker reconnecting');
+                        } else if (msg.type === 'error') {
+                            console.error('[pcm-stream] /cast/pcmlive returned', msg.status);
+                        } else if (msg.type === 'fetchError') {
+                            console.warn('[pcm-stream] worker fetch error:', msg.message);
+                        }
+                    };
+                    _pcmWorker.postMessage({ type: 'start', url: baseUrl + 'cast/pcmlive' });
+                    // Sync timer starts after pre-roll completes (see Worker onmessage above)
+                })
+                .catch(function (err) {
+                    console.error('[pcm-stream] addModule failed:', err);
+                    _pcmStop();
+                });
+        }
+
+        // Frame parser state (across fetch chunks)
+        var _pcmPrerollGate = false; // declaration kept for reference; defined above
+
+        // A/V sync: every 500 ms steer video.playbackRate to keep video near its live-sync
+        // target. Both audio (PCM ring) and video (HLS) are live streams; we simply maintain
+        // the video buffer level at ~1 s behind liveSyncPosition with very gentle rate steering.
+        //
+        // Gains are conservative: CC v2 GC pauses cause ≥100 ms timer jitter so aggressive
+        // corrections overshoot and oscillate. Hard-seeks are disabled — they stall the HLS
+        // pipeline and cause large audio gaps.
+        //
+        // The timer does not start until pre-roll completes, and an 8 s startup grace period
+        // further avoids reacting to HLS initial-latch transients.
+        function _pcmStartVideoSync() {
+            if (_pcmSyncTimer) clearInterval(_pcmSyncTimer);
+            var _lastLoggedRate = 1.0;
+            var _graceUntil = Date.now() + 8000; // ignore first 8 s after pre-roll
+
+            _pcmSyncTimer = setInterval(function () {
+                if (!_splitVideoHls || !_pcmWorkletNode) return;
+                var video = document.getElementById('hls-bg');
+                if (!video || video.paused) return;
+
+                var now = Date.now();
+                if (now < _graceUntil) return;
+
+                var videoSync = _splitVideoHls.liveSyncPosition;
+                if (videoSync == null) return;
+
+                // drift = how far video currentTime is from the target position.
+                // Target: 1 s behind liveSyncPosition (stable buffer, not too close to live edge).
+                var targetBuf = 1.0;
+                var videoBuf  = videoSync - video.currentTime;
+                var drift     = videoBuf - targetBuf;
+
+                // Discard obvious glitches (liveSyncPosition can jump on segment boundary).
+                if (Math.abs(drift) > 8.0) {
+                    console.warn('[pcm-stream] sync: ignoring anomalous drift=' + (drift * 1000).toFixed(0) + 'ms');
+                    return;
+                }
+
+                // Dead zone — no correction needed.
+                if (Math.abs(drift) < 0.40) {
+                    if (video.playbackRate !== 1.0) {
+                        video.playbackRate = 1.0;
+                        console.log('[pcm-stream] sync: back in dead zone \u2014 rate=1.0');
                     }
-                } else if (d.type === 'error') {
-                    console.error('[wasm-audio] worker error:', d.msg);
-                    if (!w.ready) { window._wasmAudioStop(); if (typeof onReady === 'function') onReady(null); }
-                } else if (d.type === 'log') {
-                    if (d.level === 'error') console.error(d.msg);
-                    else if (d.level === 'warn') console.warn(d.msg);
-                    else console.log(d.msg);
-                }
-            };
-            w.worker.onerror = function (e) {
-                console.error('[wasm-audio] worker uncaught error:', e.message);
-                if (!w.ready) { window._wasmAudioStop(); if (typeof onReady === 'function') onReady(null); }
-            };
-            w.worker.postMessage({ type: 'start', audioUrl: audioUrl, segBase: segBase,
-                                   libflacUrl: libflacUrl, liveSyncCount: liveSyncCount });
-        }
-
-    })();
-    </script>
-</body>
-</html>
-            'class FlacWorkletProcessor extends AudioWorkletProcessor {',
-            '    constructor() {',
-            '        super();',
-            '        this._qL = []; this._qR = [];',
-            '        this._curL = null; this._curR = null; this._curOff = 0;',
-            '        this.port.onmessage = function(e) {',
-            '            if (e.data.type === "pcm") {',
-            '                this._qL.push(e.data.left);',
-            '                this._qR.push(e.data.right);',
-            '            }',
-            '        }.bind(this);',
-            '    }',
-            '    process(inputs, outputs) {',
-            '        var outL = outputs[0][0], outR = outputs[0][1] || outputs[0][0];',
-            '        var needed = outL.length, filled = 0;',
-            '        while (filled < needed) {',
-            '            if (!this._curL) {',
-            '                if (!this._qL.length) break;',
-            '                this._curL = this._qL.shift();',
-            '                this._curR = this._qR.shift();',
-            '                this._curOff = 0;',
-            '            }',
-            '            var take = Math.min(this._curL.length - this._curOff, needed - filled);',
-            '            outL.set(this._curL.subarray(this._curOff, this._curOff + take), filled);',
-            '            outR.set(this._curR.subarray(this._curOff, this._curOff + take), filled);',
-            '            filled += take; this._curOff += take;',
-            '            if (this._curOff >= this._curL.length) { this._curL = null; this._curR = null; }',
-            '        }',
-            '        if (filled < needed)',
-            '            this.port.postMessage({ type: "underrun", missing: needed - filled });',
-            '        if ((currentFrame & 8191) === 0)',
-            '            this.port.postMessage({ type: "clock", frame: currentFrame });',
-            '        return true;',
-            '    }',
-            '}',
-            'registerProcessor("flac-worklet-processor", FlacWorkletProcessor);',
-        ].join('\n');
-
-        var _workletBlobUrl = null;
-        function _getWorkletUrl() {
-            if (!_workletBlobUrl)
-                _workletBlobUrl = URL.createObjectURL(new Blob([_WORKLET_SRC], { type: 'application/javascript' }));
-            return _workletBlobUrl;
-        }
-
-        // Walk top-level MP4 boxes and collect all boxes with the given 4-char type.
-        function _findBoxes(buffer, type) {
-            var view = new DataView(buffer), results = [], offset = 0;
-            while (offset + 8 <= buffer.byteLength) {
-                var sz = view.getUint32(offset, false);
-                if (sz < 8 || offset + sz > buffer.byteLength) break;
-                var t = String.fromCharCode(view.getUint8(offset+4), view.getUint8(offset+5),
-                                            view.getUint8(offset+6), view.getUint8(offset+7));
-                if (t === type) results.push({ start: offset + 8, size: sz - 8 });
-                offset += sz;
-            }
-            return results;
-        }
-
-        // Concatenate all mdat box payloads from an fMP4 media segment.
-        // For FLAC in fMP4 each mdat contains raw FLAC frames with sync codes intact.
-        function _extractMdat(buffer) {
-            var boxes = _findBoxes(buffer, 'mdat');
-            if (!boxes.length) return null;
-            var total = 0;
-            for (var i = 0; i < boxes.length; i++) total += boxes[i].size;
-            var out = new Uint8Array(total), pos = 0;
-            for (var i = 0; i < boxes.length; i++) {
-                out.set(new Uint8Array(buffer, boxes[i].start, boxes[i].size), pos);
-                pos += boxes[i].size;
-            }
-            return out;
-        }
-
-        // Find the dfLa box anywhere in the init segment and return its payload after the
-        // 4-byte version+flags field (i.e. starting with the raw FLAC metadata block header).
-        // Box layout: 4 size + 4 type + 1 version + 3 flags + FLAC metadata blocks.
-        function _extractDfLa(initBuffer) {
-            var view = new DataView(initBuffer);
-            for (var i = 0; i + 12 <= initBuffer.byteLength; i++) {
-                if (view.getUint8(i+4) === 0x64 && view.getUint8(i+5) === 0x66 &&
-                    view.getUint8(i+6) === 0x4C && view.getUint8(i+7) === 0x61) {
-                    var sz = view.getUint32(i, false);
-                    if (sz < 12 || i + sz > initBuffer.byteLength) continue;
-                    return new Uint8Array(initBuffer, i + 12, sz - 12);
-                }
-            }
-            return null;
-        }
-
-        // Read sample rate from dfLa payload.
-        // dfLaBytes[0]   = last-block flag | block type (0 = STREAMINFO)
-        // dfLaBytes[1-3] = block length (24-bit big-endian, should be 34)
-        // dfLaBytes[4-37] = 34-byte STREAMINFO content
-        // Sample rate is a 20-bit field at STREAMINFO bit offset 80 (byte 10):
-        //   rate = (si[10] << 12) | (si[11] << 4) | (si[12] >> 4)
-        //        = (dfLa[14] << 12) | (dfLa[15] << 4) | (dfLa[16] >> 4)
-        function _dfLaSampleRate(dfLaBytes) {
-            if (dfLaBytes.length < 17) return 44100;
-            return (dfLaBytes[14] << 12) | (dfLaBytes[15] << 4) | (dfLaBytes[16] >> 4);
-        }
-
-        // Build a minimal FLAC stream header from dfLa payload to seed the libflac.js decoder.
-        // Format: 4-byte 'fLaC' marker + metadata block(s) from dfLa.
-        function _buildFlacHeader(dfLaBytes) {
-            var buf = new Uint8Array(4 + dfLaBytes.length);
-            buf[0] = 0x66; buf[1] = 0x4C; buf[2] = 0x61; buf[3] = 0x43; // 'fLaC'
-            buf.set(dfLaBytes, 4);
-            buf[4] |= 0x80; // set last-metadata-block flag so decoder starts frame decoding immediately
-            return buf;
-        }
-
-        // Minimal HLS manifest parser — only needs what the segment fetcher uses.
-        function _parseM3u8(text, segBaseUrl) {
-            var lines = text.split('\n');
-            var seqBase = 0, targetDuration = 2, initUrl = null, segments = [], nextDur = 2;
-            for (var i = 0; i < lines.length; i++) {
-                var ln = lines[i].trim();
-                if (!ln) continue;
-                if      (ln.startsWith('#EXT-X-MEDIA-SEQUENCE:'))  seqBase = parseInt(ln.split(':')[1], 10);
-                else if (ln.startsWith('#EXT-X-TARGETDURATION:'))  { targetDuration = parseFloat(ln.split(':')[1]); nextDur = targetDuration; }
-                else if (ln.startsWith('#EXT-X-MAP:'))             { var m = ln.match(/URI="([^"]+)"/); if (m) initUrl = segBaseUrl + m[1]; }
-                else if (ln.startsWith('#EXTINF:'))                nextDur = parseFloat(ln.split(':')[1]);
-                else if (!ln.startsWith('#'))                      { segments.push({ seq: seqBase + segments.length, url: segBaseUrl + ln }); nextDur = targetDuration; }
-            }
-            return { seqBase: seqBase, targetDuration: targetDuration, initUrl: initUrl, segments: segments };
-        }
-
-        // Pipeline globals — set by _wasmAudioStart, cleared by _wasmAudioStop.
-        window._wasmAudio = null;
-
-        window._wasmAudioStop = function () {
-            var w = window._wasmAudio;
-            if (!w) return;
-            window._wasmAudio = null;
-            w.stopped = true;
-            if (w.pollTimer) { clearTimeout(w.pollTimer); w.pollTimer = null; }
-            if (w.decoder) {
-                try { Flac.FLAC__stream_decoder_finish(w.decoder); } catch (e) {}
-                try { Flac.FLAC__stream_decoder_delete(w.decoder); } catch (e) {}
-                w.decoder = 0;
-            }
-            if (w.workletNode) { try { w.workletNode.disconnect(); } catch (e) {} w.workletNode = null; }
-            if (w.gainNode)    { try { w.gainNode.disconnect();    } catch (e) {} w.gainNode    = null; }
-            if (w.audioCtx)    { try { w.audioCtx.close();         } catch (e) {} w.audioCtx    = null; }
-            console.log('[wasm-audio] pipeline stopped');
-        };
-
-        // Entry point called from _initSplitHls.
-        // onReady(w) fires when the first decoded PCM has reached the AudioWorklet.
-        // onReady(null) signals fallback to hls.js if the WASM stack is unavailable.
-        window._wasmAudioStart = function (baseUrl, cfg, onReady) {
-            if (typeof Flac === 'undefined') {
-                console.warn('[wasm-audio] Flac global not available — libflac.js not loaded; falling back to hls.js');
-                if (typeof onReady === 'function') onReady(null);
-                return;
-            }
-            function _go() { _initWasmPipeline(baseUrl, cfg, onReady); }
-            if (Flac.isReady()) { _go(); }
-            else { var _prev = Flac.onready; Flac.onready = function () { if (_prev) _prev(); _go(); }; }
-        };
-
-        function _initWasmPipeline(baseUrl, cfg, onReady) {
-            if (window._wasmAudio) window._wasmAudioStop();
-
-            var liveSyncCount = (cfg && cfg.hlsLiveSyncSegments > 0) ? cfg.hlsLiveSyncSegments : 3;
-            var audioUrl = baseUrl + 'cast/split_audio/stream.m3u8';
-            var segBase  = baseUrl + 'cast/split_audio/';
-
-            var w = {
-                stopped: false, decoder: 0, audioCtx: null, gainNode: null, workletNode: null,
-                sampleRate: 44100, pollTimer: null, lastSeq: -1, initFetched: false,
-                ready: false,
-                startAudioCtxTime: 0,  // audioCtx.currentTime at the A/V sync anchor point
-                startVideoTime: 0,     // video.currentTime at the same moment
-                lastWorkletFrame: 0,
-            };
-            window._wasmAudio = w;
-
-            // PCM decoded before the AudioWorklet finishes initialising.
-            // Flushed to the worklet as soon as addModule() resolves.
-            // Capped at ~3 s to avoid unbounded memory growth.
-            var _pendingPcm = [];
-            var _workletReady = false;
-
-            // Per-call decode state — refilled synchronously by the FLAC read callback.
-            var _inputBuf = null, _inputPos = 0, _pcmOut = [];
-
-            function _readCb(nbytes, bufPtr, bwPtr) {
-                if (!_inputBuf) return 1; // END_OF_STREAM
-                var avail = _inputBuf.length - _inputPos;
-                if (avail <= 0) return 1;
-                var n = Math.min(nbytes, avail);
-                Flac.HEAPU8.set(_inputBuf.subarray(_inputPos, _inputPos + n), bufPtr);
-                new Int32Array(Flac.HEAPU8.buffer, bwPtr, 1)[0] = n;
-                _inputPos += n;
-                return 0; // CONTINUE
-            }
-
-            // v5 write callback: (frame, buffer, crc)
-            // buffer is Int32Array[] — one Int32Array per channel.
-            function _writeCb(frame, buffer) {
-                if (!buffer || !buffer.length) return;
-                var bps   = frame.header.bits_per_sample || 16;
-                var scale = 1.0 / (1 << (bps - 1));
-                var n     = buffer[0].length;
-                var L = new Float32Array(n), R = new Float32Array(n);
-                var s0 = buffer[0], s1 = buffer.length > 1 ? buffer[1] : buffer[0];
-                for (var i = 0; i < n; i++) { L[i] = s0[i] * scale; R[i] = s1[i] * scale; }
-                _pcmOut.push({ L: L, R: R });
-            }
-
-            function _errCb(code, msg) { console.error('[wasm-audio] FLAC decode error', code, msg); }
-
-            w.decoder = Flac.create_libflac_decoder(false);
-            if (!w.decoder) {
-                console.error('[wasm-audio] create_libflac_decoder failed');
-                if (typeof onReady === 'function') onReady(null);
-                return;
-            }
-            var initSt = Flac.init_decoder_stream(w.decoder, _readCb, _writeCb, _errCb, null, false);
-            if (initSt !== 0) {
-                console.error('[wasm-audio] FLAC decoder init failed, status:', initSt);
-                if (typeof onReady === 'function') onReady(null);
-                return;
-            }
-
-            function _decode(bytes) {
-                _inputBuf = bytes; _inputPos = 0; _pcmOut = [];
-                while (_inputPos < _inputBuf.length && Flac.FLAC__stream_decoder_process_single(w.decoder)) {}
-                _inputBuf = null;
-                return _pcmOut.splice(0);
-            }
-
-            function _sendToWorklet(chunks) {
-                for (var i = 0; i < chunks.length; i++)
-                    w.workletNode.port.postMessage(
-                        { type: 'pcm', left: chunks[i].L, right: chunks[i].R },
-                        [chunks[i].L.buffer, chunks[i].R.buffer]);
-            }
-
-            function _enqueuePcm(chunks) {
-                if (!chunks.length) return;
-                if (!_workletReady) {
-                    _pendingPcm.push.apply(_pendingPcm, chunks);
-                    if (_pendingPcm.length > 64) _pendingPcm.splice(0, _pendingPcm.length - 64);
                     return;
                 }
-                _sendToWorklet(chunks);
-            }
 
-            // Serial fetch queue — one in-flight fetch at a time to keep memory bounded.
-            var _fetchQueue = [], _fetching = false;
-            function _drainQueue() {
-                if (_fetching || !_fetchQueue.length || w.stopped) return;
-                var item = _fetchQueue.shift();
-                _fetching = true;
-                fetch(item.url).then(function (r) { return r.arrayBuffer(); })
-                    .then(function (buf) {
-                        if (w.stopped) return;
-                        item.isInit ? _onInit(buf) : _onMedia(buf);
-                        _fetching = false; _drainQueue();
-                    })
-                    .catch(function (e) {
-                        console.error('[wasm-audio] fetch failed:', item.url, e);
-                        _fetching = false; _drainQueue();
-                    });
-            }
-            function _enqueue(url, isInit) { _fetchQueue.push({ url: url, isInit: !!isInit }); _drainQueue(); }
-
-            function _onInit(buf) {
-                var dfLa = _extractDfLa(buf);
-                if (!dfLa) { console.error('[wasm-audio] dfLa box not found in init segment'); return; }
-                w.sampleRate = _dfLaSampleRate(dfLa);
-                console.log('[wasm-audio] init segment: sampleRate=' + w.sampleRate);
-                _decode(_buildFlacHeader(dfLa)); // seeds the decoder with STREAMINFO; no PCM output expected
-                _createAudioContext();
-            }
-
-            function _onMedia(buf) {
-                var mdat = _extractMdat(buf);
-                if (!mdat || !mdat.length) { console.warn('[wasm-audio] empty mdat in segment'); return; }
-                var chunks = _decode(mdat);
-                if (!chunks.length) return;
-                _enqueuePcm(chunks);
-                // Signal ready on first decoded segment once the worklet is also ready.
-                if (!w.ready && _workletReady) {
-                    w.ready = true;
-                    console.log('[wasm-audio] first media segment decoded — signalling ready');
-                    if (typeof onReady === 'function') onReady(w);
+                // Proportional rate adjustment capped at ±4 %.
+                var rate = 1.0 + Math.max(-0.04, Math.min(0.04, drift * 0.12));
+                video.playbackRate = rate;
+                var roundedRate = Math.round(rate * 1000);
+                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 2) {
+                    console.log('[pcm-stream] sync: drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
+                    _lastLoggedRate = rate;
                 }
-            }
-
-            function _createAudioContext() {
-                try {
-                    w.audioCtx = new AudioContext({ latencyHint: 'playback', sampleRate: w.sampleRate });
-                } catch (e) {
-                    console.error('[wasm-audio] AudioContext creation failed:', e);
-                    if (typeof onReady === 'function') onReady(null);
-                    return;
-                }
-                w.audioCtx.audioWorklet.addModule(_getWorkletUrl())
-                    .then(function () {
-                        w.workletNode = new AudioWorkletNode(w.audioCtx, 'flac-worklet-processor', {
-                            numberOfOutputs: 1, outputChannelCount: [2],
-                        });
-                        w.workletNode.port.onmessage = function (e) {
-                            if (e.data.type === 'underrun')
-                                console.warn('[wasm-audio] worklet underrun:', e.data.missing, 'frames');
-                            else if (e.data.type === 'clock')
-                                w.lastWorkletFrame = e.data.frame;
-                        };
-                        w.gainNode = w.audioCtx.createGain();
-                        w.gainNode.gain.value = 1.0;
-                        w.workletNode.connect(w.gainNode);
-                        w.gainNode.connect(w.audioCtx.destination);
-                        _workletReady = true;
-
-                        // Flush PCM that was decoded while the worklet was initialising.
-                        var flushed = _pendingPcm.splice(0);
-                        if (flushed.length) {
-                            _sendToWorklet(flushed);
-                            console.log('[wasm-audio] worklet ready — flushed ' + flushed.length + ' pending PCM chunks');
-                            if (!w.ready) {
-                                w.ready = true;
-                                if (typeof onReady === 'function') onReady(w);
-                            }
-                        } else {
-                            console.log('[wasm-audio] AudioWorklet ready, sampleRate=' + w.audioCtx.sampleRate + ' — awaiting first media segment');
-                        }
-                    })
-                    .catch(function (e) {
-                        console.error('[wasm-audio] AudioWorklet addModule failed:', e);
-                        if (typeof onReady === 'function') onReady(null);
-                    });
-            }
-
-            function _pollManifest() {
-                if (w.stopped) return;
-                fetch(audioUrl)
-                    .then(function (r) { return r.text(); })
-                    .then(function (text) {
-                        if (w.stopped) return;
-                        var m = _parseM3u8(text, segBase);
-                        if (!w.initFetched && m.initUrl) { w.initFetched = true; _enqueue(m.initUrl, true); }
-                        // On first manifest: start liveSyncCount segments behind the live edge
-                        // (mirrors what the hls.js video player does with liveSyncDurationCount).
-                        if (w.lastSeq < 0 && m.segments.length > 0) {
-                            var si = Math.max(0, m.segments.length - liveSyncCount);
-                            if (si > 0) w.lastSeq = m.segments[si - 1].seq;
-                        }
-                        for (var i = 0; i < m.segments.length; i++) {
-                            if (m.segments[i].seq > w.lastSeq) {
-                                w.lastSeq = m.segments[i].seq;
-                                _enqueue(m.segments[i].url, false);
-                            }
-                        }
-                        w.pollTimer = setTimeout(_pollManifest, Math.max(500, m.targetDuration * 500));
-                    })
-                    .catch(function (e) {
-                        if (w.stopped) return;
-                        console.warn('[wasm-audio] manifest poll error:', e);
-                        w.pollTimer = setTimeout(_pollManifest, 2000);
-                    });
-            }
-
-            _pollManifest();
+            }, 500);
         }
-
-    })();
     </script>
 </body>
 </html>
