@@ -1187,69 +1187,78 @@
                     });
                     _pcmWorkletNode.connect(_pcmAudioCtx.destination);
 
-                    // Listen for clock messages from the worklet
+                    // Worklet port: only clock and underrun messages arrive here.
+                    // pcm/free traffic is handled by a direct MessageChannel (see below).
+                    var _pcmTitleNextUpdateMs = 0;
                     _pcmWorkletNode.port.onmessage = function (e) {
                         var msg = e.data;
                         if (msg.type === 'clock') {
                             _pcmLastFrameAudioTimeMs = msg.audioTimeMs;
                             _pcmSamplesPlayedAtFrame = msg.samplesPlayedAtFrame;
                             _pcmSamplesPlayed = msg.samplesPlayed;
+                            // Throttle title updates to ~1/s — avoids layout work at clock rate
                             if (msg.ringFill !== undefined) {
-                                var fillMs = (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0);
-                                var capMs  = (msg.ringCapacity / PCM_SAMPLE_RATE * 1000).toFixed(0);
-                                document.title = 'PCM ring: ' + fillMs + ' / ' + capMs + ' ms';
+                                var now = Date.now();
+                                if (now >= _pcmTitleNextUpdateMs) {
+                                    _pcmTitleNextUpdateMs = now + 1000;
+                                    var fillMs = (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                    var capMs  = (msg.ringCapacity / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                    document.title = 'PCM ring: ' + fillMs + ' / ' + capMs + ' ms';
+                                }
                             }
                         } else if (msg.type === 'underrun') {
                             var fillMs = msg.ringFill !== undefined ? (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0) : '?';
                             console.warn('[pcm-stream] AudioWorklet underrun — re-buffering (ring was ' + fillMs + ' ms)');
-                            // Pause the worklet immediately so it stops draining the empty ring
-                            // and outputs silence while pre-roll refills — prevents rapid-fire cascade.
-                            try { _pcmWorkletNode.port.postMessage({ type: 'reset' }); } catch (e) {}
-                            // Re-arm pre-roll: worker keeps fetching, pre-roll counts up again
+                            // Reset the worklet ring so it outputs silence during re-buffer
+                            try { _pcmWorkletNode.port.postMessage({ type: 'reset' }); } catch (ex) {}
+                            // Re-arm preroll in the decode Worker — it will send 'prerollComplete'
+                            // again once PCM_PREROLL_SAMPLES have been decoded.
+                            if (_pcmWorker) {
+                                try { _pcmWorker.postMessage({ type: 'resetPreroll' }); } catch (ex) {}
+                            }
                             _pcmPrerollSamples = 0;
                             _pcmPrerollGate = false;
-                        } else if (msg.type === 'free') {
-                            // Worklet has finished with these buffers — relay to the decode Worker
-                            // as a pool donation so it can reuse them instead of allocating fresh.
-                            if (_pcmWorker) {
-                                _pcmWorker.postMessage(
-                                    { type: 'pool', left: msg.left, right: msg.right },
-                                    [msg.left.buffer, msg.right.buffer]
-                                );
-                            }
                         }
+                        // Note: 'free' (buffer pool recycle) is no longer relayed through the
+                        // main thread — it goes directly Worker↔Worklet via the MessageChannel.
                     };
 
                     console.log('[pcm-stream] AudioWorklet ready — starting PCM Worker');
                     if (_pcmAudioCtx.state === 'suspended') _pcmAudioCtx.resume().catch(function () {});
 
                     // Load the decode Worker from the same origin as receiver.html.
-                    // It handles frame parsing + Int16→Float32 + buffer pool; it never fetches.
+                    // It handles frame parsing + Int16→Float32 + buffer pool + preroll counting.
                     _pcmWorker = new Worker('pcm-fetch-worker.js');
                     _pcmWorker.onerror = function(e) { console.error('[pcm-stream] Worker error:', e.message); };
                     _pcmWorker.onmessage = function (e) {
                         var msg = e.data;
-                        if (msg.type === 'pcm') {
-                            // Capture length before transfer detaches the backing buffers
-                            var sampleCount = msg.left.length;
-                            // Relay to worklet (transfers ownership — zero-copy)
+                        if (msg.type === 'prerollComplete') {
+                            // Worker has decoded PCM_PREROLL_SAMPLES — start audio output
                             if (_pcmWorkletNode) {
-                                _pcmWorkletNode.port.postMessage(msg, [msg.left.buffer, msg.right.buffer]);
+                                _pcmWorkletNode.port.postMessage({ type: 'start' });
+                                console.log('[pcm-stream] pre-roll complete — worklet started');
+                                _pcmStartVideoSync();
                             }
-                            // Pre-roll counting
-                            _pcmPrerollSamples += sampleCount;
-                            if (!_pcmPrerollGate && _pcmPrerollSamples >= PCM_PREROLL_SAMPLES) {
-                                _pcmPrerollGate = true;
-                                if (_pcmWorkletNode) {
-                                    _pcmWorkletNode.port.postMessage({ type: 'start' });
-                                    console.log('[pcm-stream] pre-roll complete (' + _pcmPrerollSamples + ' samples) — worklet started');
-                                    _pcmStartVideoSync();
-                                }
-                            }
+                            _pcmPrerollGate = true;
                         } else if (msg.type === 'syncLost') {
                             console.warn('[pcm-stream] frame sync lost in worker');
                         }
+                        // Note: 'pcm' frames are now sent directly Worker→Worklet via
+                        // MessageChannel and never appear here.
                     };
+
+                    // Wire a direct MessageChannel between the decode Worker and the AudioWorklet
+                    // so that the hot pcm/free traffic bypasses the main thread entirely.
+                    // The main thread only handles infrequent clock/underrun/prerollComplete events.
+                    var _pcmChannel = new MessageChannel();
+                    _pcmWorkletNode.port.postMessage(
+                        { type: 'setDirectPort', port: _pcmChannel.port1 },
+                        [_pcmChannel.port1]
+                    );
+                    _pcmWorker.postMessage(
+                        { type: 'setDirectPort', port: _pcmChannel.port2 },
+                        [_pcmChannel.port2]
+                    );
 
                     // The fetch runs on the main thread so that HTTP→HTTPS mixed-content
                     // rules apply in the page context (warning, not hard-block on Chromecast).
@@ -1266,35 +1275,44 @@
         // Fetch loop runs on the main thread so that HTTP→HTTPS mixed-content is allowed
         // (page context: warning only on Chromecast). Each raw byte chunk is transferred to
         // the decode Worker, which handles frame parsing and Int16→Float32 conversion.
+        //
+        // Uses async/await to avoid per-read Promise chain allocations that drove GC pressure.
+        // Transfers the network buffer directly when it owns its backing ArrayBuffer (common
+        // in Chrome) to avoid an extra slice() allocation on every chunk.
         function _pcmFetchLoop(baseUrl) {
             if (_pcmFetchAbort) { try { _pcmFetchAbort.abort(); } catch (e) {} }
             _pcmFetchAbort = new AbortController();
             if (_pcmWorker) _pcmWorker.postMessage({ type: 'reset' });
 
             fetch(baseUrl + 'cast/pcmlive', { signal: _pcmFetchAbort.signal })
-                .then(function (resp) {
+                .then(async function (resp) {
                     if (!resp.ok) {
                         console.error('[pcm-stream] /cast/pcmlive returned', resp.status);
                         setTimeout(function () { if (_pcmStarted) _pcmFetchLoop(baseUrl); }, 2000);
                         return;
                     }
                     var reader = resp.body.getReader();
-                    function pump() {
-                        return reader.read().then(function (result) {
+                    try {
+                        while (true) {
+                            var result = await reader.read();
                             if (result.done) {
                                 console.log('[pcm-stream] stream ended — reconnecting in 1 s');
                                 setTimeout(function () { if (_pcmStarted) _pcmFetchLoop(baseUrl); }, 1000);
                                 return;
                             }
-                            // Transfer raw bytes to the decode Worker (zero-copy)
                             if (_pcmWorker) {
-                                var buf = result.value.buffer.slice(result.value.byteOffset, result.value.byteOffset + result.value.byteLength);
+                                var v = result.value;
+                                // Transfer directly if the Uint8Array owns its entire backing buffer
+                                // (avoids a slice() allocation — true for the vast majority of reads).
+                                var buf = (v.byteOffset === 0 && v.byteLength === v.buffer.byteLength)
+                                    ? v.buffer
+                                    : v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
                                 _pcmWorker.postMessage({ type: 'chunk', data: new Uint8Array(buf) }, [buf]);
                             }
-                            return pump();
-                        });
+                        }
+                    } finally {
+                        reader.releaseLock();
                     }
-                    return pump();
                 })
                 .catch(function (err) {
                     if (err && err.name === 'AbortError') return;
