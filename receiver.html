@@ -1170,7 +1170,7 @@
             }
             _pcmAudioCtx = new AudioContext({ sampleRate: PCM_SAMPLE_RATE });
 
-            _pcmAudioCtx.audioWorklet.addModule(baseUrl + 'pcm-worklet.js')
+            _pcmAudioCtx.audioWorklet.addModule('pcm-worklet.js')
                 .then(function () {
                     _pcmWorkletNode = new AudioWorkletNode(_pcmAudioCtx, 'pcm-sink', {
                         numberOfInputs: 0,
