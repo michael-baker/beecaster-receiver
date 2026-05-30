@@ -93,7 +93,8 @@
                     // In split/fmp4 modes the HLS pipeline runs continuously across
                     // track changes — don't destroy and recreate the players on every
                     // LOAD.  Only start them if not already running.
-                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && _splitVideoHls);
+                    // In audio-only mode _splitVideoHls is always null, so check audio alone.
+                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && (_splitVideoHls || _splitAudioOnlyMode));
                     if (!splitAlreadyRunning) {
                         _showAudioSyncOverlay();
                         resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
@@ -291,6 +292,7 @@
         var _splitVideoHls = null;
         var _splitAudioHls = null;
         var _splitSyncTimer = null;
+        var _splitAudioOnlyMode = false; // true when running in audio-only split mode (no _splitVideoHls)
         var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
         var _lastHlsMode = 'hls_memory'; // most-recent mode from LOAD; used when restarting after calib reset
         var _calibPollTimer = null;
@@ -463,6 +465,7 @@
                 try { _splitAudioHls.destroy(); } catch (e) {}
                 _splitAudioHls = null;
             }
+            _splitAudioOnlyMode = false;
             if (video) video.style.display = 'none';
             console.warn('[hls-bg] stream reset — waiting for restart');
         }
@@ -624,8 +627,10 @@
                 .then(function (cfg) {
                     if (cfg && cfg.splitHlsAudioOnly) {
                         video.style.display = 'none';
+                        _splitAudioOnlyMode = true;
                         _initSplitHls(baseUrl, null, audio, cfg);
                     } else {
+                        _splitAudioOnlyMode = false;
                         _initSplitHls(baseUrl, video, audio, cfg);
                     }
                 });
@@ -758,16 +763,9 @@
             // PlaybackRate steering: every 500ms compare the audio and video live-edge
             // latency via EXT-X-PROGRAM-DATE-TIME. Both FFmpeg processes write PDT from
             // the same wall clock, so comparing PDTs gives the A/V drift. Nudge video
-            // playbackRate to converge on the audio position.
-            //
-            // Telemetry is decoupled from the steering tick to reduce XHR load on CC v2:
-            //   - Hard-seeks: always POST immediately (buffer anomaly, one-shot)
-            //   - Calibration page open: POST at most every 1000ms (chart does not need 500ms)
-            //   - Outside calibration, drift > 500ms: POST at most every 2000ms (alert only)
-            //   - Dead zone or normal in-range drift outside calibration: never POST
-            var _lastLoggedRate = 1.0;  // last emitted rate, to suppress redundant logs
-            var _lastTelemetryMs = 0;   // wall-clock ms of last telemetry POST
-            var _seekCooldownUntil = 0; // suppress steering until this timestamp after a hard-seek
+            // playbackRate to converge on the audio position.            
+            // Telemetry is decoupled from the steering tick to reduce XHR load on CC v2
+          
             _splitSyncTimer = setInterval(function () {
                 if (audioOnly) return;  // no sync needed in audio-only mode
                 if (!_splitAudioHls || !_splitVideoHls) return;
