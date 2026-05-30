@@ -19,7 +19,7 @@
  */
 'use strict';
 
-const RING_FRAMES = 192000; // 4 s ring buffer at 48 kHz
+const RING_FRAMES = 480000; // 10 s ring buffer at 48 kHz
 const FADE_SAMPLES = 240;   // 5 ms fade-out on underrun to avoid clicks
 const CLOCK_INTERVAL = 1024; // post clock message every ~21 ms
 

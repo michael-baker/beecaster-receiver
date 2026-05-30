@@ -1091,7 +1091,7 @@
         // and handles pre-roll counting. Video is served by the split-HLS video pipeline.
 
         const PCM_SAMPLE_RATE = 48000;
-        const PCM_PREROLL_SAMPLES = 96000; // 2 s pre-roll
+        const PCM_PREROLL_SAMPLES = 240000; // 5 s pre-roll
 
         function _pcmStop() {
             if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
@@ -1198,6 +1198,9 @@
                         } else if (msg.type === 'underrun') {
                             var fillMs = msg.ringFill !== undefined ? (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0) : '?';
                             console.warn('[pcm-stream] AudioWorklet underrun — re-buffering (ring was ' + fillMs + ' ms)');
+                            // Pause the worklet immediately so it stops draining the empty ring
+                            // and outputs silence while pre-roll refills — prevents rapid-fire cascade.
+                            try { _pcmWorkletNode.port.postMessage({ type: 'reset' }); } catch (e) {}
                             // Re-arm pre-roll: worker keeps fetching, pre-roll counts up again
                             _pcmPrerollSamples = 0;
                             _pcmPrerollGate = false;
