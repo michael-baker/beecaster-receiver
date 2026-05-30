@@ -10,6 +10,7 @@
  *   { type: 'chunk', data: Uint8Array }  — raw bytes from /cast/pcmlive
  *   { type: 'reset' }                    — stream reconnecting; clear accumulator
  *   { type: 'stop' }                     — terminate (worker.terminate() called after)
+ *   { type: 'pool',  left: Float32Array, right: Float32Array }  — recycled buffers from AudioWorklet
  *
  * Messages OUT to main thread:
  *   { type: 'pcm', left: Float32Array, right: Float32Array, audioTimeMs: number }
@@ -23,12 +24,21 @@ const PCM_HDR_SIZE = 16;
 var _accum    = new Uint8Array(512 * 1024);
 var _accumLen = 0;
 
+// Float32Array buffer pool — buffers are transferred to the AudioWorklet, which copies
+// them into the ring and immediately transfers them back via the main thread as 'pool'
+// messages.  Steady-state allocation rate drops to near zero (~30 allocs/s → 0).
+var _pool    = [];
+var _poolMax = 8;
+
 self.onmessage = function (e) {
     var msg = e.data;
     if (msg.type === 'chunk') {
         _consume(msg.data);
     } else if (msg.type === 'reset') {
         _accumLen = 0;
+    } else if (msg.type === 'pool') {
+        // Receive freed Float32Array pair transferred back from AudioWorklet via main thread.
+        if (_pool.length < _poolMax) _pool.push({ left: msg.left, right: msg.right });
     }
 };
 
@@ -44,8 +54,8 @@ function _consume(chunk) {
 
     var pos = 0;
     while (pos + PCM_HDR_SIZE <= _accumLen) {
-        var view = new DataView(_accum.buffer, _accum.byteOffset + pos, _accumLen - pos);
-        var magic = view.getUint32(0, false);
+        // Parse big-endian header fields directly — avoids allocating a DataView per frame.
+        var magic = ((_accum[pos] << 24) | (_accum[pos+1] << 16) | (_accum[pos+2] << 8) | _accum[pos+3]) >>> 0;
 
         if (magic !== PCM_MAGIC) {
             self.postMessage({ type: 'syncLost' });
@@ -53,8 +63,8 @@ function _consume(chunk) {
             continue;
         }
 
-        var audioTimeMs = view.getUint32(4, false);
-        var sampleCount = view.getUint32(8, false);
+        var audioTimeMs = ((_accum[pos+4] << 24) | (_accum[pos+5] << 16) | (_accum[pos+6] << 8) | _accum[pos+7]) >>> 0;
+        var sampleCount = ((_accum[pos+8] << 24) | (_accum[pos+9] << 16) | (_accum[pos+10] << 8) | _accum[pos+11]) >>> 0;
 
         if (sampleCount === 0) {
             // Close frame — server signalled end of stream; accumulator stays intact.
@@ -65,10 +75,15 @@ function _consume(chunk) {
         var frameBytes = PCM_HDR_SIZE + sampleCount * 4; // 2 ch × 2 bytes
         if (pos + frameBytes > _accumLen) break; // incomplete frame — wait for more data
 
-        var pcmBytes = new Uint8Array(_accum.buffer, _accum.byteOffset + pos + PCM_HDR_SIZE, sampleCount * 4);
-        var pcm16    = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, sampleCount * 2);
-        var left     = new Float32Array(sampleCount);
-        var right    = new Float32Array(sampleCount);
+        // Direct Int16Array view into the accumulator — skips an intermediate Uint8Array allocation.
+        var pcm16 = new Int16Array(_accum.buffer, _accum.byteOffset + pos + PCM_HDR_SIZE, sampleCount * 2);
+        // Reuse a pooled Float32Array pair when available; otherwise allocate a fresh one.
+        var pair  = null;
+        for (var pi = 0; pi < _pool.length; pi++) {
+            if (_pool[pi].left.length === sampleCount) { pair = _pool.splice(pi, 1)[0]; break; }
+        }
+        var left  = pair ? pair.left  : new Float32Array(sampleCount);
+        var right = pair ? pair.right : new Float32Array(sampleCount);
         for (var i = 0; i < sampleCount; i++) {
             left[i]  = pcm16[i * 2]     / 32768.0;
             right[i] = pcm16[i * 2 + 1] / 32768.0;

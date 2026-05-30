@@ -10,12 +10,12 @@
  * only needs to accept Float32 regardless of the original bit depth.
  *
  * Design:
- *   - Ring buffer: two Float32Arrays (L + R), capacity RING_FRAMES = 192000 (4 s at 48 kHz)
+ *   - Ring buffer: two Float32Arrays (L + R), capacity RING_FRAMES = 480000 (10 s at 48 kHz)
  *   - writeHead / readHead: sample-index cursors (not bytes)
  *   - Underrun: output silence with a 5 ms (240 sample) linear fade-out to avoid clicks
- *   - Pre-roll: main thread sends 'start' message once 96000 samples are buffered (2 s)
+ *   - Pre-roll: main thread sends 'start' message once 240000 samples are buffered (5 s)
  *   - On 'start': applies FADE_SAMPLES fade-in to avoid the silence→audio click
- *   - Messages TO main thread: { type: 'underrun' } | { type: 'clock', audioTimeMs, samplesPlayed }
+ *   - Messages TO main thread: { type: 'underrun' } | { type: 'clock', ... } | { type: 'free', left, right }
  */
 'use strict';
 
@@ -54,6 +54,13 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
             if (msg.type === 'pcm') {
                 // Transferred Float32Arrays — zero-copy from main thread
                 this._pushChunk(msg.left, msg.right, msg.audioTimeMs);
+                // Transfer the consumed buffers back to the main thread for pool reuse.
+                // Data has already been copied into the ring; the backing ArrayBuffers are
+                // no longer needed here and can be recycled by the decode Worker.
+                this.port.postMessage(
+                    { type: 'free', left: msg.left, right: msg.right },
+                    [msg.left.buffer, msg.right.buffer]
+                );
             } else if (msg.type === 'start') {
                 this._started = true;
                 this._underrun = false;
