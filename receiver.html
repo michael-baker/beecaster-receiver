@@ -1445,7 +1445,8 @@
                         // Recreate the HLS player and retry in 3 s.
                         if (_splitVideoHls) { try { _splitVideoHls.destroy(); } catch (e) {} _splitVideoHls = null; }
                         if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
-                        setTimeout(function () { if (_hlsStarted) startCafWavSync(baseUrl); }, 3000);
+                        _hlsStarted = false; // allow startCafWavSync to re-enter
+                        setTimeout(function () { startCafWavSync(baseUrl); }, 3000);
                     });
                 });
         }
@@ -1528,25 +1529,6 @@
                 var roundedRate = Math.round(rate * 1000);
                 if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 2) {
                     console.log('[caf-wav-sync] sync: cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
-                    _lastLoggedRate = rate;
-                }
-            }, 500);
-        }
-
-                if (Math.abs(drift) < 0.40) {
-                    if (video.playbackRate !== 1.0) {
-                        video.playbackRate = 1.0;
-                        console.log('[caf-wav-sync] sync: back in dead zone \u2014 rate=1.0');
-                        _lastLoggedRate = 1.0;
-                    }
-                    return;
-                }
-
-                var rate = 1.0 + Math.max(-0.04, Math.min(0.04, drift * 0.12));
-                video.playbackRate = rate;
-                var roundedRate = Math.round(rate * 1000);
-                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 2) {
-                    console.log('[caf-wav-sync] sync: drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
                     _lastLoggedRate = rate;
                 }
             }, 500);
