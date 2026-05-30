@@ -1090,6 +1090,7 @@
         const PCM_SAMPLE_RATE = 48000;
         const PCM_PREROLL_SAMPLES = 96000; // 2 s pre-roll
         var _pcmPrerollGate = false;
+        var _pcmWorkerUrl = null; // Blob URL for the inline Worker — revoked on stop
 
         function _pcmStop() {
             if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
@@ -1097,6 +1098,10 @@
             if (_pcmWorker) {
                 try { _pcmWorker.terminate(); } catch (e) {}
                 _pcmWorker = null;
+            }
+            if (_pcmWorkerUrl) {
+                try { URL.revokeObjectURL(_pcmWorkerUrl); } catch (e) {}
+                _pcmWorkerUrl = null;
             }
             if (_pcmWorkletNode) {
                 try { _pcmWorkletNode.port.postMessage({ type: 'reset' }); } catch (e) {}
@@ -1201,9 +1206,39 @@
                     console.log('[pcm-stream] AudioWorklet ready — starting PCM Worker');
                     if (_pcmAudioCtx.state === 'suspended') _pcmAudioCtx.resume().catch(function () {});
 
-                    // Create the decode Worker (served from GitHub Pages — same HTTPS origin).
-                    // The Worker only does frame parsing + Int16→Float32; it never fetches.
-                    _pcmWorker = new Worker('pcm-fetch-worker.js');
+                    // Create the decode Worker from an inline Blob so it works regardless
+                    // of whether pcm-fetch-worker.js is hosted on GitHub Pages.
+                    // The Worker handles frame parsing + Int16→Float32; it never fetches.
+                    var _workerSrc = [
+                        "'use strict';",
+                        "var PCM_MAGIC=0x50434DFF,PCM_HDR_SIZE=16,_accum=new Uint8Array(524288),_accumLen=0;",
+                        "self.onmessage=function(e){var m=e.data;if(m.type==='chunk')_consume(m.data);else if(m.type==='reset')_accumLen=0;};",
+                        "function _consume(chunk){",
+                        "  var n=_accumLen+chunk.length;",
+                        "  if(n>_accum.length){var b=new Uint8Array(Math.max(n,_accum.length*2));b.set(_accum.subarray(0,_accumLen));_accum=b;}",
+                        "  _accum.set(chunk,_accumLen);_accumLen+=chunk.length;",
+                        "  var pos=0;",
+                        "  while(pos+PCM_HDR_SIZE<=_accumLen){",
+                        "    var v=new DataView(_accum.buffer,_accum.byteOffset+pos,_accumLen-pos);",
+                        "    if(v.getUint32(0,false)!==PCM_MAGIC){self.postMessage({type:'syncLost'});pos++;continue;}",
+                        "    var t=v.getUint32(4,false),sc=v.getUint32(8,false);",
+                        "    if(sc===0){pos+=PCM_HDR_SIZE;continue;}",
+                        "    var fb=PCM_HDR_SIZE+sc*4;",
+                        "    if(pos+fb>_accumLen)break;",
+                        "    var pb=new Uint8Array(_accum.buffer,_accum.byteOffset+pos+PCM_HDR_SIZE,sc*4);",
+                        "    var p16=new Int16Array(pb.buffer,pb.byteOffset,sc*2);",
+                        "    var L=new Float32Array(sc),R=new Float32Array(sc);",
+                        "    for(var i=0;i<sc;i++){L[i]=p16[i*2]/32768;R[i]=p16[i*2+1]/32768;}",
+                        "    self.postMessage({type:'pcm',left:L,right:R,audioTimeMs:t},[L.buffer,R.buffer]);",
+                        "    pos+=fb;",
+                        "  }",
+                        "  if(pos>0){_accumLen-=pos;if(_accumLen>0)_accum.copyWithin(0,pos,pos+_accumLen);}",
+                        "}"
+                    ].join('\n');
+                    var _workerBlob = new Blob([_workerSrc], { type: 'application/javascript' });
+                    _pcmWorkerUrl  = URL.createObjectURL(_workerBlob);
+                    _pcmWorker = new Worker(_pcmWorkerUrl);
+                    _pcmWorker.onerror = function(e) { console.error('[pcm-stream] Worker error:', e.message); };
                     _pcmWorker.onmessage = function (e) {
                         var msg = e.data;
                         if (msg.type === 'pcm') {
