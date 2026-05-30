@@ -86,15 +86,18 @@
                 _castBaseUrl = baseUrl;
                 _lastHlsMode = hlsMode;
                 _fetchRemoteLogSetting(baseUrl);
-                // In flac_hls / fmp4_hls / fmp4_split mode the HLS stream is the audio source; mute CAF so they don't overlap.
+                // In flac_hls / fmp4_hls / fmp4_split / pcm_stream the HLS/AudioWorklet stream
+                // is the audio source; mute CAF so they don't overlap.
+                // In caf_wav_sync CAF IS the audio source — must remain unmuted.
                 var caf = document.getElementById('receiverVideoElement');
-                if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls' || hlsMode === 'fmp4_split');
+                if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls' || hlsMode === 'fmp4_split' || hlsMode === 'pcm_stream');
                 try {
-                    // In split/fmp4 modes the HLS pipeline runs continuously across
+                    // In split/fmp4/caf_wav_sync modes the HLS pipeline runs continuously across
                     // track changes — don't destroy and recreate the players on every
                     // LOAD.  Only start them if not already running.
                     // In audio-only mode _splitVideoHls is always null, so check audio alone.
-                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && (_splitVideoHls || _splitAudioOnlyMode));
+                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && (_splitVideoHls || _splitAudioOnlyMode))
+                                           || (hlsMode === 'caf_wav_sync' && _splitVideoHls);
                     if (!splitAlreadyRunning) {
                         _showAudioSyncOverlay();
                         resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
@@ -302,9 +305,7 @@
         var _pcmAudioCtx = null;      // AudioContext
         var _pcmWorkletNode = null;   // AudioWorkletNode connected to destination
         var _pcmWorker = null;        // Web Worker running pcm-fetch-worker.js
-        var _pcmFetchAbort = null;    // AbortController for the active pcmlive fetch
         var _pcmPrerollSamples = 0;   // samples accumulated before starting worklet output
-        var _pcmPrerollGate = false;  // true once pre-roll threshold has been reached this session
         var _pcmLastFrameAudioTimeMs = 0;  // from last frame header
         var _pcmSamplesPlayedAtFrame = 0;  // worklet sample counter at last frame
         var _pcmSamplesPlayed = 0;    // latest sample count from worklet clock message
@@ -368,6 +369,8 @@
                 startSplitHlsBg(baseUrl);
             } else if (hlsMode === 'pcm_stream') {
                 startPcmStream(baseUrl);
+            } else if (hlsMode === 'caf_wav_sync') {
+                startCafWavSync(baseUrl);
             } else {
                 startHlsBg(baseUrl);
             }
@@ -1090,7 +1093,9 @@
         // and handles pre-roll counting. Video is served by the split-HLS video pipeline.
 
         const PCM_SAMPLE_RATE = 48000;
-        const PCM_PREROLL_SAMPLES = 240000; // 5 s pre-roll
+        const PCM_PREROLL_SAMPLES = 96000; // 2 s pre-roll
+        var _pcmPrerollGate = false;
+        var _pcmWorkerUrl = null; // Blob URL for the inline Worker — revoked on stop
 
         function _pcmStop() {
             if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
@@ -1098,6 +1103,10 @@
             if (_pcmWorker) {
                 try { _pcmWorker.terminate(); } catch (e) {}
                 _pcmWorker = null;
+            }
+            if (_pcmWorkerUrl) {
+                try { URL.revokeObjectURL(_pcmWorkerUrl); } catch (e) {}
+                _pcmWorkerUrl = null;
             }
             if (_pcmWorkletNode) {
                 try { _pcmWorkletNode.port.postMessage({ type: 'reset' }); } catch (e) {}
@@ -1138,17 +1147,8 @@
                             lowLatencyMode: false,
                             liveSyncDurationCount: liveSyncDurationCount,
                             liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
-                            // Cap buffer at 6 s — this is muted background video; a large buffer
-                            // keeps the MSE SourceBuffer locked longer and wastes Chromecast RAM.
-                            maxBufferLength: Math.min(maxBufferLength, 6),
-                            maxMaxBufferLength: Math.min(maxBufferLength * 2, 12),
+                            maxBufferLength: maxBufferLength,
                             backBufferLength: 0,
-                            // Move hls.js demux/remux off the main thread so that MSE work
-                            // does not compete with the PCM fetch pump for JS time slices.
-                            enableWorker: true,
-                            // Single fixed-quality stream — skip ABR overhead entirely.
-                            abrEnabled: false,
-                            startLevel: 0,
                             manifestLoadingMaxRetry: 12,
                             manifestLoadingRetryDelay: 1000,
                             manifestLoadingMaxRetryTimeout: 12000,
@@ -1187,67 +1187,86 @@
                     });
                     _pcmWorkletNode.connect(_pcmAudioCtx.destination);
 
-                    // Worklet port: only clock and underrun messages arrive here.
-                    // pcm/free traffic is handled by a direct MessageChannel (see below).
+                    // Listen for clock messages from the worklet
                     _pcmWorkletNode.port.onmessage = function (e) {
                         var msg = e.data;
                         if (msg.type === 'clock') {
                             _pcmLastFrameAudioTimeMs = msg.audioTimeMs;
                             _pcmSamplesPlayedAtFrame = msg.samplesPlayedAtFrame;
                             _pcmSamplesPlayed = msg.samplesPlayed;
+                            if (msg.ringFill !== undefined) {
+                                var fillMs = (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                var capMs  = (msg.ringCapacity / PCM_SAMPLE_RATE * 1000).toFixed(0);
+                                document.title = 'PCM ring: ' + fillMs + ' / ' + capMs + ' ms';
+                            }
                         } else if (msg.type === 'underrun') {
                             var fillMs = msg.ringFill !== undefined ? (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0) : '?';
                             console.warn('[pcm-stream] AudioWorklet underrun — re-buffering (ring was ' + fillMs + ' ms)');
-                            // Reset the worklet ring so it outputs silence during re-buffer
-                            try { _pcmWorkletNode.port.postMessage({ type: 'reset' }); } catch (ex) {}
-                            // Re-arm preroll in the decode Worker — it will send 'prerollComplete'
-                            // again once PCM_PREROLL_SAMPLES have been decoded.
-                            if (_pcmWorker) {
-                                try { _pcmWorker.postMessage({ type: 'resetPreroll' }); } catch (ex) {}
-                            }
+                            // Re-arm pre-roll: worker keeps fetching, pre-roll counts up again
                             _pcmPrerollSamples = 0;
                             _pcmPrerollGate = false;
                         }
-                        // Note: 'free' (buffer pool recycle) is no longer relayed through the
-                        // main thread — it goes directly Worker↔Worklet via the MessageChannel.
                     };
 
                     console.log('[pcm-stream] AudioWorklet ready — starting PCM Worker');
                     if (_pcmAudioCtx.state === 'suspended') _pcmAudioCtx.resume().catch(function () {});
 
-                    // Load the decode Worker from the same origin as receiver.html.
-                    // It handles frame parsing + Int16→Float32 + buffer pool + preroll counting.
-                    _pcmWorker = new Worker('pcm-fetch-worker.js');
+                    // Create the decode Worker from an inline Blob so it works regardless
+                    // of whether pcm-fetch-worker.js is hosted on GitHub Pages.
+                    // The Worker handles frame parsing + Int16→Float32; it never fetches.
+                    var _workerSrc = [
+                        "'use strict';",
+                        "var PCM_MAGIC=0x50434DFF,PCM_HDR_SIZE=16,_accum=new Uint8Array(524288),_accumLen=0;",
+                        "self.onmessage=function(e){var m=e.data;if(m.type==='chunk')_consume(m.data);else if(m.type==='reset')_accumLen=0;};",
+                        "function _consume(chunk){",
+                        "  var n=_accumLen+chunk.length;",
+                        "  if(n>_accum.length){var b=new Uint8Array(Math.max(n,_accum.length*2));b.set(_accum.subarray(0,_accumLen));_accum=b;}",
+                        "  _accum.set(chunk,_accumLen);_accumLen+=chunk.length;",
+                        "  var pos=0;",
+                        "  while(pos+PCM_HDR_SIZE<=_accumLen){",
+                        "    var v=new DataView(_accum.buffer,_accum.byteOffset+pos,_accumLen-pos);",
+                        "    if(v.getUint32(0,false)!==PCM_MAGIC){self.postMessage({type:'syncLost'});pos++;continue;}",
+                        "    var t=v.getUint32(4,false),sc=v.getUint32(8,false);",
+                        "    if(sc===0){pos+=PCM_HDR_SIZE;continue;}",
+                        "    var fb=PCM_HDR_SIZE+sc*4;",
+                        "    if(pos+fb>_accumLen)break;",
+                        "    var pb=new Uint8Array(_accum.buffer,_accum.byteOffset+pos+PCM_HDR_SIZE,sc*4);",
+                        "    var p16=new Int16Array(pb.buffer,pb.byteOffset,sc*2);",
+                        "    var L=new Float32Array(sc),R=new Float32Array(sc);",
+                        "    for(var i=0;i<sc;i++){L[i]=p16[i*2]/32768;R[i]=p16[i*2+1]/32768;}",
+                        "    self.postMessage({type:'pcm',left:L,right:R,audioTimeMs:t},[L.buffer,R.buffer]);",
+                        "    pos+=fb;",
+                        "  }",
+                        "  if(pos>0){_accumLen-=pos;if(_accumLen>0)_accum.copyWithin(0,pos,pos+_accumLen);}",
+                        "}"
+                    ].join('\n');
+                    var _workerBlob = new Blob([_workerSrc], { type: 'application/javascript' });
+                    _pcmWorkerUrl  = URL.createObjectURL(_workerBlob);
+                    _pcmWorker = new Worker(_pcmWorkerUrl);
                     _pcmWorker.onerror = function(e) { console.error('[pcm-stream] Worker error:', e.message); };
                     _pcmWorker.onmessage = function (e) {
                         var msg = e.data;
-                        if (msg.type === 'prerollComplete') {
-                            // Worker has decoded PCM_PREROLL_SAMPLES — start audio output
+                        if (msg.type === 'pcm') {
+                            // Capture length before transfer detaches the backing buffers
+                            var sampleCount = msg.left.length;
+                            // Relay to worklet (transfers ownership — zero-copy)
                             if (_pcmWorkletNode) {
-                                _pcmWorkletNode.port.postMessage({ type: 'start' });
-                                console.log('[pcm-stream] pre-roll complete — worklet started');
-                                _pcmStartVideoSync();
+                                _pcmWorkletNode.port.postMessage(msg, [msg.left.buffer, msg.right.buffer]);
                             }
-                            _pcmPrerollGate = true;
+                            // Pre-roll counting
+                            _pcmPrerollSamples += sampleCount;
+                            if (!_pcmPrerollGate && _pcmPrerollSamples >= PCM_PREROLL_SAMPLES) {
+                                _pcmPrerollGate = true;
+                                if (_pcmWorkletNode) {
+                                    _pcmWorkletNode.port.postMessage({ type: 'start' });
+                                    console.log('[pcm-stream] pre-roll complete (' + _pcmPrerollSamples + ' samples) — worklet started');
+                                    _pcmStartVideoSync();
+                                }
+                            }
                         } else if (msg.type === 'syncLost') {
                             console.warn('[pcm-stream] frame sync lost in worker');
                         }
-                        // Note: 'pcm' frames are now sent directly Worker→Worklet via
-                        // MessageChannel and never appear here.
                     };
-
-                    // Wire a direct MessageChannel between the decode Worker and the AudioWorklet
-                    // so that the hot pcm/free traffic bypasses the main thread entirely.
-                    // The main thread only handles infrequent clock/underrun/prerollComplete events.
-                    var _pcmChannel = new MessageChannel();
-                    _pcmWorkletNode.port.postMessage(
-                        { type: 'setDirectPort', port: _pcmChannel.port1 },
-                        [_pcmChannel.port1]
-                    );
-                    _pcmWorker.postMessage(
-                        { type: 'setDirectPort', port: _pcmChannel.port2 },
-                        [_pcmChannel.port2]
-                    );
 
                     // The fetch runs on the main thread so that HTTP→HTTPS mixed-content
                     // rules apply in the page context (warning, not hard-block on Chromecast).
@@ -1261,47 +1280,41 @@
                 });
         }
 
+        var _pcmPrerollGate = false;
+        var _pcmFetchAbort = null;
+
         // Fetch loop runs on the main thread so that HTTP→HTTPS mixed-content is allowed
         // (page context: warning only on Chromecast). Each raw byte chunk is transferred to
         // the decode Worker, which handles frame parsing and Int16→Float32 conversion.
-        //
-        // Uses async/await to avoid per-read Promise chain allocations that drove GC pressure.
-        // Transfers the network buffer directly when it owns its backing ArrayBuffer (common
-        // in Chrome) to avoid an extra slice() allocation on every chunk.
         function _pcmFetchLoop(baseUrl) {
             if (_pcmFetchAbort) { try { _pcmFetchAbort.abort(); } catch (e) {} }
             _pcmFetchAbort = new AbortController();
             if (_pcmWorker) _pcmWorker.postMessage({ type: 'reset' });
 
             fetch(baseUrl + 'cast/pcmlive', { signal: _pcmFetchAbort.signal })
-                .then(async function (resp) {
+                .then(function (resp) {
                     if (!resp.ok) {
                         console.error('[pcm-stream] /cast/pcmlive returned', resp.status);
                         setTimeout(function () { if (_pcmStarted) _pcmFetchLoop(baseUrl); }, 2000);
                         return;
                     }
                     var reader = resp.body.getReader();
-                    try {
-                        while (true) {
-                            var result = await reader.read();
+                    function pump() {
+                        return reader.read().then(function (result) {
                             if (result.done) {
                                 console.log('[pcm-stream] stream ended — reconnecting in 1 s');
                                 setTimeout(function () { if (_pcmStarted) _pcmFetchLoop(baseUrl); }, 1000);
                                 return;
                             }
+                            // Transfer raw bytes to the decode Worker (zero-copy)
                             if (_pcmWorker) {
-                                var v = result.value;
-                                // Transfer directly if the Uint8Array owns its entire backing buffer
-                                // (avoids a slice() allocation — true for the vast majority of reads).
-                                var buf = (v.byteOffset === 0 && v.byteLength === v.buffer.byteLength)
-                                    ? v.buffer
-                                    : v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+                                var buf = result.value.buffer.slice(result.value.byteOffset, result.value.byteOffset + result.value.byteLength);
                                 _pcmWorker.postMessage({ type: 'chunk', data: new Uint8Array(buf) }, [buf]);
                             }
-                        }
-                    } finally {
-                        reader.releaseLock();
+                            return pump();
+                        });
                     }
+                    return pump();
                 })
                 .catch(function (err) {
                     if (err && err.name === 'AbortError') return;
@@ -1363,6 +1376,124 @@
                 var roundedRate = Math.round(rate * 1000);
                 if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 2) {
                     console.log('[pcm-stream] sync: drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
+                    _lastLoggedRate = rate;
+                }
+            }, 500);
+        }
+
+        // ─── CAF WAV Sync mode (caf_wav_sync) ────────────────────────────────────────
+        // CAF plays /live/{hash}.wav via its receiverVideoElement (unmuted, hardware audio).
+        // We run the split_video HLS pipeline as a muted background video and steer its
+        // playbackRate to keep it locked ~1 s behind liveSyncPosition.
+        // No AudioWorklet, no PCM fetch, no PcmBroadcastSink — just video sync.
+        function startCafWavSync(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            if (!video) return;
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[caf-wav-sync] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+
+            // CAF plays audio via /live/{hash}.wav — keep it unmuted (already set by
+            // the LOAD interceptor, but assert here for clarity).
+            var caf = document.getElementById('receiverVideoElement');
+            if (caf) caf.muted = false;
+
+            fetch(baseUrl + 'api/settings')
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .catch(function () { return null; })
+                .then(function (cfg) {
+                    var liveSyncDurationCount       = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 3;
+                    var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0)  ? cfg.hlsMaxLatencySegments  : 6;
+                    var maxBufferLength             = (cfg && cfg.hlsMaxBufferSeconds > 0)    ? Math.min(cfg.hlsMaxBufferSeconds, 6) : 6;
+
+                    _splitVideoHls = new Hls({
+                        lowLatencyMode: false,
+                        liveSyncDurationCount: liveSyncDurationCount,
+                        liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
+                        maxBufferLength: maxBufferLength,
+                        backBufferLength: 0,
+                        // Disable hls.js Worker: in the Cast receiver context the Worker
+                        // runs in a separate V8 isolate which can cause GC pressure. Without
+                        // a Worker, hls.js runs on the main thread — one fewer GC root.
+                        enableWorker: false,
+                        abrEnabled: false,
+                        startLevel: 0,
+                        manifestLoadingMaxRetry: 12,
+                        manifestLoadingRetryDelay: 1000,
+                        manifestLoadingMaxRetryTimeout: 12000,
+                    });
+
+                    _splitVideoHls.loadSource(baseUrl + 'cast/split_video/stream.m3u8');
+                    _splitVideoHls.attachMedia(video);
+
+                    _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                        video.muted = true;
+                        video.style.display = 'block';
+                        var pos = _splitVideoHls.liveSyncPosition;
+                        if (pos != null) { video.currentTime = pos; }
+                        video.play().catch(function (e) { console.warn('[caf-wav-sync] video play() rejected:', e); });
+                        console.log('[caf-wav-sync] video manifest parsed — starting sync loop');
+                        _cafWavSyncVideoSync();
+                    });
+
+                    _splitVideoHls.on(Hls.Events.ERROR, function (evt, data) {
+                        if (!data.fatal) return;
+                        console.error('[caf-wav-sync] video fatal HLS error:', data.type, data.details);
+                        // Don't restart audio — only the video pipeline failed.
+                        // Recreate the HLS player and retry in 3 s.
+                        if (_splitVideoHls) { try { _splitVideoHls.destroy(); } catch (e) {} _splitVideoHls = null; }
+                        if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
+                        setTimeout(function () { if (_hlsStarted) startCafWavSync(baseUrl); }, 3000);
+                    });
+                });
+        }
+
+        // Buffer-level relative sync for caf_wav_sync.
+        // Targets videoBuf = 1.0 s (video currentTime 1 s behind liveSyncPosition).
+        // Identical strategy to _pcmStartVideoSync but without the AudioWorklet guard.
+        function _cafWavSyncVideoSync() {
+            if (_pcmSyncTimer) clearInterval(_pcmSyncTimer);
+            var _lastLoggedRate = 1.0;
+            var _graceUntil = Date.now() + 8000; // ignore first 8 s while HLS latches
+
+            _pcmSyncTimer = setInterval(function () {
+                if (!_splitVideoHls) return;
+                var video = document.getElementById('hls-bg');
+                if (!video || video.paused) return;
+
+                var now = Date.now();
+                if (now < _graceUntil) return;
+
+                var videoSync = _splitVideoHls.liveSyncPosition;
+                if (videoSync == null) return;
+
+                var targetBuf = 1.0;
+                var videoBuf  = videoSync - video.currentTime;
+                var drift     = videoBuf - targetBuf;
+
+                if (Math.abs(drift) > 8.0) {
+                    console.warn('[caf-wav-sync] sync: ignoring anomalous drift=' + (drift * 1000).toFixed(0) + 'ms');
+                    return;
+                }
+
+                if (Math.abs(drift) < 0.40) {
+                    if (video.playbackRate !== 1.0) {
+                        video.playbackRate = 1.0;
+                        console.log('[caf-wav-sync] sync: back in dead zone \u2014 rate=1.0');
+                        _lastLoggedRate = 1.0;
+                    }
+                    return;
+                }
+
+                var rate = 1.0 + Math.max(-0.04, Math.min(0.04, drift * 0.12));
+                video.playbackRate = rate;
+                var roundedRate = Math.round(rate * 1000);
+                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 2) {
+                    console.log('[caf-wav-sync] sync: drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
                     _lastLoggedRate = rate;
                 }
             }, 500);
