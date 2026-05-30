@@ -682,9 +682,15 @@
             // Map the server's codec setting to the hls.js audioPreference fourcc.
             var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
             var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
+            // In test-track mode the audio comes from a static FLAC file whose PTS starts
+            // at 0 and builds up gradually. Doubling liveSyncDurationCount (intended to give
+            // the live WASAPI stream a deep buffer) would push liveSyncPosition to 0 for the
+            // first ~56 s, blocking _audioReady and causing a large startup A/V offset. Use
+            // the same liveSyncDurationCount as video so both streams become ready together.
+            var isTestTrack = (cfg && cfg.isTestTrack === true);
             var audioCfg = Object.assign({}, commonCfg, {
-                liveSyncDurationCount: liveSyncDurationCount * 2,
-                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount * 2,
+                liveSyncDurationCount: isTestTrack ? liveSyncDurationCount : liveSyncDurationCount * 2,
+                liveMaxLatencyDurationCount: isTestTrack ? liveMaxLatencyDurationCount : liveMaxLatencyDurationCount * 2,
                 maxBufferLength: 30,
                 backBufferLength: 4,
                 maxLiveSyncPlaybackRate: 1.0,
@@ -765,9 +771,17 @@
             //   - Dead zone or normal in-range drift outside calibration: never POST
             var _lastLoggedRate = 1.0;  // last emitted rate, to suppress redundant logs
             var _lastTelemetryMs = 0;   // wall-clock ms of last telemetry POST
+            var _seekCooldownUntil = 0; // suppress steering until this timestamp after a hard-seek
             _splitSyncTimer = setInterval(function () {
+                if (audioOnly) return;  // no sync needed in audio-only mode
                 if (!_splitAudioHls || !_splitVideoHls) return;
                 if (audio.paused || video.paused) return;
+
+                // Suppress all steering during the cooldown period after a hard-seek.
+                // The Chromecast takes ~1-2 s to complete an MSE seek; firing another
+                // hard-seek before the previous one finishes causes continuous thrashing.
+                var now = Date.now();
+                if (now < _seekCooldownUntil) return;
 
                 // Use liveSyncPosition as each player's target playback point.
                 // The delta between audio and video liveSyncPosition tells us how far
@@ -783,6 +797,13 @@
                 var videoBuf = videoSync - video.currentTime;
                 var drift = videoBuf - audioBuf;
 
+                // Anomaly guard: liveSyncPosition can spike when HLS.js parses a new
+                // manifest (sequence number reset, etc.). Ignore implausible readings.
+                if (Math.abs(drift) > 8.0) {
+                    console.warn('[split-hls] sync: ignoring anomalous drift=' + (drift * 1000).toFixed(0) + 'ms (liveSyncPosition glitch)');
+                    return;
+                }
+
                 // Large drift (>1s): rate steering (10%) needs 10+ s to recover — hard-seek
                 // before both MSE buffers drain past the live edge.
                 if (Math.abs(drift) > 1.0) {
@@ -791,8 +812,9 @@
                     video.currentTime = targetTime;
                     video.playbackRate = 1.0;
                     _lastLoggedRate = 1.0;
+                    _seekCooldownUntil = now + 2500;  // suppress steering for 2.5 s while seek completes
                     // Hard-seeks are buffer anomalies — always POST regardless of calibration state.
-                    _lastTelemetryMs = Date.now();
+                    _lastTelemetryMs = now;
                     _postSplitTelemetry({
                         driftMs: Math.round(drift * 1000),
                         rate: 1.0,
@@ -839,7 +861,6 @@
 
                 // Throttled telemetry: calibration page gets 1 update/s; outside calibration
                 // only post on notable drift (>500ms) at most every 2s.
-                var now = Date.now();
                 var throttleMs = _sawCalibrationMode ? 1000 : 2000;
                 if (!_sawCalibrationMode && Math.abs(drift) < 0.5) return;
                 if ((now - _lastTelemetryMs) < throttleMs) return;
