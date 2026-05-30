@@ -621,17 +621,25 @@
             fetch(baseUrl + 'api/settings')
                 .then(function (r) { return r.ok ? r.json() : null; })
                 .catch(function () { return null; })
-                .then(function (cfg) { _initSplitHls(baseUrl, video, audio, cfg); });
+                .then(function (cfg) {
+                    if (cfg && cfg.splitHlsAudioOnly) {
+                        video.style.display = 'none';
+                        _initSplitHls(baseUrl, null, audio, cfg);
+                    } else {
+                        _initSplitHls(baseUrl, video, audio, cfg);
+                    }
+                });
         }
 
         function _initSplitHls(baseUrl, video, audio, cfg) {
             var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 7;
             var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 14;
             var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 30;
+            var audioOnly = !!(cfg && cfg.splitHlsAudioOnly);
 
             var videoUrl = baseUrl + 'cast/split_video/stream.m3u8';
             var audioUrl = baseUrl + 'cast/split_audio/stream.m3u8';
-            console.log('[split-hls] starting video:', videoUrl, 'audio:', audioUrl);
+            console.log('[split-hls] starting' + (audioOnly ? ' (audio-only)' : '') + ' video:', videoUrl, 'audio:', audioUrl);
 
             var commonCfg = {
                 lowLatencyMode: false,
@@ -652,12 +660,12 @@
             // live edge, and both players race ahead of liveSyncPosition (negative
             // buffers, zero safety margin for segment delivery jitter).
             var _audioReady = false;
-            var _videoReady = false;
+            var _videoReady = audioOnly;  // audio-only: no video gate needed
 
             function _trySplitStart() {
                 if (!_audioReady || !_videoReady) return;
                 var aSync = _splitAudioHls.liveSyncPosition;
-                var vSync = _splitVideoHls.liveSyncPosition;
+                var vSync = _splitVideoHls ? _splitVideoHls.liveSyncPosition : null;
                 if (aSync != null) {
                     audio.currentTime = aSync;
                     console.log('[split-hls] audio seeking to liveSyncPosition ' + aSync.toFixed(2));
@@ -667,7 +675,7 @@
                     console.log('[split-hls] video seeking to liveSyncPosition ' + vSync.toFixed(2));
                 }
                 audio.play().catch(function (e) { console.warn('[split-hls] audio play() rejected:', e); });
-                video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
+                if (video && !audioOnly) video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
             }
 
             // Audio player (master clock, unmuted)
@@ -713,6 +721,7 @@
             });
 
             // Video player (muted, playbackRate-steered to chase audio)
+            if (!audioOnly) {
             _splitVideoHls = new Hls(commonCfg);
             _splitVideoHls.loadSource(videoUrl);
             _splitVideoHls.attachMedia(video);
@@ -742,6 +751,7 @@
                     setTimeout(function () { startSplitHlsBg(baseUrl); }, 3000);
                 }
             });
+            } // end if (!audioOnly)
 
             // PlaybackRate steering: every 500ms compare the audio and video live-edge
             // latency via EXT-X-PROGRAM-DATE-TIME. Both FFmpeg processes write PDT from
