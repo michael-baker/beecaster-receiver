@@ -763,17 +763,15 @@
             // PlaybackRate steering: every 500ms compare the audio and video live-edge
             // latency via EXT-X-PROGRAM-DATE-TIME. Both FFmpeg processes write PDT from
             // the same wall clock, so comparing PDTs gives the A/V drift. Nudge video
-            // playbackRate to converge on the audio position.            
-            // Telemetry is decoupled from the steering tick to reduce XHR load on CC v2
-          
+            // playbackRate to converge on the audio position.
+            var _lastLoggedRate = 1.0;  // last emitted rate, to suppress redundant logs
+            var _lastTelemetryMs = 0;   // wall-clock ms of last telemetry POST
+            var _seekCooldownUntil = 0; // suppress steering until this timestamp after a hard-seek
             _splitSyncTimer = setInterval(function () {
                 if (audioOnly) return;  // no sync needed in audio-only mode
                 if (!_splitAudioHls || !_splitVideoHls) return;
                 if (audio.paused || video.paused) return;
-
-                // Suppress all steering during the cooldown period after a hard-seek.
-                // The Chromecast takes ~1-2 s to complete an MSE seek; firing another
-                // hard-seek before the previous one finishes causes continuous thrashing.
+                                
                 var now = Date.now();
                 if (now < _seekCooldownUntil) return;
 
