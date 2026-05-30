@@ -1452,33 +1452,88 @@
                 });
         }
 
-        // Buffer-level relative sync for caf_wav_sync.
-        // Targets videoBuf = 1.0 s (video currentTime 1 s behind liveSyncPosition).
-        // Identical strategy to _pcmStartVideoSync but without the AudioWorklet guard.
+        // Audio-clock-driven sync for caf_wav_sync.
+        // Polls /cast/audio-clock to learn the server-side AudioClockTee position (audioMs)
+        // and the epoch (epochMs = AudioClockTee ms when this HTTP client first connected).
+        //
+        // CAF's audio timeline:  cafAudioMs = epochMs + caf.currentTime * 1000
+        // cafBufS  = (audioMs - epochMs) / 1000 - caf.currentTime
+        //          = seconds of audio that have been produced but not yet played by CAF
+        // videoBufS = videoHls.liveSyncPosition - video.currentTime
+        //           = seconds of video that are buffered ahead of currentTime
+        //
+        // drift = videoBufS - cafBufS
+        //   > 0: video is further behind live than audio -> speed video up
+        //   < 0: video is ahead of audio -> slow video down
         function _cafWavSyncVideoSync() {
             if (_pcmSyncTimer) clearInterval(_pcmSyncTimer);
             var _lastLoggedRate = 1.0;
             var _graceUntil = Date.now() + 8000; // ignore first 8 s while HLS latches
+            var _cafEpochMs = 0;
+            var _cafServerMs = 0;
+            var _clockPollActive = false;
+
+            function _pollAudioClock() {
+                if (!_castBaseUrl || _clockPollActive) return;
+                _clockPollActive = true;
+                fetch(_castBaseUrl + 'cast/audio-clock', { cache: 'no-store' })
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .then(function (d) {
+                        if (d) {
+                            _cafEpochMs  = d.epochMs  || 0;
+                            _cafServerMs = d.audioMs  || 0;
+                        }
+                    })
+                    .catch(function () {})
+                    .finally(function () { _clockPollActive = false; });
+            }
 
             _pcmSyncTimer = setInterval(function () {
+                _pollAudioClock();
+
                 if (!_splitVideoHls) return;
                 var video = document.getElementById('hls-bg');
                 if (!video || video.paused) return;
 
                 var now = Date.now();
                 if (now < _graceUntil) return;
+                if (_cafEpochMs === 0 || _cafServerMs === 0) return; // wait for first clock poll
+
+                var caf = document.getElementById('receiverVideoElement');
+                if (!caf) return;
 
                 var videoSync = _splitVideoHls.liveSyncPosition;
                 if (videoSync == null) return;
 
-                var targetBuf = 1.0;
-                var videoBuf  = videoSync - video.currentTime;
-                var drift     = videoBuf - targetBuf;
+                // Seconds of audio produced by the server that CAF has not yet played.
+                var cafBufS   = (_cafServerMs - _cafEpochMs) / 1000 - caf.currentTime;
+                // Seconds of HLS video buffered ahead of currentTime.
+                var videoBufS = videoSync - video.currentTime;
+                var drift     = videoBufS - cafBufS;
 
                 if (Math.abs(drift) > 8.0) {
-                    console.warn('[caf-wav-sync] sync: ignoring anomalous drift=' + (drift * 1000).toFixed(0) + 'ms');
+                    console.warn('[caf-wav-sync] sync: ignoring anomalous drift=' + (drift * 1000).toFixed(0) + 'ms (cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms)');
                     return;
                 }
+
+                if (Math.abs(drift) < 0.40) {
+                    if (video.playbackRate !== 1.0) {
+                        video.playbackRate = 1.0;
+                        console.log('[caf-wav-sync] sync: back in dead zone - rate=1.0');
+                        _lastLoggedRate = 1.0;
+                    }
+                    return;
+                }
+
+                var rate = 1.0 + Math.max(-0.04, Math.min(0.04, drift * 0.12));
+                video.playbackRate = rate;
+                var roundedRate = Math.round(rate * 1000);
+                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 2) {
+                    console.log('[caf-wav-sync] sync: cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
+                    _lastLoggedRate = rate;
+                }
+            }, 500);
+        }
 
                 if (Math.abs(drift) < 0.40) {
                     if (video.playbackRate !== 1.0) {
