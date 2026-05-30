@@ -463,7 +463,7 @@
                 try { _splitAudioHls.destroy(); } catch (e) {}
                 _splitAudioHls = null;
             }
-            video.style.display = 'none';
+            if (video) video.style.display = 'none';
             console.warn('[hls-bg] stream reset — waiting for restart');
         }
 
@@ -682,15 +682,11 @@
             // Map the server's codec setting to the hls.js audioPreference fourcc.
             var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
             var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
-            // In test-track mode the audio comes from a static FLAC file whose PTS starts
-            // at 0 and builds up gradually. Doubling liveSyncDurationCount (intended to give
-            // the live WASAPI stream a deep buffer) would push liveSyncPosition to 0 for the
-            // first ~56 s, blocking _audioReady and causing a large startup A/V offset. Use
-            // the same liveSyncDurationCount as video so both streams become ready together.
-            var isTestTrack = (cfg && cfg.isTestTrack === true);
+            // Audio uses the same liveSyncDurationCount as video so both players target
+            // the same position in the HLS timeline on startup. Diverging values cause
+            // _audioReady to fire much later than _videoReady (blocking playback) and
+            // seeking each player to a different PTS at _trySplitStart (A/V desync).
             var audioCfg = Object.assign({}, commonCfg, {
-                liveSyncDurationCount: isTestTrack ? liveSyncDurationCount : liveSyncDurationCount * 2,
-                liveMaxLatencyDurationCount: isTestTrack ? liveMaxLatencyDurationCount : liveMaxLatencyDurationCount * 2,
                 maxBufferLength: 30,
                 backBufferLength: 4,
                 maxLiveSyncPlaybackRate: 1.0,
