@@ -1242,12 +1242,14 @@
                     _pcmWorker.onmessage = function (e) {
                         var msg = e.data;
                         if (msg.type === 'pcm') {
-                            // Relay to worklet (main thread just bounces the message)
+                            // Capture length before transfer detaches the backing buffers
+                            var sampleCount = msg.left.length;
+                            // Relay to worklet (transfers ownership — zero-copy)
                             if (_pcmWorkletNode) {
                                 _pcmWorkletNode.port.postMessage(msg, [msg.left.buffer, msg.right.buffer]);
                             }
                             // Pre-roll counting
-                            _pcmPrerollSamples += msg.left.length;
+                            _pcmPrerollSamples += sampleCount;
                             if (!_pcmPrerollGate && _pcmPrerollSamples >= PCM_PREROLL_SAMPLES) {
                                 _pcmPrerollGate = true;
                                 if (_pcmWorkletNode) {
