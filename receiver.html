@@ -67,25 +67,25 @@
             cast.framework.messages.Command.QUEUE_PREV
         );
 
-        // Suppress UI updates for preloaded (queued-next) tracks
         playerManager.setMessageInterceptor(
             cast.framework.messages.MessageType.PRELOAD,
             request => request
         );
-
-        // On LOAD: extract MediaBaseUrl from customData and start background video
+            
         playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
             const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
             console.log('[receiver] LOAD interceptor: baseUrl=' + baseUrl);
             if (baseUrl) {
                 _castBaseUrl = baseUrl;
                 _fetchRemoteLogSetting(baseUrl);
+                // Invalidate the sync epoch so the loop does not use a stale value
+                // from the previous track while waiting for the next /cast/audio-clock poll.
+                _epochWallMs    = -1;
+                _videoStartDate = null;
                 // CAF IS the audio source in caf_wav_sync — must remain unmuted.
                 var caf = document.getElementById('receiverVideoElement');
                 if (caf) caf.muted = false;
                 try {
-                    // The HLS video pipeline runs continuously across track changes —
-                    // don't destroy and recreate the player on every LOAD.
                     if (!_splitVideoHls) {
                         _showAudioSyncOverlay();
                         resetBgVideo();
@@ -123,8 +123,7 @@
                 _pauseRevealTimer = null;
                 if (overlay) overlay.style.opacity = '0';
             }, 1500);
-
-            // Notify plugin that CC has entered PAUSED state.
+                        
             if (_castBaseUrl) {
                 fetch(_castBaseUrl + 'cast/ack', {
                     method: 'POST',
@@ -133,21 +132,21 @@
                 }).catch(function () {});
             }
         });
-
-        // On PLAYING (resume): seek video to live edge, fade out overlay.
-        // On initial load _loadSyncActive is true so the overlay stays until the timer fires.
+                
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
             var bg      = document.getElementById('hls-bg');
             var overlay = document.getElementById('pause-overlay');
             if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
             if (bg && _splitVideoHls) {
-                if (_splitVideoHls.liveSyncPosition) {
-                    bg.currentTime = _splitVideoHls.liveSyncPosition;
-                }
+                // Do NOT hard-seek to liveSyncPosition here — that would jump the video
+                // forward by the full HLS latency on every resume, causing a large drift
+                // spike that the sync loop then has to fight against.
+                // Instead: just unpause and let _cafWavSyncVideoSync correct any drift
+                // with a hard-seek to the audio-aligned position within one tick.
                 if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
             }
             if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
-            // Notify plugin that CC has entered PLAYING state.
+            
             if (_castBaseUrl) {
                 fetch(_castBaseUrl + 'cast/ack', {
                     method: 'POST',
@@ -157,7 +156,6 @@
             }
         });
 
-        // Forward next/previous queue jumps back to the plugin
         playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, function (event) {
             var next = event.requestData && event.requestData.jump == 1;
             context.sendCustomMessage(CHANNEL, undefined, {
@@ -185,10 +183,7 @@
         });
 
         context.start(options);
-
-        // Remote logging — gated by the EnableReceiverLog server setting.
-        // Re-fetched on every LOAD so the checkbox in settings takes effect without
-        // restarting the cast session. Off by default — zero HTTP traffic until enabled.
+                
         var _remoteLogEnabled = false;
 
         function _postRemoteLog(entry) {
@@ -248,6 +243,12 @@
         var _calibPollTimer = null;
         var _sawCalibrationMode = false;
 
+        // Module-level sync state — must be reset on every LOAD so the sync loop
+        // does not use a stale epoch from the previous track/session.
+        var _epochWallMs      = -1;  // server UTC ms when CAF connected (caf.currentTime=0)
+        var _videoStartDate   = null; // cached result of video.getStartDate()
+        var _videoStartDateAt = 0;    // wall time when _videoStartDate was last refreshed
+
         function _postSplitTelemetry(data) {
             if (!_castBaseUrl) return;
             try {
@@ -257,9 +258,7 @@
                 xhr.send(JSON.stringify(data));
             } catch(e) { /* never let telemetry break the stream */ }
         }
-
-        // Load overlay: shown immediately on LOAD to cover the HLS video until CAF has
-        // consumed its ~9 s audio pre-buffer. Fades out after 14 s (3 s during calibration).
+                
         function _showAudioSyncOverlay() {
             var overlay = document.getElementById('pause-overlay');
             if (!overlay) return;
@@ -284,8 +283,7 @@
                     }, 14000);
                 });
         }
-
-        // Destroys the HLS video player, clearing all MSE source buffers.
+                
         function resetBgVideo() {
             var video = document.getElementById('hls-bg');
             if (_splitVideoHls) {
@@ -297,10 +295,7 @@
             if (video) { try { video.pause(); } catch (e) {} video.style.display = 'none'; }
             console.log('[receiver] bg video reset — buffers dropped');
         }
-
-        // Polls /cast/state to detect calibration mode transitions.
-        // On start: seeks video to live edge so the calibration display appears promptly.
-        // On end: seeks back to live edge to flush calibration frames.
+                
         function _startCalibrationWatch() {
             if (_calibPollTimer) { clearTimeout(_calibPollTimer); }
             _calibPollTimer = setTimeout(_calibPoll, 1000);
@@ -341,11 +336,7 @@
                     }
                 });
         }
-
-        // ─── CAF WAV Sync mode ────────────────────────────────────────────────────────
-        // CAF plays /cast/caf-audio as its ContentId (raw WAV stream, hardware audio path).
-        // The split_video HLS pipeline runs as a muted background video; its playbackRate
-        // is steered by an audio-clock-driven sync loop to stay locked to CAF's position.
+                
         function startCafWavSync(baseUrl) {
             if (_hlsStarted || !baseUrl) return;
             var video = document.getElementById('hls-bg');
@@ -366,9 +357,7 @@
                 .then(function (cfg) {
                     var liveSyncDurationCount       = (cfg && cfg.hlsLiveSyncSegments > 0)   ? cfg.hlsLiveSyncSegments   : 3;
                     var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
-                    // maxBufferLength must exceed cafBufS (~9 s) so after the initial
-                    // hard-seek the player can sustain the lookback position.
-                    // backBufferLength retains already-played segments so seek-back works.
+                    
                     var maxBufferLength  = 25;
                     var backBufferLength = 20;
 
@@ -377,9 +366,7 @@
                         liveSyncDurationCount: liveSyncDurationCount,
                         liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
                         maxBufferLength: maxBufferLength,
-                        backBufferLength: backBufferLength,
-                        // Disable hls.js Worker: in the Cast receiver context the Worker
-                        // runs in a separate V8 isolate which can cause GC pressure.
+                        backBufferLength: backBufferLength,                        
                         enableWorker: false,
                         abrEnabled: false,
                         startLevel: 0,
@@ -412,67 +399,64 @@
                 });
         }
 
-        // Audio-clock-driven A/V sync for caf_wav_sync.
-        //
-        // CAF buffers ~9 s of WAV audio ahead of its playback position (fixed by the
-        // Chromecast media player; we cannot reduce it).  The HLS video must therefore
-        // also run ~9 s behind its own live edge to stay in sync.
-        //
-        //   cafBufS   = (serverAudioMs - epochMs) / 1000 + wallElapsedSincePoll - caf.currentTime
-        //             = seconds of audio buffered by CAF but not yet played
-        //   videoBufS = liveSyncPosition - video.currentTime
-        //             = seconds of video buffered ahead of currentTime
-        //   drift     = videoBufS - cafBufS
-        //     > 0  video has more buffer than audio  → video is running too close to live edge
-        //     < 0  video has less buffer than audio  → video is ahead of audio
-        //
-        // Strategy:
-        //   |drift| > SEEK_THRESHOLD  → hard-seek video.currentTime to liveSyncPosition - cafBufS
-        //   |drift| > DEAD_ZONE       → gentle rate trim (±8%)
-        //   |drift| < DEAD_ZONE       → rate = 1.0
-        //
-        // Audio-clock is polled on a separate slower timer (every CLOCK_POLL_MS) to
-        // reduce HTTP overhead; the sync loop itself runs at SYNC_TICK_MS.
         function _cafWavSyncVideoSync() {
             if (_syncTimer) clearInterval(_syncTimer);
-            var SYNC_TICK_MS   = 200;   // sync evaluation interval
-            var CLOCK_POLL_MS  = 2000;  // how often to refresh cafBufS from server
-            var SEEK_THRESHOLD = 1.0;   // seconds: hard-seek when drift exceeds this
-            var DEAD_ZONE      = 0.15;  // seconds: no correction within this band
-            var SEEK_COOLDOWN  = 3000;  // ms: suppress seeks for this long after a seek
-            var ANOMALY_CAP    = 60.0;  // seconds: discard readings beyond this (true glitch)
+            var SYNC_TICK_MS   = 100;    // sync evaluation interval (ms)
+            var CLOCK_POLL_MS  = 500;    // audio-clock poll interval (ms)
+            var SEEK_THRESHOLD = 400;    // ms: hard-seek when |drift| exceeds this
+            var DEAD_ZONE      = 40;     // ms: no correction within ±40 ms
+            var RATE_GAIN      = 0.5;    // proportional gain (drift_s → rate delta)
+            var MAX_RATE_DELTA = 0.10;   // ±10 % max rate adjustment
+            var SEEK_COOLDOWN  = 2000;   // ms: suppress seeks for this long after a seek
+            var MAX_RTT_MS     = 300;    // discard poll responses with RTT > this
 
-            var _lastLoggedRate      = 1.0;
-            var _graceUntil          = Date.now() + 8000; // ignore first 8 s while HLS latches
-            var _cafEpochMs          = -1;  // -1 = not yet connected (0 is a valid epoch)
-            var _cafServerMs         = 0;
-            var _lastClockPollAt     = 0;
-            var _cafLastPollReturnMs = 0;   // wall time when last poll response arrived
-            var _clockPollActive     = false;
-            var _lastHardSeekAt      = 0;
+            var _lastLoggedRate   = 1.0;
+            var _graceUntil       = Date.now() + 8000; // ignore first 8 s while HLS latches
+            // _epochWallMs, _videoStartDate, _videoStartDateAt are module-level so the LOAD
+            // interceptor can reset them on every track change without restarting the sync loop.
+            var _lastClockPollAt  = 0;
+            var _clockPollActive  = false;
+            var _lastHardSeekAt   = 0;
 
             function _pollAudioClock() {
                 if (!_castBaseUrl || _clockPollActive) return;
                 _clockPollActive = true;
+                var t0 = Date.now();
                 fetch(_castBaseUrl + 'cast/audio-clock', { cache: 'no-store' })
                     .then(function (r) { return r.ok ? r.json() : null; })
                     .then(function (d) {
-                        if (d) {
-                            // epochMs: server returns -1 until CAF has connected; 0 is a valid epoch
-                            // (CAF connects before the first audio sample is produced).
-                            _cafEpochMs  = (typeof d.epochMs === 'number') ? d.epochMs : -1;
-                            _cafServerMs = d.audioMs  || 0;
-                            _cafLastPollReturnMs = Date.now();
+                        if (!d) return;
+                        var rtt = Date.now() - t0;
+                        if (rtt > MAX_RTT_MS) {
+                            console.warn('[caf-wav-sync] clock poll RTT=' + rtt + 'ms > MAX — discarding');
+                            return;
+                        }
+                        // epochWallMs: -1 until CAF has connected to the audio stream.
+                        if (typeof d.epochWallMs === 'number' && d.epochWallMs >= 0) {
+                            _epochWallMs = d.epochWallMs;
                         }
                     })
                     .catch(function () {})
                     .finally(function () { _clockPollActive = false; });
             }
+         
+            function _getVideoStartDate(video) {
+                var now = Date.now();
+                if (_videoStartDate && (now - _videoStartDateAt) < 10000) return _videoStartDate;
+                if (typeof video.getStartDate === 'function') {
+                    var d = video.getStartDate();
+                    if (d && !isNaN(d.getTime()) && d.getTime() > 0) {
+                        _videoStartDate = d;
+                        _videoStartDateAt = now;
+                    }
+                }
+                return _videoStartDate;
+            }
 
             _syncTimer = setInterval(function () {
                 var now = Date.now();
 
-                // Refresh audio-clock at the slower rate
+                // Refresh audio-clock at the configured rate.
                 if (now - _lastClockPollAt >= CLOCK_POLL_MS) {
                     _lastClockPollAt = now;
                     _pollAudioClock();
@@ -482,64 +466,77 @@
                 var video = document.getElementById('hls-bg');
                 if (!video || video.paused) return;
                 if (now < _graceUntil) return;
-                if (_cafEpochMs < 0 || _cafServerMs === 0) return; // -1 = epoch not yet set
+                if (_epochWallMs < 0) return; // CAF has not connected yet
 
                 var caf = document.getElementById('receiverVideoElement');
-                if (!caf) return;
+                if (!caf || caf.currentTime <= 0) return;
 
-                var videoSync = _splitVideoHls.liveSyncPosition;
-                if (videoSync == null) return;
+                // ── Wall-clock position of what audio is playing right now ──
+                // epochWallMs is the server UTC time when caf.currentTime was 0.
+                var audioWallMs = _epochWallMs + caf.currentTime * 1000;
 
-                // Compensate for stale server clock: _cafServerMs was captured up to
-                // CLOCK_POLL_MS ms ago. Both the hardware audio clock and caf.currentTime
-                // advance at ~1 s/s, so adding the elapsed wall-clock time keeps cafBufS
-                // approximately stable between polls and removes the sawtooth artifact.
-                var wallElapsed = _cafLastPollReturnMs > 0 ? Math.min((now - _cafLastPollReturnMs) / 1000, CLOCK_POLL_MS / 1000 + 1.0) : 0;
-                var cafBufS   = (_cafServerMs - _cafEpochMs) / 1000 + wallElapsed - caf.currentTime;
-                var videoBufS = videoSync - video.currentTime;
-                var drift     = videoBufS - cafBufS;
-
-                // Discard only truly broken readings (liveSyncPosition spike, epoch not set yet)
-                if (cafBufS < 0 || cafBufS > ANOMALY_CAP || Math.abs(drift) > ANOMALY_CAP) {
-                    console.warn('[caf-wav-sync] sync: anomalous reading — cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms drift=' + (drift * 1000).toFixed(0) + 'ms — skipping');
+                // ── Wall-clock position of what video is showing right now ──
+                // getStartDate() returns the Date for currentTime = 0 from EXT-X-PROGRAM-DATE-TIME.
+                var startDate = _getVideoStartDate(video);
+                if (!startDate) {
+                    // PDT not available yet — emit a one-time warning and skip this tick.
+                    if (!_cafWavSyncVideoSync._pdtWarned) {
+                        _cafWavSyncVideoSync._pdtWarned = true;
+                        console.warn('[caf-wav-sync] EXT-X-PROGRAM-DATE-TIME not yet available — waiting for manifest PDT');
+                    }
                     return;
                 }
 
-                // Large drift: hard-seek video to liveSyncPosition - cafBufS
+                var videoWallMs = startDate.getTime() + video.currentTime * 1000;
+
+                // drift > 0: audio is ahead of video → video needs to play faster to catch up
+                // drift < 0: video is ahead of audio → video needs to slow down
+                var drift = audioWallMs - videoWallMs;  // in ms
+
+                // Sanity: discard wild readings (startup transients, stale epoch, NaN)
+                if (!isFinite(drift) || Math.abs(drift) > 30000) {
+                    console.warn('[caf-wav-sync] anomalous drift=' + drift.toFixed(0) + 'ms — audioWall=' + audioWallMs + ' videoWall=' + videoWallMs + ' — skipping');
+                    return;
+                }
+
+                // ── Hard-seek: large drift, outside cooldown ──
                 if (Math.abs(drift) > SEEK_THRESHOLD && (now - _lastHardSeekAt) > SEEK_COOLDOWN) {
-                    var targetTime = videoSync - cafBufS;
-                    // Clamp: stay inside the buffered range; never past the live edge
+                    // targetVideoTime: move video so its PDT wall time matches the audio wall time.
+                    var targetVideoTime = (audioWallMs - startDate.getTime()) / 1000;
+                    // Clamp to buffered range
                     if (video.buffered.length > 0) {
-                        targetTime = Math.max(video.buffered.start(0) + 0.1, targetTime);
+                        var bufStart = video.buffered.start(0) + 0.1;
+                        var bufEnd   = video.buffered.end(video.buffered.length - 1) - 0.1;
+                        targetVideoTime = Math.max(bufStart, Math.min(bufEnd, targetVideoTime));
                     }
-                    targetTime = Math.min(videoSync - 0.2, targetTime);
-                    if (targetTime > 0 && targetTime < videoSync) {
-                        video.currentTime = targetTime;
+                    if (targetVideoTime > 0) {
+                        video.currentTime = targetVideoTime;
                         video.playbackRate = 1.0;
                         _lastHardSeekAt = now;
                         _lastLoggedRate = 1.0;
-                        console.log('[caf-wav-sync] hard-seek: cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms drift=' + (drift * 1000).toFixed(0) + 'ms → seekTo=' + targetTime.toFixed(3));
-                        _postSplitTelemetry({ type: 'caf_seek', cafBufMs: Math.round(cafBufS * 1000), videoBufMs: Math.round(videoBufS * 1000), driftMs: Math.round(drift * 1000), targetTime: targetTime });
+                        _videoStartDate = null; // force PDT re-read after seek
+                        console.log('[caf-wav-sync] hard-seek: drift=' + drift.toFixed(0) + 'ms → seekTo=' + targetVideoTime.toFixed(3) + ' cafT=' + caf.currentTime.toFixed(2));
+                        _postSplitTelemetry({ type: 'caf_seek', driftMs: Math.round(drift), targetTime: targetVideoTime, audioWallMs: Math.round(audioWallMs), videoWallMs: Math.round(videoWallMs) });
                     }
                     return;
                 }
 
-                // Dead zone: no correction
+                // ── Dead zone: no correction ──
                 if (Math.abs(drift) < DEAD_ZONE) {
                     if (video.playbackRate !== 1.0) {
                         video.playbackRate = 1.0;
-                        console.log('[caf-wav-sync] sync: dead zone — rate=1.0');
+                        console.log('[caf-wav-sync] sync: dead zone — rate=1.0 drift=' + drift.toFixed(0) + 'ms');
                         _lastLoggedRate = 1.0;
                     }
                     return;
                 }
 
-                // Small drift: proportional rate trim, capped at ±8%
-                var rate = 1.0 + Math.max(-0.08, Math.min(0.08, drift * 0.2));
+                // ── Rate trim: proportional, capped at ±MAX_RATE_DELTA ──
+                var rate = 1.0 + Math.max(-MAX_RATE_DELTA, Math.min(MAX_RATE_DELTA, (drift / 1000) * RATE_GAIN));
                 video.playbackRate = rate;
                 var roundedRate = Math.round(rate * 1000);
                 if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 3) {
-                    console.log('[caf-wav-sync] sync: cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms drift=' + (drift * 1000).toFixed(0) + 'ms rate=' + rate.toFixed(3));
+                    console.log('[caf-wav-sync] sync: drift=' + drift.toFixed(0) + 'ms rate=' + rate.toFixed(3) + ' cafT=' + caf.currentTime.toFixed(2) + ' vidT=' + video.currentTime.toFixed(2));
                     _lastLoggedRate = rate;
                 }
             }, SYNC_TICK_MS);
