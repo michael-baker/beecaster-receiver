@@ -1487,9 +1487,10 @@
 
             var _lastLoggedRate   = 1.0;
             var _graceUntil       = Date.now() + 8000; // ignore first 8 s while HLS latches
-            var _cafEpochMs       = 0;
+            var _cafEpochMs       = -1;  // -1 = not yet connected (0 is a valid epoch)
             var _cafServerMs      = 0;
             var _lastClockPollAt  = 0;
+            var _cafLastPollReturnMs = 0; // wall time when last poll response arrived
             var _clockPollActive  = false;
             var _lastHardSeekAt   = 0;
 
@@ -1500,8 +1501,11 @@
                     .then(function (r) { return r.ok ? r.json() : null; })
                     .then(function (d) {
                         if (d) {
-                            _cafEpochMs  = d.epochMs  || 0;
+                            // epochMs: server returns -1 until CAF has connected; 0 is a valid epoch
+                            // (CAF connects before the first audio sample is produced).
+                            _cafEpochMs  = (typeof d.epochMs === 'number') ? d.epochMs : -1;
                             _cafServerMs = d.audioMs  || 0;
+                            _cafLastPollReturnMs = Date.now();
                         }
                     })
                     .catch(function () {})
@@ -1521,7 +1525,7 @@
                 var video = document.getElementById('hls-bg');
                 if (!video || video.paused) return;
                 if (now < _graceUntil) return;
-                if (_cafEpochMs === 0 || _cafServerMs === 0) return;
+                if (_cafEpochMs < 0 || _cafServerMs === 0) return; // -1 = epoch not yet set
 
                 var caf = document.getElementById('receiverVideoElement');
                 if (!caf) return;
@@ -1529,7 +1533,12 @@
                 var videoSync = _splitVideoHls.liveSyncPosition;
                 if (videoSync == null) return;
 
-                var cafBufS   = (_cafServerMs - _cafEpochMs) / 1000 - caf.currentTime;
+                // Compensate for stale server clock: _cafServerMs was captured up to
+                // CLOCK_POLL_MS ms ago. Both the hardware audio clock and caf.currentTime
+                // advance at ~1 s/s, so adding the elapsed wall-clock time keeps cafBufS
+                // approximately stable between polls and removes the sawtooth artifact.
+                var wallElapsed = _cafLastPollReturnMs > 0 ? Math.min((now - _cafLastPollReturnMs) / 1000, CLOCK_POLL_MS / 1000 + 1.0) : 0;
+                var cafBufS   = (_cafServerMs - _cafEpochMs) / 1000 + wallElapsed - caf.currentTime;
                 var videoBufS = videoSync - video.currentTime;
                 var drift     = videoBufS - cafBufS;
 
@@ -1552,7 +1561,9 @@
                         video.playbackRate = 1.0;
                         _lastHardSeekAt = now;
                         _lastLoggedRate = 1.0;
-                        console.log('[caf-wav-sync] hard-seek: cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms drift=' + (drift * 1000).toFixed(0) + 'ms → seekTo=' + targetTime.toFixed(3));
+                        var seekMsg = '[caf-wav-sync] hard-seek: cafBuf=' + (cafBufS * 1000).toFixed(0) + 'ms videoBuf=' + (videoBufS * 1000).toFixed(0) + 'ms drift=' + (drift * 1000).toFixed(0) + 'ms → seekTo=' + targetTime.toFixed(3);
+                        console.log(seekMsg);
+                        _postSplitTelemetry({ type: 'caf_seek', cafBufMs: Math.round(cafBufS * 1000), videoBufMs: Math.round(videoBufS * 1000), driftMs: Math.round(drift * 1000), targetTime: targetTime });
                     }
                     return;
                 }
