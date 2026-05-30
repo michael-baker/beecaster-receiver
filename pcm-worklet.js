@@ -10,10 +10,11 @@
  * only needs to accept Float32 regardless of the original bit depth.
  *
  * Design:
- *   - Ring buffer: two Float32Arrays (L + R), capacity RING_FRAMES = 96000 (2 s at 48 kHz)
+ *   - Ring buffer: two Float32Arrays (L + R), capacity RING_FRAMES = 192000 (4 s at 48 kHz)
  *   - writeHead / readHead: sample-index cursors (not bytes)
  *   - Underrun: output silence with a 5 ms (240 sample) linear fade-out to avoid clicks
- *   - Pre-roll: main thread sends 'start' message once 48000 samples are buffered (1 s)
+ *   - Pre-roll: main thread sends 'start' message once 96000 samples are buffered (2 s)
+ *   - On 'start': applies FADE_SAMPLES fade-in to avoid the silence→audio click
  *   - Messages TO main thread: { type: 'underrun' } | { type: 'clock', audioTimeMs, samplesPlayed }
  */
 'use strict';
@@ -35,7 +36,6 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
         // Underrun state
         this._underrun = false;
         this._fadeSamplesLeft = 0;
-        this._fadeGain = 1.0;
 
         // Running sample count for clock messages to main thread
         this._samplesPlayed = 0;
@@ -57,15 +57,14 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
             } else if (msg.type === 'start') {
                 this._started = true;
                 this._underrun = false;
-                this._fadeSamplesLeft = 0;
-                this._fadeGain = 1.0;
+                // Fade in from silence to avoid a click at the silence→audio boundary.
+                this._fadeSamplesLeft = FADE_SAMPLES;
             } else if (msg.type === 'reset') {
                 this._writeHead = 0;
                 this._readHead = 0;
                 this._started = false;
                 this._underrun = false;
                 this._fadeSamplesLeft = 0;
-                this._fadeGain = 1.0;
                 this._samplesPlayed = 0;
                 this._lastClockSamples = 0;
             }
@@ -113,7 +112,6 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
             if (!this._underrun) {
                 this._underrun = true;
                 this._fadeSamplesLeft = FADE_SAMPLES;
-                this._fadeGain = 1.0;
                 this.port.postMessage({ type: 'underrun', ringFill: buffered });
             }
 
@@ -147,7 +145,6 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
             // Recovering from underrun — fade back in over FADE_SAMPLES
             this._underrun = false;
             this._fadeSamplesLeft = FADE_SAMPLES;
-            this._fadeGain = 0.0;
         }
 
         for (let i = 0; i < blockSize; i++) {

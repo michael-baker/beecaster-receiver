@@ -302,7 +302,10 @@
         var _pcmAudioCtx = null;      // AudioContext
         var _pcmWorkletNode = null;   // AudioWorkletNode connected to destination
         var _pcmWorker = null;        // Web Worker running pcm-fetch-worker.js
+        var _pcmWorkerUrl = null;     // Blob URL for inline Worker source (revoked on stop)
+        var _pcmFetchAbort = null;    // AbortController for the active pcmlive fetch
         var _pcmPrerollSamples = 0;   // samples accumulated before starting worklet output
+        var _pcmPrerollGate = false;  // true once pre-roll threshold has been reached this session
         var _pcmLastFrameAudioTimeMs = 0;  // from last frame header
         var _pcmSamplesPlayedAtFrame = 0;  // worklet sample counter at last frame
         var _pcmSamplesPlayed = 0;    // latest sample count from worklet clock message
@@ -1089,8 +1092,6 @@
 
         const PCM_SAMPLE_RATE = 48000;
         const PCM_PREROLL_SAMPLES = 96000; // 2 s pre-roll
-        var _pcmPrerollGate = false;
-        var _pcmWorkerUrl = null; // Blob URL for the inline Worker — revoked on stop
 
         function _pcmStop() {
             if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
@@ -1274,9 +1275,6 @@
                     _pcmStop();
                 });
         }
-
-        var _pcmPrerollGate = false;
-        var _pcmFetchAbort = null;
 
         // Fetch loop runs on the main thread so that HTTP→HTTPS mixed-content is allowed
         // (page context: warning only on Chromecast). Each raw byte chunk is transferred to
