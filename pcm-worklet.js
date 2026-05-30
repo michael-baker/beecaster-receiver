@@ -12,22 +12,22 @@
  *   - Pre-roll: main thread sends 'start' message once the decode Worker reports preroll done
  *   - On 'start': applies FADE_SAMPLES fade-in to avoid the silence→audio click
  *   - Messages TO main thread (port): { type: 'underrun' } | { type: 'clock', ... }
- *   - Messages TO decode Worker (directPort): { type: 'free', left, right } — pool recycle
+ *   - Messages TO decode Worker (directPort): { type: 'free', lefts, rights } — batch pool recycle
  *
  * Performance notes:
- *   - _clockMsg and _freeMsg are pre-allocated and mutated in-place to avoid per-callback
- *     heap allocations, eliminating GC pressure on the audio render thread.
- *   - Ring reads/writes use TypedArray.set() with explicit wrap handling instead of
- *     per-sample JS loops, reducing render-thread CPU usage by ~4×.
- *   - CLOCK_INTERVAL raised to 4096 (~85 ms) — sufficient for A/V rate steering.
- *   - The direct MessageChannel port carries pcm/free traffic at full decode rate,
- *     keeping the main-thread message queue idle during normal playback.
+ *   - Incoming pcm messages are queued in _pendingFrames (O(1) push, no copy, no postMessage).
+ *     process() drains the queue: ring copies via TypedArray.set(), then one batched 'free'
+ *     postMessage per process() call — eliminates the burst-of-messages problem where the
+ *     audio render thread was blocked up to 82ms draining a queue of 10+ frames.
+ *   - _clockMsg is pre-allocated and mutated in-place (no per-call heap allocation).
+ *   - Ring reads/writes use TypedArray.set() with explicit wrap handling.
+ *   - CLOCK_INTERVAL = 4096 (~85 ms) — sufficient for A/V rate steering.
  */
 'use strict';
 
 const RING_FRAMES    = 480000; // 10 s ring buffer at 48 kHz
 const FADE_SAMPLES   = 240;    // 5 ms fade on underrun/start to avoid clicks
-const CLOCK_INTERVAL = 4096;   // post clock every ~85 ms (was 1024/~21 ms)
+const CLOCK_INTERVAL = 4096;   // post clock every ~85 ms
 
 class PcmSinkProcessor extends AudioWorkletProcessor {
     constructor() {
@@ -40,7 +40,7 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
         this._readHead  = 0;
 
         // Underrun / fade state
-        this._underrun       = false;
+        this._underrun        = false;
         this._fadeSamplesLeft = 0;
 
         // Running sample counter for clock messages
@@ -48,18 +48,20 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
         this._lastClockSamples   = 0;
 
         // Clock anchor: timestamp of the last received frame + samples played at that point
-        this._lastFrameAudioTimeMs    = 0;
+        this._lastFrameAudioTimeMs     = 0;
         this._samplesPlayedAtLastFrame = 0;
 
         // Gate: set true when main thread sends { type: 'start' }
         this._started = false;
 
         // Direct MessageChannel port to the decode Worker (set via 'setDirectPort').
-        // pcm messages arrive here; free messages go back here.
-        // Falls back to this.port if the direct port hasn't been wired up yet.
         this._directPort = null;
 
-        // Pre-allocated message objects — mutated and re-posted to avoid GC churn.
+        // Incoming-frame queue: _handlePcm pushes here (O(1), no copy).
+        // _drainPending() in process() consumes it: ring copy + batch free postMessage.
+        this._pendingFrames = [];
+
+        // Pre-allocated clock message — mutated in-place each time it's sent.
         this._clockMsg = {
             type: 'clock',
             audioTimeMs: 0,
@@ -68,57 +70,82 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
             ringFill: 0,
             ringCapacity: RING_FRAMES,
         };
-        this._freeMsg = { type: 'free', left: null, right: null };
+
+        // Reusable arrays for the batch free postMessage built in _drainPending().
+        // These are cleared and refilled each call; no new arrays are allocated.
+        this._freeLefts     = [];
+        this._freeRights    = [];
+        this._freeTransfers = [];
 
         this.port.onmessage = (e) => {
             const msg = e.data;
             if (msg.type === 'pcm') {
-                // Fallback path: pcm arrived via main-thread port (before direct port is wired)
-                this._handlePcm(msg);
+                // Fallback: pcm arrived via main-thread port (before direct port is wired).
+                // Should not happen in normal operation but handled for safety.
+                this._pendingFrames.push(msg);
             } else if (msg.type === 'setDirectPort') {
-                // Wire up the direct Worker↔Worklet channel — hot pcm/free traffic
-                // no longer touches the main thread after this point.
+                // Wire up the direct Worker↔Worklet channel.
                 this._directPort = msg.port;
                 this._directPort.onmessage = (ev) => {
-                    if (ev.data.type === 'pcm') this._handlePcm(ev.data);
+                    // Ultra-fast: just enqueue the frame reference — no copy, no postMessage.
+                    // process() will drain the queue and bulk-free all buffers in one shot.
+                    if (ev.data.type === 'pcm') this._pendingFrames.push(ev.data);
                 };
             } else if (msg.type === 'start') {
-                this._started = true;
-                this._underrun = false;
+                this._started         = true;
+                this._underrun        = false;
                 this._fadeSamplesLeft = FADE_SAMPLES;
             } else if (msg.type === 'reset') {
-                this._writeHead       = 0;
-                this._readHead        = 0;
-                this._started         = false;
-                this._underrun        = false;
-                this._fadeSamplesLeft = 0;
-                this._samplesPlayed   = 0;
+                this._writeHead        = 0;
+                this._readHead         = 0;
+                this._started          = false;
+                this._underrun         = false;
+                this._fadeSamplesLeft  = 0;
+                this._samplesPlayed    = 0;
                 this._lastClockSamples = 0;
+                this._pendingFrames.length = 0;
             }
         };
     }
 
-    // Handle an incoming 'pcm' message: copy into ring, return buffers for pool reuse.
-    _handlePcm(msg) {
-        this._pushChunk(msg.left, msg.right, msg.audioTimeMs);
-        // Return the (now-drained) buffers to the decode Worker for pool reuse.
-        // Use the direct channel when available to avoid a main-thread hop.
+    // Drain all queued pcm frames into the ring, then send ONE batched 'free' message
+    // back to the Worker.  Called at the start of every process() tick.
+    //
+    // Sending one postMessage per process() (instead of one per frame in onmessage)
+    // eliminates the burst where 10+ rapid-fire messages blocked the render thread
+    // for up to 82ms.  In steady state (~10ms frames, ~2.67ms process() period) the
+    // queue has 0–1 entries; no postMessage is sent when the queue is empty.
+    _drainPending() {
+        const n = this._pendingFrames.length;
+        if (n === 0) return;
+
+        const lefts     = this._freeLefts;
+        const rights    = this._freeRights;
+        const transfers = this._freeTransfers;
+        lefts.length = rights.length = transfers.length = 0;
+
+        for (let i = 0; i < n; i++) {
+            const f = this._pendingFrames[i];
+            this._pushChunk(f.left, f.right, f.audioTimeMs);
+            lefts.push(f.left);
+            rights.push(f.right);
+            transfers.push(f.left.buffer, f.right.buffer);
+        }
+        this._pendingFrames.length = 0;
+
+        // Return all consumed buffers to the Worker pool in a single message.
         const replyPort = this._directPort || this.port;
-        this._freeMsg.left  = msg.left;
-        this._freeMsg.right = msg.right;
-        replyPort.postMessage(this._freeMsg, [msg.left.buffer, msg.right.buffer]);
+        replyPort.postMessage({ type: 'free', lefts, rights }, transfers);
     }
 
-    // Bulk-copy left/right chunks into the ring using TypedArray.set() —
-    // avoids per-sample JS operations and the modulo on every iteration.
+    // Bulk-copy left/right chunks into the ring using TypedArray.set() with
+    // explicit wrap handling — avoids per-sample JS and per-iteration modulo.
     _pushChunk(left, right, audioTimeMs) {
-        const n = left.length;
+        const n    = left.length;
         const fill = (this._writeHead - this._readHead + RING_FRAMES) % RING_FRAMES;
-        const available = RING_FRAMES - fill;
-        if (n > available) {
-            // Ring full — advance readHead to make room, discarding the oldest samples.
-            const discard = n - available + 256;
-            this._readHead = (this._readHead + discard) % RING_FRAMES;
+        if (n > RING_FRAMES - fill) {
+            // Ring full — discard oldest samples to make room.
+            this._readHead = (this._readHead + (n - (RING_FRAMES - fill)) + 256) % RING_FRAMES;
         }
 
         const toEnd = RING_FRAMES - this._writeHead;
@@ -128,7 +155,6 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
             this._writeHead += n;
             if (this._writeHead >= RING_FRAMES) this._writeHead = 0;
         } else {
-            // Wrap: two segments
             this._ringL.set(left.subarray(0, toEnd),  this._writeHead);
             this._ringL.set(left.subarray(toEnd),  0);
             this._ringR.set(right.subarray(0, toEnd), this._writeHead);
@@ -144,6 +170,11 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
         const outL = outputs[0][0];
         const outR = outputs[0][1] || outputs[0][0]; // mono fallback
         const blockSize = outL.length; // always 128 on Web Audio
+
+        // Drain any queued frames into the ring (and batch-free their buffers) before
+        // outputting.  This is the only place ring writes happen, ensuring they never
+        // compete with onmessage for execution time on the render thread.
+        this._drainPending();
 
         if (!this._started) {
             outL.fill(0);
@@ -186,7 +217,7 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
         }
 
         if (this._fadeSamplesLeft > 0) {
-            // Fade-in: per-sample gain ramp (only for FADE_SAMPLES ≈ 2 callbacks)
+            // Fade-in: per-sample gain ramp (only active for FADE_SAMPLES ≈ 2 callbacks)
             for (let i = 0; i < blockSize; i++) {
                 const g = 1.0 - (this._fadeSamplesLeft / FADE_SAMPLES);
                 if (this._fadeSamplesLeft > 0) this._fadeSamplesLeft--;
@@ -195,7 +226,7 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
                 this._readHead = (this._readHead + 1) % RING_FRAMES;
             }
         } else {
-            // Fast path: bulk TypedArray copy, no per-sample JS overhead
+            // Fast path: bulk TypedArray copy
             const toEnd = RING_FRAMES - this._readHead;
             if (toEnd >= blockSize) {
                 outL.set(this._ringL.subarray(this._readHead, this._readHead + blockSize));
@@ -203,7 +234,6 @@ class PcmSinkProcessor extends AudioWorkletProcessor {
                 this._readHead += blockSize;
                 if (this._readHead >= RING_FRAMES) this._readHead = 0;
             } else {
-                // Wrap: two segments
                 outL.set(this._ringL.subarray(this._readHead, this._readHead + toEnd));
                 outL.set(this._ringL.subarray(0, blockSize - toEnd), toEnd);
                 outR.set(this._ringR.subarray(this._readHead, this._readHead + toEnd));

@@ -1189,23 +1189,12 @@
 
                     // Worklet port: only clock and underrun messages arrive here.
                     // pcm/free traffic is handled by a direct MessageChannel (see below).
-                    var _pcmTitleNextUpdateMs = 0;
                     _pcmWorkletNode.port.onmessage = function (e) {
                         var msg = e.data;
                         if (msg.type === 'clock') {
                             _pcmLastFrameAudioTimeMs = msg.audioTimeMs;
                             _pcmSamplesPlayedAtFrame = msg.samplesPlayedAtFrame;
                             _pcmSamplesPlayed = msg.samplesPlayed;
-                            // Throttle title updates to ~1/s — avoids layout work at clock rate
-                            if (msg.ringFill !== undefined) {
-                                var now = Date.now();
-                                if (now >= _pcmTitleNextUpdateMs) {
-                                    _pcmTitleNextUpdateMs = now + 1000;
-                                    var fillMs = (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0);
-                                    var capMs  = (msg.ringCapacity / PCM_SAMPLE_RATE * 1000).toFixed(0);
-                                    document.title = 'PCM ring: ' + fillMs + ' / ' + capMs + ' ms';
-                                }
-                            }
                         } else if (msg.type === 'underrun') {
                             var fillMs = msg.ringFill !== undefined ? (msg.ringFill / PCM_SAMPLE_RATE * 1000).toFixed(0) : '?';
                             console.warn('[pcm-stream] AudioWorklet underrun — re-buffering (ring was ' + fillMs + ' ms)');

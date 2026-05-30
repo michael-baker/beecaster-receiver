@@ -65,9 +65,15 @@ self.onmessage = function (e) {
         // and pool recycling (free) arrives here without touching the main thread.
         _directPort = msg.port;
         _directPort.onmessage = function (ev) {
+            // Worklet sends a batched free: { type: 'free', lefts: [...], rights: [...] }
+            // The Float32Array backing buffers have been transferred here — they are
+            // valid at this receiver and can be pushed into the pool for reuse.
             var m = ev.data;
-            if (m.type === 'free' && _pool.length < _poolMax) {
-                _pool.push({ left: m.left, right: m.right });
+            if (m.type === 'free') {
+                var n = m.lefts ? m.lefts.length : 0;
+                for (var i = 0; i < n && _pool.length < _poolMax; i++) {
+                    _pool.push({ left: m.lefts[i], right: m.rights[i] });
+                }
             }
         };
     } else if (msg.type === 'pool') {
