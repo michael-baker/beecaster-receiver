@@ -1118,12 +1118,411 @@
     <script>
     // WASM FLAC audio pipeline for fmp4_split mode.
     // Replaces hls.js + MSE SourceBuffer audio with:
-    //   HLS manifest poll → fetch fMP4 segment → MP4 box demux → libflac.js decode → AudioWorklet
-    // This removes the MSE SourceBuffer from the audio path entirely, eliminating the
-    // bufferFullError that caused buffering glitches on CC v2 under FLAC.
+    //   Web Worker: HLS manifest poll → fetch fMP4 segment → MP4 demux → libflac.js WASM decode
+    //   Main thread: receive Float32 PCM via postMessage → relay to AudioWorklet ring buffer
+    // Running fetch + decode in a Worker means zero main-thread CPU from FLAC work.
+    // This removes the MSE SourceBuffer from the audio path entirely, eliminating
+    // bufferFullError glitches on CC v2 under FLAC.
     (function () {
-        // AudioWorklet processor source — embedded as a blob URL so no extra file is needed.
+
+        // AudioWorklet processor — embedded as a blob URL; no extra file needed.
         var _WORKLET_SRC = [
+            'class FlacWorkletProcessor extends AudioWorkletProcessor {',
+            '    constructor() {',
+            '        super();',
+            '        this._qL = []; this._qR = [];',
+            '        this._curL = null; this._curR = null; this._curOff = 0;',
+            '        this.port.onmessage = function(e) {',
+            '            if (e.data.type === "pcm") {',
+            '                this._qL.push(e.data.left);',
+            '                this._qR.push(e.data.right);',
+            '            }',
+            '        }.bind(this);',
+            '    }',
+            '    process(inputs, outputs) {',
+            '        var outL = outputs[0][0], outR = outputs[0][1] || outputs[0][0];',
+            '        var needed = outL.length, filled = 0;',
+            '        while (filled < needed) {',
+            '            if (!this._curL) {',
+            '                if (!this._qL.length) break;',
+            '                this._curL = this._qL.shift();',
+            '                this._curR = this._qR.shift();',
+            '                this._curOff = 0;',
+            '            }',
+            '            var take = Math.min(this._curL.length - this._curOff, needed - filled);',
+            '            outL.set(this._curL.subarray(this._curOff, this._curOff + take), filled);',
+            '            outR.set(this._curR.subarray(this._curOff, this._curOff + take), filled);',
+            '            filled += take; this._curOff += take;',
+            '            if (this._curOff >= this._curL.length) { this._curL = null; this._curR = null; }',
+            '        }',
+            '        if (filled < needed)',
+            '            this.port.postMessage({ type: "underrun", missing: needed - filled });',
+            '        if ((currentFrame & 8191) === 0)',
+            '            this.port.postMessage({ type: "clock", frame: currentFrame });',
+            '        return true;',
+            '    }',
+            '}',
+            'registerProcessor("flac-worklet-processor", FlacWorkletProcessor);',
+        ].join('\n');
+
+        var _workletBlobUrl = null;
+        function _getWorkletUrl() {
+            if (!_workletBlobUrl)
+                _workletBlobUrl = URL.createObjectURL(new Blob([_WORKLET_SRC], { type: 'application/javascript' }));
+            return _workletBlobUrl;
+        }
+
+        // Web Worker source — runs the entire fetch/demux/decode pipeline off the main thread.
+        // importScripts loads libflac.js from the same CDN URL as the page.
+        // Posted messages to the worker:
+        //   { type: 'start', audioUrl, segBase, libflacUrl, liveSyncCount }
+        //   { type: 'stop' }
+        // Messages from the worker:
+        //   { type: 'sampleRate', value }       — after init segment parsed
+        //   { type: 'pcm', left, right }         — transferable Float32Arrays per decoded frame
+        //   { type: 'ready' }                    — first media segment decoded, pipeline hot
+        //   { type: 'log', level, msg }          — console relay
+        //   { type: 'error', msg }               — fatal error, should fall back to hls.js
+        var _WORKER_SRC = [
+            '"use strict";',
+            'var _stopped = false, _decoder = 0, _lastSeq = -1, _initFetched = false;',
+            'var _liveSyncCount = 3, _audioUrl = "", _segBase = "";',
+            'var _inputBuf = null, _inputPos = 0, _pcmOut = [];',
+            'var _signalledReady = false;',
+            'var _fetchQueue = [], _fetching = false;',
+            'var _pollTimer = null;',
+            '',
+            'function _log(level, msg) { self.postMessage({ type: "log", level: level, msg: msg }); }',
+            '',
+            'function _findBoxes(buffer, type) {',
+            '    var view = new DataView(buffer), results = [], offset = 0;',
+            '    while (offset + 8 <= buffer.byteLength) {',
+            '        var sz = view.getUint32(offset, false);',
+            '        if (sz < 8 || offset + sz > buffer.byteLength) break;',
+            '        var t = String.fromCharCode(view.getUint8(offset+4), view.getUint8(offset+5),',
+            '                                    view.getUint8(offset+6), view.getUint8(offset+7));',
+            '        if (t === type) results.push({ start: offset + 8, size: sz - 8 });',
+            '        offset += sz;',
+            '    }',
+            '    return results;',
+            '}',
+            '',
+            'function _extractMdat(buffer) {',
+            '    var boxes = _findBoxes(buffer, "mdat");',
+            '    if (!boxes.length) return null;',
+            '    var total = 0;',
+            '    for (var i = 0; i < boxes.length; i++) total += boxes[i].size;',
+            '    var out = new Uint8Array(total), pos = 0;',
+            '    for (var i = 0; i < boxes.length; i++) {',
+            '        out.set(new Uint8Array(buffer, boxes[i].start, boxes[i].size), pos);',
+            '        pos += boxes[i].size;',
+            '    }',
+            '    return out;',
+            '}',
+            '',
+            'function _extractDfLa(initBuffer) {',
+            '    var view = new DataView(initBuffer);',
+            '    for (var i = 0; i + 12 <= initBuffer.byteLength; i++) {',
+            '        if (view.getUint8(i+4) === 0x64 && view.getUint8(i+5) === 0x66 &&',
+            '            view.getUint8(i+6) === 0x4C && view.getUint8(i+7) === 0x61) {',
+            '            var sz = view.getUint32(i, false);',
+            '            if (sz < 12 || i + sz > initBuffer.byteLength) continue;',
+            '            return new Uint8Array(initBuffer, i + 12, sz - 12);',
+            '        }',
+            '    }',
+            '    return null;',
+            '}',
+            '',
+            'function _dfLaSampleRate(b) {',
+            '    if (b.length < 17) return 44100;',
+            '    return (b[14] << 12) | (b[15] << 4) | (b[16] >> 4);',
+            '}',
+            '',
+            'function _buildFlacHeader(dfLa) {',
+            '    var buf = new Uint8Array(4 + dfLa.length);',
+            '    buf[0]=0x66; buf[1]=0x4C; buf[2]=0x61; buf[3]=0x43;',
+            '    buf.set(dfLa, 4);',
+            '    buf[4] |= 0x80;',
+            '    return buf;',
+            '}',
+            '',
+            'function _parseM3u8(text) {',
+            '    var lines = text.split("\\n"), seqBase = 0, targetDuration = 2;',
+            '    var initUrl = null, segments = [];',
+            '    for (var i = 0; i < lines.length; i++) {',
+            '        var ln = lines[i].trim();',
+            '        if (!ln) continue;',
+            '        if (ln.startsWith("#EXT-X-MEDIA-SEQUENCE:")) seqBase = parseInt(ln.split(":")[1], 10);',
+            '        else if (ln.startsWith("#EXT-X-TARGETDURATION:")) targetDuration = parseFloat(ln.split(":")[1]);',
+            '        else if (ln.startsWith("#EXT-X-MAP:")) { var m = ln.match(/URI="([^"]+)"/); if (m) initUrl = _segBase + m[1]; }',
+            '        else if (!ln.startsWith("#")) segments.push({ seq: seqBase + segments.length, url: _segBase + ln });',
+            '    }',
+            '    return { targetDuration: targetDuration, initUrl: initUrl, segments: segments };',
+            '}',
+            '',
+            'function _readCb(nbytes, bufPtr, bwPtr) {',
+            '    if (!_inputBuf) return 1;',
+            '    var avail = _inputBuf.length - _inputPos;',
+            '    if (avail <= 0) return 1;',
+            '    var n = Math.min(nbytes, avail);',
+            '    Flac.HEAPU8.set(_inputBuf.subarray(_inputPos, _inputPos + n), bufPtr);',
+            '    new Int32Array(Flac.HEAPU8.buffer, bwPtr, 1)[0] = n;',
+            '    _inputPos += n;',
+            '    return 0;',
+            '}',
+            '',
+            'function _writeCb(frame, buffer) {',
+            '    if (!buffer || !buffer.length) return;',
+            '    var bps   = frame.header.bits_per_sample || 16;',
+            '    var scale = 1.0 / (1 << (bps - 1));',
+            '    var n  = buffer[0].length;',
+            '    var L  = new Float32Array(n), R = new Float32Array(n);',
+            '    var s0 = buffer[0], s1 = buffer.length > 1 ? buffer[1] : buffer[0];',
+            '    for (var i = 0; i < n; i++) { L[i] = s0[i] * scale; R[i] = s1[i] * scale; }',
+            '    _pcmOut.push({ L: L, R: R });',
+            '}',
+            '',
+            'function _errCb(code, msg) { _log("error", "[wasm-worker] FLAC decode error " + code + " " + msg); }',
+            '',
+            'function _decode(bytes) {',
+            '    _inputBuf = bytes; _inputPos = 0; _pcmOut = [];',
+            '    while (_inputPos < _inputBuf.length && Flac.FLAC__stream_decoder_process_single(_decoder)) {}',
+            '    _inputBuf = null;',
+            '    return _pcmOut.splice(0);',
+            '}',
+            '',
+            'function _drainQueue() {',
+            '    if (_fetching || !_fetchQueue.length || _stopped) return;',
+            '    var item = _fetchQueue.shift();',
+            '    _fetching = true;',
+            '    fetch(item.url).then(function(r) { return r.arrayBuffer(); })',
+            '        .then(function(buf) {',
+            '            if (_stopped) return;',
+            '            item.isInit ? _onInit(buf) : _onMedia(buf);',
+            '            _fetching = false; _drainQueue();',
+            '        })',
+            '        .catch(function(e) {',
+            '            _log("warn", "[wasm-worker] fetch failed: " + item.url + " " + e);',
+            '            _fetching = false; _drainQueue();',
+            '        });',
+            '}',
+            'function _enqueue(url, isInit) { _fetchQueue.push({ url: url, isInit: !!isInit }); _drainQueue(); }',
+            '',
+            'function _onInit(buf) {',
+            '    var dfLa = _extractDfLa(buf);',
+            '    if (!dfLa) { self.postMessage({ type: "error", msg: "dfLa box not found in init segment" }); return; }',
+            '    var sr = _dfLaSampleRate(dfLa);',
+            '    _log("log", "[wasm-worker] init segment: sampleRate=" + sr);',
+            '    self.postMessage({ type: "sampleRate", value: sr });',
+            '    _decode(_buildFlacHeader(dfLa));',
+            '}',
+            '',
+            'function _onMedia(buf) {',
+            '    var mdat = _extractMdat(buf);',
+            '    if (!mdat || !mdat.length) { _log("warn", "[wasm-worker] empty mdat in segment"); return; }',
+            '    var chunks = _decode(mdat);',
+            '    for (var i = 0; i < chunks.length; i++)',
+            '        self.postMessage({ type: "pcm", left: chunks[i].L, right: chunks[i].R },',
+            '                         [chunks[i].L.buffer, chunks[i].R.buffer]);',
+            '    if (!_signalledReady && chunks.length) {',
+            '        _signalledReady = true;',
+            '        self.postMessage({ type: "ready" });',
+            '    }',
+            '}',
+            '',
+            'function _pollManifest() {',
+            '    if (_stopped) return;',
+            '    fetch(_audioUrl)',
+            '        .then(function(r) { return r.text(); })',
+            '        .then(function(text) {',
+            '            if (_stopped) return;',
+            '            var m = _parseM3u8(text);',
+            '            if (!_initFetched && m.initUrl) { _initFetched = true; _enqueue(m.initUrl, true); }',
+            '            if (_lastSeq < 0 && m.segments.length > 0) {',
+            '                var si = Math.max(0, m.segments.length - _liveSyncCount);',
+            '                if (si > 0) _lastSeq = m.segments[si - 1].seq;',
+            '            }',
+            '            for (var i = 0; i < m.segments.length; i++) {',
+            '                if (m.segments[i].seq > _lastSeq) {',
+            '                    _lastSeq = m.segments[i].seq;',
+            '                    _enqueue(m.segments[i].url, false);',
+            '                }',
+            '            }',
+            // Poll at 40% of segment duration (was 50%) — discover segments ~0.4 segments after they land.
+            '            _pollTimer = setTimeout(_pollManifest, Math.max(200, m.targetDuration * 400));',
+            '        })',
+            '        .catch(function(e) {',
+            '            if (_stopped) return;',
+            '            _pollTimer = setTimeout(_pollManifest, 2000);',
+            '        });',
+            '}',
+            '',
+            'self.onmessage = function(e) {',
+            '    if (e.data.type === "start") {',
+            '        _audioUrl = e.data.audioUrl; _segBase = e.data.segBase;',
+            '        _liveSyncCount = e.data.liveSyncCount || 3;',
+            '        importScripts(e.data.libflacUrl);',
+            '        function _go() {',
+            '            _decoder = Flac.create_libflac_decoder(false);',
+            '            if (!_decoder) { self.postMessage({ type: "error", msg: "create_libflac_decoder failed" }); return; }',
+            '            var st = Flac.init_decoder_stream(_decoder, _readCb, _writeCb, _errCb, null, false);',
+            '            if (st !== 0) { self.postMessage({ type: "error", msg: "FLAC decoder init failed status=" + st }); return; }',
+            '            _pollManifest();',
+            '        }',
+            '        if (Flac.isReady()) { _go(); }',
+            '        else { var _prev = Flac.onready; Flac.onready = function() { if (_prev) _prev(); _go(); }; }',
+            '    } else if (e.data.type === "stop") {',
+            '        _stopped = true;',
+            '        if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }',
+            '        if (_decoder) {',
+            '            try { Flac.FLAC__stream_decoder_finish(_decoder); } catch(e) {}',
+            '            try { Flac.FLAC__stream_decoder_delete(_decoder); } catch(e) {}',
+            '            _decoder = 0;',
+            '        }',
+            '    }',
+            '};',
+        ].join('\n');
+
+        var _workerBlobUrl = null;
+        function _getWorkerUrl() {
+            if (!_workerBlobUrl)
+                _workerBlobUrl = URL.createObjectURL(new Blob([_WORKER_SRC], { type: 'application/javascript' }));
+            return _workerBlobUrl;
+        }
+
+        // Pipeline globals — set by _wasmAudioStart, cleared by _wasmAudioStop.
+        window._wasmAudio = null;
+
+        window._wasmAudioStop = function () {
+            var w = window._wasmAudio;
+            if (!w) return;
+            window._wasmAudio = null;
+            w.stopped = true;
+            if (w.worker) { try { w.worker.postMessage({ type: 'stop' }); w.worker.terminate(); } catch (e) {} w.worker = null; }
+            if (w.workletNode) { try { w.workletNode.disconnect(); } catch (e) {} w.workletNode = null; }
+            if (w.gainNode)    { try { w.gainNode.disconnect();    } catch (e) {} w.gainNode    = null; }
+            if (w.audioCtx)    { try { w.audioCtx.close();         } catch (e) {} w.audioCtx    = null; }
+            console.log('[wasm-audio] pipeline stopped');
+        };
+
+        window._wasmAudioStart = function (baseUrl, cfg, onReady) {
+            if (typeof Worker === 'undefined') {
+                console.warn('[wasm-audio] Web Worker not available — falling back to hls.js');
+                if (typeof onReady === 'function') onReady(null);
+                return;
+            }
+            _initWasmPipeline(baseUrl, cfg, onReady);
+        };
+
+        function _initWasmPipeline(baseUrl, cfg, onReady) {
+            if (window._wasmAudio) window._wasmAudioStop();
+
+            var liveSyncCount = (cfg && cfg.hlsLiveSyncSegments > 0) ? cfg.hlsLiveSyncSegments : 3;
+            var audioUrl = baseUrl + 'cast/split_audio/stream.m3u8';
+            var segBase  = baseUrl + 'cast/split_audio/';
+            // CDN URL used by the page — the Worker uses importScripts() to load the same build.
+            var libflacUrl = 'https://cdn.jsdelivr.net/npm/libflac.js@5.4.0/dist/libflac.min.js';
+
+            var w = {
+                stopped: false, worker: null, audioCtx: null, gainNode: null, workletNode: null,
+                sampleRate: 44100, ready: false,
+                startAudioCtxTime: 0,
+                startVideoTime: 0,
+                lastWorkletFrame: 0,
+            };
+            window._wasmAudio = w;
+
+            // PCM delivered before the AudioWorklet finishes addModule().
+            var _pendingPcm = [], _workletReady = false;
+
+            function _sendToWorklet(msg) {
+                w.workletNode.port.postMessage(msg, [msg.left.buffer, msg.right.buffer]);
+            }
+
+            function _onPcm(msg) {
+                if (!_workletReady) {
+                    _pendingPcm.push(msg);
+                    if (_pendingPcm.length > 128) _pendingPcm.shift(); // cap at ~3 s
+                    return;
+                }
+                _sendToWorklet(msg);
+            }
+
+            function _createAudioContext(sampleRate) {
+                try {
+                    w.audioCtx = new AudioContext({ latencyHint: 'playback', sampleRate: sampleRate });
+                } catch (e) {
+                    console.error('[wasm-audio] AudioContext creation failed:', e);
+                    if (typeof onReady === 'function') onReady(null);
+                    return;
+                }
+                w.audioCtx.audioWorklet.addModule(_getWorkletUrl())
+                    .then(function () {
+                        w.workletNode = new AudioWorkletNode(w.audioCtx, 'flac-worklet-processor', {
+                            numberOfOutputs: 1, outputChannelCount: [2],
+                        });
+                        w.workletNode.port.onmessage = function (e) {
+                            if (e.data.type === 'underrun')
+                                console.warn('[wasm-audio] worklet underrun:', e.data.missing, 'frames');
+                            else if (e.data.type === 'clock')
+                                w.lastWorkletFrame = e.data.frame;
+                        };
+                        w.gainNode = w.audioCtx.createGain();
+                        w.gainNode.gain.value = 1.0;
+                        w.workletNode.connect(w.gainNode);
+                        w.gainNode.connect(w.audioCtx.destination);
+                        _workletReady = true;
+                        var flushed = _pendingPcm.splice(0);
+                        for (var i = 0; i < flushed.length; i++) _sendToWorklet(flushed[i]);
+                        if (flushed.length)
+                            console.log('[wasm-audio] worklet ready — flushed ' + flushed.length + ' pending PCM chunks');
+                        else
+                            console.log('[wasm-audio] AudioWorklet ready, sampleRate=' + w.audioCtx.sampleRate);
+                        // If the worker already signalled ready before the worklet was up, signal now.
+                        if (!w.ready && flushed.length) { w.ready = true; if (typeof onReady === 'function') onReady(w); }
+                    })
+                    .catch(function (e) {
+                        console.error('[wasm-audio] AudioWorklet addModule failed:', e);
+                        if (typeof onReady === 'function') onReady(null);
+                    });
+            }
+
+            w.worker = new Worker(_getWorkerUrl());
+            w.worker.onmessage = function (e) {
+                if (w.stopped) return;
+                var d = e.data;
+                if (d.type === 'sampleRate') {
+                    w.sampleRate = d.value;
+                    _createAudioContext(d.value);
+                } else if (d.type === 'pcm') {
+                    _onPcm({ type: 'pcm', left: d.left, right: d.right });
+                } else if (d.type === 'ready') {
+                    if (!w.ready && _workletReady) {
+                        w.ready = true;
+                        console.log('[wasm-audio] pipeline ready — signalling host');
+                        if (typeof onReady === 'function') onReady(w);
+                    }
+                } else if (d.type === 'error') {
+                    console.error('[wasm-audio] worker error:', d.msg);
+                    if (!w.ready && typeof onReady === 'function') onReady(null);
+                } else if (d.type === 'log') {
+                    if (d.level === 'error') console.error(d.msg);
+                    else if (d.level === 'warn') console.warn(d.msg);
+                    else console.log(d.msg);
+                }
+            };
+            w.worker.onerror = function (e) {
+                console.error('[wasm-audio] worker uncaught error:', e.message);
+                if (!w.ready && typeof onReady === 'function') onReady(null);
+            };
+            w.worker.postMessage({ type: 'start', audioUrl: audioUrl, segBase: segBase,
+                                   libflacUrl: libflacUrl, liveSyncCount: liveSyncCount });
+        }
+
+    })();
+    </script>
+</body>
+</html>
             'class FlacWorkletProcessor extends AudioWorkletProcessor {',
             '    constructor() {',
             '        super();',
