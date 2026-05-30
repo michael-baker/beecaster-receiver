@@ -9,7 +9,7 @@
     <!-- mpegts.js: MSE-based MPEG-TS player for the mpegts streaming mode -->
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
     <!-- libflac.js: WASM FLAC decoder used by the WASM audio pipeline (fmp4_split mode) -->
-    <script src="https://cdn.jsdelivr.net/npm/libflac.js@6/dist/libflac.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/libflac.js@5.4.0/dist/libflac.min.js"></script>
     <style>
         body {
             overflow: hidden;
@@ -1323,13 +1323,15 @@
                 return 0; // CONTINUE
             }
 
-            function _writeCb(frame, buf, channels) {
-                if (!channels || !channels.length) return;
+            // v5 write callback: (frame, buffer, crc)
+            // buffer is Int32Array[] — one Int32Array per channel.
+            function _writeCb(frame, buffer) {
+                if (!buffer || !buffer.length) return;
                 var bps   = frame.header.bits_per_sample || 16;
                 var scale = 1.0 / (1 << (bps - 1));
-                var n     = channels[0].length;
+                var n     = buffer[0].length;
                 var L = new Float32Array(n), R = new Float32Array(n);
-                var s0 = channels[0], s1 = channels.length > 1 ? channels[1] : channels[0];
+                var s0 = buffer[0], s1 = buffer.length > 1 ? buffer[1] : buffer[0];
                 for (var i = 0; i < n; i++) { L[i] = s0[i] * scale; R[i] = s1[i] * scale; }
                 _pcmOut.push({ L: L, R: R });
             }
