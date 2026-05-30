@@ -1093,8 +1093,8 @@
 
         function _pcmStop() {
             if (_pcmSyncTimer) { clearInterval(_pcmSyncTimer); _pcmSyncTimer = null; }
+            if (_pcmFetchAbort) { try { _pcmFetchAbort.abort(); } catch (e) {} _pcmFetchAbort = null; }
             if (_pcmWorker) {
-                try { _pcmWorker.postMessage({ type: 'stop' }); } catch (e) {}
                 try { _pcmWorker.terminate(); } catch (e) {}
                 _pcmWorker = null;
             }
@@ -1201,7 +1201,8 @@
                     console.log('[pcm-stream] AudioWorklet ready — starting PCM Worker');
                     if (_pcmAudioCtx.state === 'suspended') _pcmAudioCtx.resume().catch(function () {});
 
-                    // Start the fetch Worker — completely off the main thread
+                    // Create the decode Worker (served from GitHub Pages — same HTTPS origin).
+                    // The Worker only does frame parsing + Int16→Float32; it never fetches.
                     _pcmWorker = new Worker('pcm-fetch-worker.js');
                     _pcmWorker.onmessage = function (e) {
                         var msg = e.data;
@@ -1222,15 +1223,13 @@
                             }
                         } else if (msg.type === 'syncLost') {
                             console.warn('[pcm-stream] frame sync lost in worker');
-                        } else if (msg.type === 'ended') {
-                            console.log('[pcm-stream] stream ended — worker reconnecting');
-                        } else if (msg.type === 'error') {
-                            console.error('[pcm-stream] /cast/pcmlive returned', msg.status);
-                        } else if (msg.type === 'fetchError') {
-                            console.warn('[pcm-stream] worker fetch error:', msg.message);
                         }
                     };
-                    _pcmWorker.postMessage({ type: 'start', url: baseUrl + 'cast/pcmlive' });
+
+                    // The fetch runs on the main thread so that HTTP→HTTPS mixed-content
+                    // rules apply in the page context (warning, not hard-block on Chromecast).
+                    // Raw bytes are piped to the Worker for parsing and decoding.
+                    _pcmFetchLoop(baseUrl);
                     // Sync timer starts after pre-roll completes (see Worker onmessage above)
                 })
                 .catch(function (err) {
@@ -1239,8 +1238,48 @@
                 });
         }
 
-        // Frame parser state (across fetch chunks)
-        var _pcmPrerollGate = false; // declaration kept for reference; defined above
+        var _pcmPrerollGate = false;
+        var _pcmFetchAbort = null;
+
+        // Fetch loop runs on the main thread so that HTTP→HTTPS mixed-content is allowed
+        // (page context: warning only on Chromecast). Each raw byte chunk is transferred to
+        // the decode Worker, which handles frame parsing and Int16→Float32 conversion.
+        function _pcmFetchLoop(baseUrl) {
+            if (_pcmFetchAbort) { try { _pcmFetchAbort.abort(); } catch (e) {} }
+            _pcmFetchAbort = new AbortController();
+            if (_pcmWorker) _pcmWorker.postMessage({ type: 'reset' });
+
+            fetch(baseUrl + 'cast/pcmlive', { signal: _pcmFetchAbort.signal })
+                .then(function (resp) {
+                    if (!resp.ok) {
+                        console.error('[pcm-stream] /cast/pcmlive returned', resp.status);
+                        setTimeout(function () { if (_pcmStarted) _pcmFetchLoop(baseUrl); }, 2000);
+                        return;
+                    }
+                    var reader = resp.body.getReader();
+                    function pump() {
+                        return reader.read().then(function (result) {
+                            if (result.done) {
+                                console.log('[pcm-stream] stream ended — reconnecting in 1 s');
+                                setTimeout(function () { if (_pcmStarted) _pcmFetchLoop(baseUrl); }, 1000);
+                                return;
+                            }
+                            // Transfer raw bytes to the decode Worker (zero-copy)
+                            if (_pcmWorker) {
+                                var buf = result.value.buffer.slice(result.value.byteOffset, result.value.byteOffset + result.value.byteLength);
+                                _pcmWorker.postMessage({ type: 'chunk', data: new Uint8Array(buf) }, [buf]);
+                            }
+                            return pump();
+                        });
+                    }
+                    return pump();
+                })
+                .catch(function (err) {
+                    if (err && err.name === 'AbortError') return;
+                    console.warn('[pcm-stream] fetch error:', err);
+                    setTimeout(function () { if (_pcmStarted) _pcmFetchLoop(baseUrl); }, 2000);
+                });
+        }
 
         // A/V sync: every 500 ms steer video.playbackRate to keep video near its live-sync
         // target. Both audio (PCM ring) and video (HLS) are live streams; we simply maintain
