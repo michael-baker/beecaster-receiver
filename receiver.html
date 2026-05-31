@@ -76,9 +76,7 @@
         // ── Module state ───────────────────────────────────────────────────────
         var _baseUrl      = '';
         var _hls          = null;   // single hls.js instance for muxed fMP4 stream
-        var _benchTimer   = null;   // setInterval handle for decode benchmark
         var _stallTimer   = null;   // stall recovery timeout
-        var _remoteLogEnabled = false;
 
         // ── LOAD interceptor ────────────────────────────────────────────────────
         playerManager.setMessageInterceptor(
@@ -87,9 +85,7 @@
                 var custom = request.media && request.media.customData;
                 _baseUrl = (custom && custom.MediaBaseUrl) || '';
                 var mode = (custom && custom.HlsStreamingMode) || '';
-                console.log('[receiver] LOAD mode=' + mode + ' baseUrl=' + _baseUrl);
 
-                // Keep the CAF protocol vehicle muted — /live WAV must be silent.
                 var cafEl = document.getElementById('caf-el');
                 if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
 
@@ -108,25 +104,19 @@
 
         // ── CAF PAUSE ──────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
-            console.log('[receiver] PAUSE');
             _showOverlay(1);
             var p = document.getElementById('player');
             if (p && !p.paused) p.pause();
             _postAck('PAUSED');
-            // Fade to reveal paused frame after 1.5 s.
             setTimeout(function () { _showOverlay(0); }, 1500);
         });
 
         // ── CAF PLAYING ────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
-            console.log('[receiver] PLAYING');
-            // Re-enforce mute on ghost element (CAF resets muted on PLAYING).
             var cafEl = document.getElementById('caf-el');
             if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
             var p = document.getElementById('player');
-            if (p && p.paused) p.play().catch(function (e) {
-                console.warn('[receiver] player.play() rejected:', e);
-            });
+            if (p && p.paused) p.play().catch(function () {});
             _postAck('PLAYING');
         });
 
@@ -156,13 +146,6 @@
         options.maxInactivity = 3600;
         options.mediaElement = document.getElementById('caf-el');
 
-        window.onerror = function (msg, src, line, col, err) {
-            console.error('[CRASH] Uncaught error:', msg, 'at', src, line + ':' + col, err);
-        };
-        window.addEventListener('unhandledrejection', function (e) {
-            console.error('[CRASH] Unhandled rejection:', e.reason);
-        });
-
         context.start(options);
 
         // ── Permanently silence #caf-el via Web Audio API ──────────────────────
@@ -179,11 +162,7 @@
             try {
                 var silenceCtx = new (window.AudioContext || window.webkitAudioContext)();
                 var src = silenceCtx.createMediaElementSource(cafEl);
-                // Intentionally not connected to silenceCtx.destination.
-                console.log('[caf-silence] caf-el audio permanently routed off speakers');
             } catch (e) {
-                // Fallback: keep trying to zero volume on every timeupdate.
-                console.warn('[caf-silence] AudioContext unavailable, using volume=0 fallback:', e);
                 cafEl.addEventListener('volumechange', function () {
                     if (cafEl.volume !== 0) { cafEl.volume = 0; }
                 });
@@ -207,8 +186,6 @@
         // ══════════════════════════════════════════════════════════════════════
 
         function _reset() {
-            console.log('[muxed] reset');
-            if (_benchTimer) { clearInterval(_benchTimer); _benchTimer = null; }
             if (_stallTimer) { clearTimeout(_stallTimer); _stallTimer = null; }
             if (_hls) { try { _hls.destroy(); } catch (e) {} _hls = null; }
             var p = document.getElementById('player');
@@ -229,22 +206,12 @@
                 return;
             }
 
-            // Log muxed codec support for diagnostics.
-            var muxOk = !!(window.MediaSource &&
-                MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"'));
-            console.log('[muxed] video/mp4; codecs="avc1.640029, flac" supported=' + muxOk);
-
             _showOverlay(1);
 
             fetch(baseUrl + 'api/settings')
                 .then(function (r) { return r.ok ? r.json() : null; })
                 .catch(function () { return null; })
                 .then(function (cfg) {
-                    // Apply remote log setting from the same fetch.
-                    _remoteLogEnabled = !!(cfg && cfg.enableReceiverLog);
-                    console.log('[receiver] remote log ' +
-                        (_remoteLogEnabled ? 'enabled' : 'disabled'));
-
                     var liveSyncCount = (cfg && cfg.hlsLiveSyncSegments  > 0) ? cfg.hlsLiveSyncSegments  : 3;
                     var liveMaxCount  = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
 
@@ -253,160 +220,71 @@
                         liveSyncDurationCount:       liveSyncCount,
                         liveMaxLatencyDurationCount: liveMaxCount,
                         maxBufferLength:             25,
-                        backBufferLength:            0,       // evict played segments immediately; server regenerates on seek
-                        enableWorker:                false,   // reduce thread count on CC v2
+                        backBufferLength:            0,
+                        enableWorker:                true,
                         abrEnabled:                  false,
                         startLevel:                  0,
+                        debug:                       false,
                         manifestLoadingMaxRetry:     12,
                         manifestLoadingRetryDelay:   1000,
                         manifestLoadingMaxRetryTimeout: 12000,
                     });
 
-                    _hls.on(Hls.Events.MANIFEST_LOADING, function (e, d) {
-                        console.log('[muxed] MANIFEST_LOADING url=' + d.url);
-                    });
-                    _hls.on(Hls.Events.MANIFEST_LOADED, function (e, d) {
-                        console.log('[muxed] MANIFEST_LOADED levels=' + d.levels.length);
-                    });
-                    _hls.on(Hls.Events.FRAG_LOADING, function (e, d) {
-                        console.log('[muxed] FRAG_LOADING sn=' + d.frag.sn +
-                            ' url=' + d.frag.url.split('/').pop());
-                    });
-
                     // Defer play() until enough fragments are buffered to avoid an
-                    // immediate stall.  MANIFEST_PARSED can fire when the playlist has
-                    // only 1 fragment (server just started); playing immediately causes
-                    // bufferStalledError after 4 s.  Wait for LEVEL_LOADED to report
-                    // >= 2 fragments before starting playback.
+                    // immediate stall when the playlist has only 1 fragment.
                     var _playStarted = false;
                     function _tryStartPlayback() {
                         if (_playStarted) return;
                         _playStarted = true;
-                        console.log('[muxed] starting playback');
                         var pos = _hls.liveSyncPosition;
                         if (pos != null) { player.currentTime = pos; }
-                        player.play().catch(function (err) {
-                            console.warn('[muxed] play() rejected:', err);
-                        });
-                        // Fade overlay when actual playback starts.
+                        player.play().catch(function () {});
                         var _onPlaying = function () {
                             player.removeEventListener('playing', _onPlaying);
                             setTimeout(function () { _showOverlay(0); }, 500);
                         };
                         player.addEventListener('playing', _onPlaying);
-                        // Safety fallback if 'playing' never fires.
                         setTimeout(function () {
                             player.removeEventListener('playing', _onPlaying);
                             _showOverlay(0);
                         }, 6000);
-                        _startBenchmark(player);
                     }
 
-                    _hls.on(Hls.Events.MANIFEST_PARSED, function (e, d) {
-                        console.log('[muxed] MANIFEST_PARSED levels=' + d.levels.length);
-                    });
-
                     _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
-                        console.log('[muxed] LEVEL_LOADED fragments=' + d.details.fragments.length +
-                            ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration);
                         if (!_playStarted && d.details.fragments.length >= 2) {
                             _tryStartPlayback();
                         }
                     });
 
-                    _hls.on(Hls.Events.FRAG_BUFFERED, function (e, d) {
-                        console.log('[muxed] FRAG_BUFFERED sn=' + d.frag.sn +
-                            ' dur=' + (d.frag.duration ? d.frag.duration.toFixed(2) : '?') + 's');
-                        // Cancel pending stall recovery — a new fragment was buffered.
+                    _hls.on(Hls.Events.FRAG_BUFFERED, function () {
                         if (_stallTimer) { clearTimeout(_stallTimer); _stallTimer = null; }
                     });
 
                     _hls.on(Hls.Events.BUFFER_STALLED, function () {
-                        console.warn('[muxed] BUFFER_STALLED');
-                        // If still stalled after 5 s, seek to the live sync point.
-                        // On CC v2 a brief decode hiccup can leave the player behind
-                        // the live window; without this, it stays stuck forever.
                         if (_stallTimer) clearTimeout(_stallTimer);
                         _stallTimer = setTimeout(function () {
                             _stallTimer = null;
                             if (!_hls) return;
                             var p = document.getElementById('player');
-                            if (!p || p.readyState >= 3) return;  // recovered on its own
+                            if (!p || p.readyState >= 3) return;
                             var syncPos = _hls.liveSyncPosition;
                             if (syncPos != null && syncPos > p.currentTime + 2) {
-                                console.warn('[muxed] stall recovery: seeking from ' +
-                                    p.currentTime.toFixed(2) + ' to liveSyncPosition ' +
-                                    syncPos.toFixed(2));
                                 p.currentTime = syncPos;
                             }
                         }, 5000);
                     });
 
                     _hls.on(Hls.Events.ERROR, function (e, d) {
-                        var lvl = d.fatal ? 'error' : 'warn';
-                        console[lvl]('[muxed] ERROR fatal=' + d.fatal +
-                            ' type=' + d.type + ' details=' + d.details +
-                            (d.response ? ' status=' + d.response.code : ''));
                         if (!d.fatal) return;
                         if (_hls) { try { _hls.destroy(); } catch (err) {} _hls = null; }
-                        console.error('[muxed] Fatal error — retrying in 3 s');
                         setTimeout(function () {
                             if (_baseUrl) _startMuxed(_baseUrl);
                         }, 3000);
                     });
 
-                    var src = baseUrl + 'cast/muxed/stream.m3u8';
-                    console.log('[muxed] loading ' + src);
-                    _hls.loadSource(src);
+                    _hls.loadSource(baseUrl + 'cast/muxed/stream.m3u8');
                     _hls.attachMedia(player);
                 });
-        }
-
-        // ── Benchmark: decode quality metrics logged every 5 s ─────────────────
-        //
-        // Pass criteria (logged as PASS/WARN):
-        //   droppedVideoFrames / totalVideoFrames < 0.5%   — hardware decode holding
-        //   bufferedAhead >= 4 s                           — buffer not draining
-        //
-        function _startBenchmark(player) {
-            if (_benchTimer) clearInterval(_benchTimer);
-            _benchTimer = setInterval(function () {
-                try {
-                    var q = player.getVideoPlaybackQuality
-                        ? player.getVideoPlaybackQuality() : null;
-                    var total   = q ? q.totalVideoFrames   : 0;
-                    var dropped = q ? q.droppedVideoFrames : 0;
-                    var bufferedAhead = 0;
-                    if (player.buffered && player.buffered.length > 0) {
-                        for (var i = 0; i < player.buffered.length; i++) {
-                            if (player.buffered.start(i) <= player.currentTime &&
-                                player.buffered.end(i)   >= player.currentTime) {
-                                bufferedAhead = player.buffered.end(i) - player.currentTime;
-                                break;
-                            }
-                        }
-                    }
-                    var dropRate = total > 0 ? (dropped / total) : 0;
-                    var pass     = dropRate < 0.005 && bufferedAhead >= 4;
-                    console.log('[bench] ' + (pass ? 'PASS' : 'WARN') +
-                        ' dropped=' + dropped + '/' + total +
-                        ' dropRate=' + (dropRate * 100).toFixed(2) + '%' +
-                        ' bufferedAhead=' + bufferedAhead.toFixed(1) + 's' +
-                        ' readyState=' + player.readyState +
-                        ' currentTime=' + player.currentTime.toFixed(2));
-                    _postTelemetry({
-                        type: 'bench',
-                        droppedFrames: dropped,
-                        totalFrames:   total,
-                        dropRate:      dropRate,
-                        bufferedAhead: bufferedAhead,
-                        readyState:    player.readyState,
-                        pass:          pass,
-                    });
-                } catch (e) {
-                    console.warn('[bench] getVideoPlaybackQuality error:', e);
-                }
-            }, 5000);
         }
 
         // ── Overlay ────────────────────────────────────────────────────────────
@@ -424,107 +302,6 @@
                 body: JSON.stringify({ state: state }),
             }).catch(function () {});
         }
-
-        function _postTelemetry(data) {
-            if (!_baseUrl) return;
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', _baseUrl + 'cast/telemetry', true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.send(JSON.stringify(data));
-            } catch (e) {}
-        }
-
-        // ── Remote logging ─────────────────────────────────────────────────────
-        function _postRemoteLog(entry) {
-            if (!_remoteLogEnabled || !_baseUrl) return;
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', _baseUrl + 'cast/log', true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.send(JSON.stringify(entry));
-            } catch (e) {}
-        }
-
-        function _sendRemoteLog(level, args) {
-            if (!_remoteLogEnabled) return;
-            var msg;
-            try {
-                msg = Array.prototype.map.call(args, function (a) {
-                    if (a == null) return String(a);
-                    try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
-                    catch (e) { return '[unserializable]'; }
-                }).join(' ');
-            } catch (e) { msg = '[log serialization error]'; }
-            _postRemoteLog({ level: level, message: msg, ts: new Date().toISOString() });
-        }
-
-        (function _installConsoleInterceptors() {
-            ['log', 'info', 'warn', 'error'].forEach(function (m) {
-                var orig = console[m].bind(console);
-                console[m] = function () { orig.apply(console, arguments); _sendRemoteLog(m, arguments); };
-            });
-            window.onerror = function (msg, src, line) {
-                _sendRemoteLog('error', ['[uncaught] ' + msg + ' (' + src + ':' + line + ')']);
-                return false;
-            };
-            window.addEventListener('unhandledrejection', function (e) {
-                var r = e.reason;
-                _sendRemoteLog('error', ['[unhandledrejection] ' +
-                    (r && r.message ? r.message : String(r))]);
-            });
-        })();
-
-        // _fetchRemoteLogSetting is no longer needed — remote log setting is now
-        // applied from the single api/settings fetch in _startMuxed().
-
-        // ── CAF diagnostics ────────────────────────────────────────────────────
-        (function _wireCafDiagnostics() {
-            var EV = cast.framework.events.EventType;
-            [
-                EV.PLAYER_LOAD_COMPLETE, EV.PLAYER_LOAD_FAILED,
-                EV.PLAY, EV.PAUSE, EV.PLAYING, EV.ENDED,
-                EV.BUFFERING, EV.ERROR, EV.REQUEST_LOAD,
-            ].forEach(function (evType) {
-                if (!evType) return;  // skip undefined event types (CAF version compat)
-                try {
-                    playerManager.addEventListener(evType, function (event) {
-                        var detail = '';
-                        try { detail = JSON.stringify(event).substring(0, 200); }
-                        catch (e) { detail = String(event); }
-                        console.log('[caf-diag] ' + evType + ' ' + detail);
-                    });
-                } catch (e) {
-                    console.warn('[caf-diag] skip event ' + evType + ': ' + e.message);
-                }
-            });
-
-            // TIME_UPDATE: log every 5 s so CAF + player progress is visible in remote log.
-            playerManager.addEventListener(EV.TIME_UPDATE, function () {
-                var now = Date.now();
-                if (!_wireCafDiagnostics._lastTU ||
-                    now - _wireCafDiagnostics._lastTU > 5000) {
-                    _wireCafDiagnostics._lastTU = now;
-                    var cafEl = document.getElementById('caf-el');
-                    var p     = document.getElementById('player');
-                    console.log('[caf-diag] TIME_UPDATE' +
-                        ' cafT='    + (cafEl ? cafEl.currentTime.toFixed(2) : 'n/a') +
-                        ' playerT=' + (p ? p.currentTime.toFixed(2) : 'n/a') +
-                        ' paused='  + (p ? p.paused : '?'));
-                }
-            });
-
-            var SYS = cast.framework.system.EventType;
-            [SYS.READY, SYS.SENDER_CONNECTED, SYS.SENDER_DISCONNECTED,
-             SYS.SYSTEM_VOLUME_CHANGED, SYS.ERROR].forEach(function (sysEvType) {
-                context.addEventListener(sysEvType, function (event) {
-                    var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); }
-                    catch (e) { detail = String(event); }
-                    console.log('[caf-sys] ' + sysEvType + ' ' + detail);
-                });
-            });
-        })();
 
     })(); // end IIFE
     </script>
