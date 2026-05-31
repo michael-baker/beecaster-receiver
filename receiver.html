@@ -6,479 +6,1123 @@
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
     <!-- hls.js: Chromecast does not support HLS via canPlayType; MSE (hls.js) is required -->
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
-    <!--
-        fmp4_muxed mode: single FFmpeg process muxes H.264 video + FLAC audio into
-        fragmented MP4 (fMP4) HLS segments served in-memory from HlsSegmentStore.
-        hls.js drives a single <video id="player"> element via MSE SourceBuffer.
-        A/V sync is guaranteed by the shared PTS timeline in the muxed container —
-        no sync loop, no rate steering, no hard seeks.
-        Confirmed on Chromecast v2 (Chrome 90 / armv7l):
-          MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"') = true
-    -->
+    <!-- mpegts.js: MSE-based MPEG-TS player for the mpegts streaming mode -->
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1/dist/mpegts.min.js"></script>
     <style>
-        *, *::before, *::after { box-sizing: border-box; }
-        body { overflow: hidden; margin: 0; padding: 0; background: #000; }
-
-        /* Black overlay — full-screen, shown during load and pause */
-        #overlay {
-            position: absolute; inset: 0;
-            background: #000; opacity: 1;
-            transition: opacity 0.4s ease;
-            pointer-events: none; z-index: 10;
+        body {
+            overflow: hidden;
+            margin: 0;
+            padding: 0;
+            background: #000;
         }
 
-        /* CAF protocol vehicle — invisible, muted, only here so CAF has a
-           valid media element to report state and accept commands.        */
-        #caf-el {
-            position: absolute; width: 1px; height: 1px;
-            opacity: 0; pointer-events: none;
+        /* Pause overlay — fades to black when audio is paused so the stale
+           HLS buffer drain is hidden rather than looking like a sync error. */
+        #pause-overlay {
+            position: absolute;
+            inset: 0;
+            background: #000;
+            opacity: 0;
+            transition: opacity 0.35s ease;
+            pointer-events: none;
+            z-index: 10;
         }
 
-        /* Muxed player — full-screen, produces both audio and video output. */
-        #player {
-            position: absolute; inset: 0;
-            width: 100%; height: 100%;
+        /* CAF audio element — invisible but functional for audio playback */
+        video {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        /* HLS background video — full screen, shown after manifest loads */
+        #hls-bg {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
             object-fit: cover;
+            opacity: 1;
+            display: none;
         }
     </style>
 </head>
 <body>
-    <!-- CAF protocol vehicle: loaded with /live WAV by CAF, muted at JS level.
-         CAF needs a media element to track play/pause state and send commands. -->
-    <video id="caf-el" class="castMediaElement"></video>
-    <!-- Muxed player: hls.js drives this element with the H.264+FLAC fMP4 stream.
-         NOT muted — this element produces the actual audio and video output.    -->
-    <video id="player" playsinline></video>
-    <!-- Overlay: black during load and pause -->
-    <div id="overlay"></div>
+    <!-- CAF audio element; class="castMediaElement" lets CAF auto-discover it -->
+    <video id="receiverVideoElement" class="castMediaElement"></video>
+    <!-- HLS background: shows the WebView2 preview stream captured by FFmpeg -->
+    <video id="hls-bg" muted playsinline autoplay></video>
+    <!-- Audio-only element for FLAC fMP4 HLS test stream -->
+    <audio id="flac-audio" preload="none"></audio>
+    <!-- Black overlay that fades in on pause to hide the HLS buffer drain -->
+    <div id="pause-overlay"></div>
 
     <script>
-    (function () {
-        'use strict';
-
-        // ── CAF init ────────────────────────────────────────────────────────────
-        var CHANNEL       = 'urn:x-cast:com.google.cast.media';
-        var context       = cast.framework.CastReceiverContext.getInstance();
-        var playerManager = context.getPlayerManager();
+        const CHANNEL = 'urn:x-cast:com.google.cast.media';
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const playerManager = context.getPlayerManager();
 
         playerManager.setSupportedMediaCommands(
             cast.framework.messages.Command.ALL_BASIC_MEDIA |
-            cast.framework.messages.Command.PAUSE           |
-            cast.framework.messages.Command.QUEUE_NEXT      |
+            cast.framework.messages.Command.PAUSE |
+            cast.framework.messages.Command.QUEUE_NEXT |
             cast.framework.messages.Command.QUEUE_PREV
         );
 
+        // Suppress UI updates for preloaded (queued-next) tracks
         playerManager.setMessageInterceptor(
             cast.framework.messages.MessageType.PRELOAD,
-            function (req) { return req; }
+            request => request
         );
 
-        // ── Module state ───────────────────────────────────────────────────────
-        var _baseUrl      = '';
-        var _hls          = null;   // single hls.js instance for muxed fMP4 stream
-        var _benchTimer   = null;   // setInterval handle for decode benchmark
-        var _remoteLogEnabled = false;
-
-        // ── LOAD interceptor ────────────────────────────────────────────────────
-        playerManager.setMessageInterceptor(
-            cast.framework.messages.MessageType.LOAD,
-            function (request) {
-                var custom = request.media && request.media.customData;
-                _baseUrl = (custom && custom.MediaBaseUrl) || '';
-                var mode = (custom && custom.HlsStreamingMode) || '';
-                console.log('[receiver] LOAD mode=' + mode + ' baseUrl=' + _baseUrl);
-
-                if (_baseUrl) { _fetchRemoteLogSetting(_baseUrl); }
-
-                // Keep the CAF protocol vehicle muted — /live WAV must be silent.
-                var cafEl = document.getElementById('caf-el');
-                if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
-
-                _reset();
-
-                if (mode === 'fmp4_muxed') {
-                    _startMuxed(_baseUrl);
-                } else {
-                    console.error('[receiver] Unsupported mode "' + mode + '" — expected fmp4_muxed');
-                    _showOverlay(1);
+        // On LOAD: extract MediaBaseUrl and HlsStreamingMode from customData and start background video
+        playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
+            const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
+            const hlsMode = (request.media && request.media.customData && request.media.customData.HlsStreamingMode) || 'hls_memory';
+            console.log('[receiver] LOAD interceptor: baseUrl=' + baseUrl + ' hlsMode=' + hlsMode);
+            if (baseUrl) {
+                _castBaseUrl = baseUrl;
+                _lastHlsMode = hlsMode;
+                _fetchRemoteLogSetting(baseUrl);
+                // In flac_hls / fmp4_hls / fmp4_split / fmp4_offline mode the HLS stream is the audio source; mute CAF so they don't overlap.
+                var caf = document.getElementById('receiverVideoElement');
+                if (caf) caf.muted = (hlsMode === 'flac_hls' || hlsMode === 'fmp4_hls' || hlsMode === 'fmp4_split' || hlsMode === 'fmp4_offline');
+                try {
+                    // In split/fmp4 modes the HLS pipeline runs continuously across
+                    // track changes — don't destroy and recreate the players on every
+                    // LOAD.  Only start them if not already running.
+                    // In audio-only mode _splitVideoHls is always null, so check audio alone.
+                    // Split and offline pipelines are continuous across track changes.
+                    var splitAlreadyRunning = (hlsMode === 'fmp4_split' && _splitAudioHls && (_splitVideoHls || _splitAudioOnlyMode))
+                                          || (hlsMode === 'fmp4_offline' && _hlsInstance);
+                    if (!splitAlreadyRunning) {
+                        _showAudioSyncOverlay();
+                        resetBgVideo(); // drop stale buffers before connecting to the fresh pipeline
+                        startBgVideo(baseUrl, hlsMode);
+                    } else {
+                        // Split pipeline is continuous — no overlay needed for track
+                        // changes or calibration since nothing resets.
+                        console.log('[receiver] LOAD: split HLS already running — skipping reset');
+                    }
+                } catch (e) {
+                    // A throw here would abort the Cast LOAD and render chrome-error.
+                    // Log and swallow so the session continues without background video.
+                    console.error('[receiver] startBgVideo threw (non-fatal):', e && e.message ? e.message : String(e));
                 }
-
-                return request;
+                _startCalibrationWatch(); // drop buffers the moment Stop Calibration is pressed
             }
-        );
+            return request;
+        });
 
-        // ── CAF PAUSE ──────────────────────────────────────────────────────────
+        var _pauseRevealTimer = null;
+        var _loadSyncActive = false;       // true while the initial load overlay covers the HLS video
+        var _audioSyncOverlayTimer = null; // timer to lift the load overlay once audio delay has elapsed
+
+        // On PAUSE: fade to black immediately so the stale HLS buffer drain is hidden.
+        // Then after AutoVideoDelayMs the live stream has caught up to the paused state,
+        // so fade the overlay back out to reveal the idle visual.
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
-            console.log('[receiver] PAUSE');
-            _showOverlay(1);
-            var p = document.getElementById('player');
-            if (p && !p.paused) p.pause();
-            _postAck('PAUSED');
-            // Fade to reveal paused frame after 1.5 s.
-            setTimeout(function () { _showOverlay(0); }, 1500);
-        });
+            var overlay = document.getElementById('pause-overlay');
+            if (_audioSyncOverlayTimer) { clearTimeout(_audioSyncOverlayTimer); _audioSyncOverlayTimer = null; }
+            _loadSyncActive = false;
+            if (overlay) overlay.style.opacity = '1';
+            if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
 
-        // ── CAF PLAYING ────────────────────────────────────────────────────────
-        playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
-            console.log('[receiver] PLAYING');
-            // Re-enforce mute on ghost element (CAF resets muted on PLAYING).
-            var cafEl = document.getElementById('caf-el');
-            if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
-            var p = document.getElementById('player');
-            if (p && p.paused) p.play().catch(function (e) {
-                console.warn('[receiver] player.play() rejected:', e);
-            });
-            _postAck('PLAYING');
-        });
-
-        // ── Queue next / prev ──────────────────────────────────────────────────
-        playerManager.addEventListener(
-            cast.framework.events.EventType.REQUEST_QUEUE_UPDATE,
-            function (event) {
-                var next = event.requestData && event.requestData.jump === 1;
-                context.sendCustomMessage(CHANNEL, undefined, {
-                    type:    next ? 'NEXT' : 'PREVIOUS',
-                    message: next ? 'NEXT' : 'PREVIOUS',
-                });
+            // Split mode: pause both elements so they don't drift during the pause.
+            if (_splitVideoHls) {
+                var bg = document.getElementById('hls-bg');
+                if (bg) try { bg.pause(); } catch (e) {}
             }
-        );
+            if (_splitAudioHls) {
+                var fa = document.getElementById('flac-audio');
+                if (fa) try { fa.pause(); } catch (e) {}
+            }
 
-        // ── Sender disconnected ────────────────────────────────────────────────
-        context.addEventListener(
-            cast.framework.system.EventType.SENDER_DISCONNECTED,
-            function () { context.stop(); }
-        );
+            fetch(_castBaseUrl + 'cast/state')
+                .then(function (r) { return r.json(); })
+                .then(function (s) {
+                    // Split mode has no adelay — lift overlay after a short settle time.
+                    var isSplitOrOffline = _lastHlsMode === 'fmp4_split' || _lastHlsMode === 'fmp4_offline';
+                    var delayMs = isSplitOrOffline ? 1500 : 3500;
+                    _pauseRevealTimer = setTimeout(function () {
+                        _pauseRevealTimer = null;
+                        if (overlay) overlay.style.opacity = '0';
+                    }, delayMs);
+                })
+                .catch(function () {
+                    _pauseRevealTimer = setTimeout(function () {
+                        _pauseRevealTimer = null;
+                        if (overlay) overlay.style.opacity = '0';
+                    }, 12500);
+                });
+            // Notify plugin that CC has entered PAUSED state.
+            if (_castBaseUrl) {
+                fetch(_castBaseUrl + 'cast/ack', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ state: 'PAUSED' })
+                }).catch(function () {});
+            }
+        });
 
-        // ── CAF options + start ────────────────────────────────────────────────
+        // On PLAYING (resume): cancel any pending reveal, seek to live edge, fade out.
+        playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
+            var bg      = document.getElementById('hls-bg');
+            var overlay = document.getElementById('pause-overlay');
+            if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
+            if (bg) {
+                // For HLS mode, snap back to live sync position so the background
+                // doesn't drift when audio has been paused for a long time.
+                // For mpegts mode the player manages play/pause directly; don't interfere.
+                if (_hlsInstance && _hlsInstance.liveSyncPosition) {
+                    bg.currentTime = _hlsInstance.liveSyncPosition;
+                }
+                if (_splitVideoHls && _splitVideoHls.liveSyncPosition) {
+                    bg.currentTime = _splitVideoHls.liveSyncPosition;
+                }
+                if (_splitAudioHls && _splitAudioHls.liveSyncPosition) {
+                    var flacAudio = document.getElementById('flac-audio');
+                    if (flacAudio) {
+                        flacAudio.currentTime = _splitAudioHls.liveSyncPosition;
+                        if (flacAudio.paused) flacAudio.play().catch(function (e) { console.warn('[split-hls] audio resume rejected:', e); });
+                    }
+                }
+                if (!_mpegtsPlayer && (_hlsInstance || _splitVideoHls) && bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+            }
+            // Split mode: lift overlay immediately — no adelay to wait for.
+            if (overlay && (_lastHlsMode === 'fmp4_split' || _lastHlsMode === 'fmp4_offline' || !_loadSyncActive)) overlay.style.opacity = '0';
+            // Notify plugin that CC has entered PLAYING state.
+            if (_castBaseUrl) {
+                fetch(_castBaseUrl + 'cast/ack', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ state: 'PLAYING' })
+                }).catch(function () {});
+            }
+        });
+
+        // Forward next/previous queue jumps back to the plugin
+        playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, function (event) {
+            var next = event.requestData && event.requestData.jump == 1;
+            context.sendCustomMessage(CHANNEL, undefined, {
+                type: next ? 'NEXT' : 'PREVIOUS',
+                message: next ? 'NEXT' : 'PREVIOUS'
+            });
+        });
+
+        context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, function () {
+            context.stop();
+        });
+
         var options = new cast.framework.CastReceiverOptions();
         options.customNamespaces = {};
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
         options.disableIdleTimeout = false;
         options.maxInactivity = 3600;
-        options.mediaElement = document.getElementById('caf-el');
+        options.mediaElement = document.getElementById('receiverVideoElement');
 
         window.onerror = function (msg, src, line, col, err) {
             console.error('[CRASH] Uncaught error:', msg, 'at', src, line + ':' + col, err);
         };
         window.addEventListener('unhandledrejection', function (e) {
-            console.error('[CRASH] Unhandled rejection:', e.reason);
+            console.error('[CRASH] Unhandled promise rejection:', e.reason);
         });
 
         context.start(options);
+    </script>
 
-        // ── Permanently silence #caf-el via Web Audio API ──────────────────────
-        // CAF owns #caf-el and overrides muted/volume on every PLAYING event,
-        // making the /live WAV audible regardless of what JS sets.
-        // createMediaElementSource() permanently re-routes the element's audio
-        // output into the Web Audio graph and away from the speakers.
-        // We deliberately do NOT connect the source node to AudioContext.destination,
-        // so the audio is consumed (keeping the element playing for CAF state) but
-        // produces zero output. CAF state tracking is unaffected.
-        (function _silenceCafElement() {
-            var cafEl = document.getElementById('caf-el');
-            if (!cafEl) return;
-            try {
-                var silenceCtx = new (window.AudioContext || window.webkitAudioContext)();
-                var src = silenceCtx.createMediaElementSource(cafEl);
-                // Intentionally not connected to silenceCtx.destination.
-                console.log('[caf-silence] caf-el audio permanently routed off speakers');
-            } catch (e) {
-                // Fallback: keep trying to zero volume on every timeupdate.
-                console.warn('[caf-silence] AudioContext unavailable, using volume=0 fallback:', e);
-                cafEl.addEventListener('volumechange', function () {
-                    if (cafEl.volume !== 0) { cafEl.volume = 0; }
-                });
-                cafEl.volume = 0;
-            }
-        })();
+    <script>
+        // Remote logging — gated by the EnableReceiverLog server setting.
+        // Re-fetched on every LOAD so the checkbox in settings takes effect without
+        // restarting the cast session. Off by default — zero HTTP traffic until enabled.
+        var _remoteLogEnabled = false;
 
-        // ══════════════════════════════════════════════════════════════════════
-        // fmp4_muxed pipeline
-        //
-        // Architecture:
-        //   Single <video id="player"> — hls.js + MSE SourceBuffer
-        //   codec: video/mp4; codecs="avc1.640029, flac"
-        //
-        //   A/V sync is guaranteed by the muxed fMP4 container.  Both tracks share
-        //   the same PTS timeline from a single FFmpeg muxer, so synchronisation is
-        //   mathematically exact — no sync loop, no rate steering, no hard seeks.
-        //
-        //   Chromecast v2 (Chrome 90 / armv7l) confirms hardware support via:
-        //     MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"') = true
-        // ══════════════════════════════════════════════════════════════════════
-
-        function _reset() {
-            console.log('[muxed] reset');
-            if (_benchTimer) { clearInterval(_benchTimer); _benchTimer = null; }
-            if (_hls) { try { _hls.destroy(); } catch (e) {} _hls = null; }
-            var p = document.getElementById('player');
-            if (p) { try { p.pause(); } catch (e) {} }
-            _showOverlay(1);
-        }
-
-        function _startMuxed(baseUrl) {
-            var player = document.getElementById('player');
-            if (!player) { console.error('[muxed] #player element missing'); return; }
-
-            if (!window.Hls || !Hls.isSupported()) {
-                console.error('[muxed] hls.js / MSE not available');
-                return;
-            }
-
-            // Log muxed codec support for diagnostics.
-            var muxOk = !!(window.MediaSource &&
-                MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"'));
-            console.log('[muxed] video/mp4; codecs="avc1.640029, flac" supported=' + muxOk);
-
-            _showOverlay(1);
-
-            fetch(baseUrl + 'api/settings')
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .catch(function () { return null; })
-                .then(function (cfg) {
-                    var liveSyncCount = (cfg && cfg.hlsLiveSyncSegments  > 0) ? cfg.hlsLiveSyncSegments  : 3;
-                    var liveMaxCount  = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
-
-                    _hls = new Hls({
-                        lowLatencyMode:              false,
-                        liveSyncDurationCount:       liveSyncCount,
-                        liveMaxLatencyDurationCount: liveMaxCount,
-                        maxBufferLength:             25,
-                        backBufferLength:            20,
-                        enableWorker:                false,  // reduce thread count on CC v2
-                        abrEnabled:                  false,
-                        startLevel:                  0,
-                        manifestLoadingMaxRetry:     12,
-                        manifestLoadingRetryDelay:   1000,
-                        manifestLoadingMaxRetryTimeout: 12000,
-                    });
-
-                    _hls.on(Hls.Events.MANIFEST_LOADING, function (e, d) {
-                        console.log('[muxed] MANIFEST_LOADING url=' + d.url);
-                    });
-                    _hls.on(Hls.Events.MANIFEST_LOADED, function (e, d) {
-                        console.log('[muxed] MANIFEST_LOADED levels=' + d.levels.length);
-                    });
-                    _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
-                        console.log('[muxed] LEVEL_LOADED fragments=' + d.details.fragments.length +
-                            ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration);
-                    });
-                    _hls.on(Hls.Events.FRAG_LOADING, function (e, d) {
-                        console.log('[muxed] FRAG_LOADING sn=' + d.frag.sn +
-                            ' url=' + d.frag.url.split('/').pop());
-                    });
-
-                    _hls.on(Hls.Events.MANIFEST_PARSED, function (e, d) {
-                        console.log('[muxed] MANIFEST_PARSED levels=' + d.levels.length);
-                        var pos = _hls.liveSyncPosition;
-                        if (pos != null) { player.currentTime = pos; }
-                        player.play().catch(function (err) {
-                            console.warn('[muxed] play() rejected:', err);
-                        });
-                        // Fade overlay out after 3 s — enough time for A/V decode buffers to fill.
-                        setTimeout(function () { _showOverlay(0); }, 3000);
-                        _startBenchmark(player);
-                    });
-
-                    _hls.on(Hls.Events.FRAG_BUFFERED, function (e, d) {
-                        console.log('[muxed] FRAG_BUFFERED sn=' + d.frag.sn +
-                            ' dur=' + (d.frag.duration ? d.frag.duration.toFixed(2) : '?') + 's');
-                    });
-
-                    _hls.on(Hls.Events.BUFFER_STALLED, function () {
-                        console.warn('[muxed] BUFFER_STALLED');
-                    });
-
-                    _hls.on(Hls.Events.ERROR, function (e, d) {
-                        var lvl = d.fatal ? 'error' : 'warn';
-                        console[lvl]('[muxed] ERROR fatal=' + d.fatal +
-                            ' type=' + d.type + ' details=' + d.details +
-                            (d.response ? ' status=' + d.response.code : ''));
-                        if (!d.fatal) return;
-                        if (_hls) { try { _hls.destroy(); } catch (err) {} _hls = null; }
-                        console.error('[muxed] Fatal error — retrying in 3 s');
-                        setTimeout(function () {
-                            if (_baseUrl) _startMuxed(_baseUrl);
-                        }, 3000);
-                    });
-
-                    var src = baseUrl + 'cast/muxed/stream.m3u8';
-                    console.log('[muxed] loading ' + src);
-                    _hls.loadSource(src);
-                    _hls.attachMedia(player);
-                });
-        }
-
-        // ── Benchmark: decode quality metrics logged every 5 s ─────────────────
-        //
-        // Pass criteria (logged as PASS/WARN):
-        //   droppedVideoFrames / totalVideoFrames < 0.5%   — hardware decode holding
-        //   bufferedAhead >= 4 s                           — buffer not draining
-        //
-        function _startBenchmark(player) {
-            if (_benchTimer) clearInterval(_benchTimer);
-            _benchTimer = setInterval(function () {
-                try {
-                    var q = player.getVideoPlaybackQuality
-                        ? player.getVideoPlaybackQuality() : null;
-                    var total   = q ? q.totalVideoFrames   : 0;
-                    var dropped = q ? q.droppedVideoFrames : 0;
-                    var bufferedAhead = 0;
-                    if (player.buffered && player.buffered.length > 0) {
-                        for (var i = 0; i < player.buffered.length; i++) {
-                            if (player.buffered.start(i) <= player.currentTime &&
-                                player.buffered.end(i)   >= player.currentTime) {
-                                bufferedAhead = player.buffered.end(i) - player.currentTime;
-                                break;
-                            }
-                        }
-                    }
-                    var dropRate = total > 0 ? (dropped / total) : 0;
-                    var pass     = dropRate < 0.005 && bufferedAhead >= 4;
-                    console.log('[bench] ' + (pass ? 'PASS' : 'WARN') +
-                        ' dropped=' + dropped + '/' + total +
-                        ' dropRate=' + (dropRate * 100).toFixed(2) + '%' +
-                        ' bufferedAhead=' + bufferedAhead.toFixed(1) + 's' +
-                        ' readyState=' + player.readyState +
-                        ' currentTime=' + player.currentTime.toFixed(2));
-                    _postTelemetry({
-                        type: 'bench',
-                        droppedFrames: dropped,
-                        totalFrames:   total,
-                        dropRate:      dropRate,
-                        bufferedAhead: bufferedAhead,
-                        readyState:    player.readyState,
-                        pass:          pass,
-                    });
-                } catch (e) {
-                    console.warn('[bench] getVideoPlaybackQuality error:', e);
-                }
-            }, 5000);
-        }
-
-        // ── Overlay ────────────────────────────────────────────────────────────
-        function _showOverlay(opacity) {
-            var el = document.getElementById('overlay');
-            if (el) el.style.opacity = String(opacity);
-        }
-
-        // ── Server communication ────────────────────────────────────────────────
-        function _postAck(state) {
-            if (!_baseUrl) return;
-            fetch(_baseUrl + 'cast/ack', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ state: state }),
-            }).catch(function () {});
-        }
-
-        function _postTelemetry(data) {
-            if (!_baseUrl) return;
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', _baseUrl + 'cast/telemetry', true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.send(JSON.stringify(data));
-            } catch (e) {}
-        }
-
-        // ── Remote logging ─────────────────────────────────────────────────────
         function _postRemoteLog(entry) {
-            if (!_remoteLogEnabled || !_baseUrl) return;
+            if (!_remoteLogEnabled || !_castBaseUrl) return;
             try {
                 var xhr = new XMLHttpRequest();
-                xhr.open('POST', _baseUrl + 'cast/log', true);
+                xhr.open('POST', _castBaseUrl + 'cast/log', true);
                 xhr.setRequestHeader('Content-Type', 'application/json');
                 xhr.send(JSON.stringify(entry));
-            } catch (e) {}
+            } catch(e) { /* never let remote logging break the app */ }
         }
 
         function _sendRemoteLog(level, args) {
             if (!_remoteLogEnabled) return;
             var msg;
             try {
-                msg = Array.prototype.map.call(args, function (a) {
+                msg = Array.prototype.map.call(args, function(a) {
                     if (a == null) return String(a);
                     try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
-                    catch (e) { return '[unserializable]'; }
+                    catch(e) { return '[unserializable]'; }
                 }).join(' ');
-            } catch (e) { msg = '[log serialization error]'; }
+            } catch(e) { msg = '[log serialization error]'; }
             _postRemoteLog({ level: level, message: msg, ts: new Date().toISOString() });
         }
 
-        (function _installConsoleInterceptors() {
-            ['log', 'info', 'warn', 'error'].forEach(function (m) {
-                var orig = console[m].bind(console);
-                console[m] = function () { orig.apply(console, arguments); _sendRemoteLog(m, arguments); };
+        (function() {
+            ['log', 'info', 'warn', 'error'].forEach(function(m) {
+                var _orig = console[m].bind(console);
+                console[m] = function() { _orig.apply(console, arguments); _sendRemoteLog(m, arguments); };
             });
-            window.onerror = function (msg, src, line) {
+            window.onerror = function(msg, src, line) {
                 _sendRemoteLog('error', ['[uncaught] ' + msg + ' (' + src + ':' + line + ')']);
                 return false;
             };
-            window.addEventListener('unhandledrejection', function (e) {
+            window.addEventListener('unhandledrejection', function(e) {
                 var r = e.reason;
-                _sendRemoteLog('error', ['[unhandledrejection] ' +
-                    (r && r.message ? r.message : String(r))]);
+                _sendRemoteLog('error', ['[unhandledrejection] ' + (r && r.message ? r.message : String(r))]);
             });
         })();
 
         function _fetchRemoteLogSetting(baseUrl) {
             try {
                 fetch(baseUrl + 'api/settings')
-                    .then(function (r) { return r.ok ? r.json() : null; })
-                    .then(function (cfg) {
+                    .then(function(r) { return r.ok ? r.json() : null; })
+                    .then(function(cfg) {
                         _remoteLogEnabled = !!(cfg && cfg.enableReceiverLog);
-                        console.log('[receiver] remote log ' +
-                            (_remoteLogEnabled ? 'enabled' : 'disabled'));
+                        console.log('[receiver] remote log ' + (_remoteLogEnabled ? 'enabled' : 'disabled'));
                     })
-                    .catch(function () { _remoteLogEnabled = false; });
-            } catch (e) { _remoteLogEnabled = false; }
+                    .catch(function() { _remoteLogEnabled = false; });
+            } catch(e) { _remoteLogEnabled = false; }
         }
 
-        // ── CAF diagnostics ────────────────────────────────────────────────────
-        (function _wireCafDiagnostics() {
-            var EV = cast.framework.events.EventType;
-            [
-                EV.PLAYER_LOAD_COMPLETE, EV.PLAYER_LOAD_FAILED,
-                EV.PLAY, EV.PAUSE, EV.PLAYING, EV.ENDED,
-                EV.BUFFERING, EV.ERROR, EV.REQUEST_LOAD,
-            ].forEach(function (evType) {
-                playerManager.addEventListener(evType, function (event) {
-                    var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); }
-                    catch (e) { detail = String(event); }
-                    console.log('[caf-diag] ' + evType + ' ' + detail);
+        var _hlsStarted = false;
+        var _hlsInstance = null;
+        var _splitVideoHls = null;
+        var _splitAudioHls = null;
+        var _splitSyncTimer = null;
+        var _splitAudioOnlyMode = false; // true when running in audio-only split mode (no _splitVideoHls)
+        var _castBaseUrl = '';          // set on LOAD from customData.MediaBaseUrl
+        var _lastHlsMode = 'hls_memory'; // most-recent mode from LOAD; used when restarting after calib reset
+        var _calibPollTimer = null;
+        var _sawCalibrationMode = false;
+
+        function _postSplitTelemetry(data) {
+            if (!_castBaseUrl) return;
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', _castBaseUrl + 'cast/telemetry', true);
+                xhr.setRequestHeader('Content-Type', 'application/json');
+                xhr.send(JSON.stringify(data));
+            } catch(e) { /* never let telemetry break the stream */ }
+        }
+
+        // Load overlay: shown immediately on LOAD to cover the HLS spectrum video until
+        // the audio pipeline's adelay has been consumed. Fades out after AutoVideoDelayMs + 2 s
+        // so spectrum and audio become visible together from the user's perspective.
+        function _showAudioSyncOverlay() {
+            var overlay = document.getElementById('pause-overlay');
+            if (!overlay) return;
+            if (_audioSyncOverlayTimer) { clearTimeout(_audioSyncOverlayTimer); _audioSyncOverlayTimer = null; }
+            _loadSyncActive = true;
+            overlay.style.opacity = '1';
+            fetch(_castBaseUrl + 'cast/state')
+                .then(function (r) { return r.json(); })
+                .then(function (s) {
+                    // During calibration the HLS video runs continuously — only the audio pipeline
+                    // restarts, which takes ~3 s.  Skip the full AutoVideoDelayMs wait so the user
+                    // gets fast feedback after each slider adjustment.
+                    var delayMs = s.calibrationMode
+                        ? 3000
+                        : (_lastHlsMode === 'flac_hls' || _lastHlsMode === 'fmp4_hls' || _lastHlsMode === 'fmp4_split' || _lastHlsMode === 'fmp4_offline')
+                            ? 3000
+                            : 14000;
+                    _audioSyncOverlayTimer = setTimeout(function () {
+                        _audioSyncOverlayTimer = null;
+                        _loadSyncActive = false;
+                        overlay.style.opacity = '0';
+                    }, delayMs);
+                })
+                .catch(function () {
+                    _audioSyncOverlayTimer = setTimeout(function () {
+                        _audioSyncOverlayTimer = null;
+                        _loadSyncActive = false;
+                        overlay.style.opacity = '0';
+                    }, 14000);
                 });
+        }
+
+        // Dispatcher: choose HLS or MPEG-TS based on server setting
+        function startBgVideo(baseUrl, hlsMode) {
+            if (hlsMode === 'mpegts') {
+                startMpegTsBg(baseUrl);
+            } else if (hlsMode === 'flac_hls') {
+                startFlacHlsBg(baseUrl);
+            } else if (hlsMode === 'fmp4_hls') {
+                startFmp4HlsBg(baseUrl);
+            } else if (hlsMode === 'fmp4_split') {
+                startSplitHlsBg(baseUrl);
+            } else if (hlsMode === 'fmp4_offline') {
+                startOfflineHlsBg(baseUrl);
+            } else {
+                startHlsBg(baseUrl);
+            }
+        }
+
+        // MPEG-TS background (mpegts mode)
+        // The plugin serves a never-ending chunked MPEG-TS stream at /cast/videolive.
+        // Chrome dropped native MPEG-TS support, so we use mpegts.js (MSE-based demuxer).
+        var _mpegtsPlayer = null;
+        var _mpegtsLastStartMs = 0; // debounce double-LOAD
+
+        function startMpegTsBg(baseUrl) {
+            var video = document.getElementById('hls-bg');
+            if (!video) { console.error('[mpegts-bg] hls-bg element missing'); return; }
+
+            // CAF sometimes fires LOAD twice in quick succession; ignore the duplicate.
+            var now = Date.now();
+            if (now - _mpegtsLastStartMs < 2000) {
+                console.warn('[mpegts-bg] ignoring duplicate start within 2 s');
+                return;
+            }
+            _mpegtsLastStartMs = now;
+
+            if (typeof mpegts === 'undefined') {
+                console.error('[mpegts-bg] mpegts global undefined — CDN script did not load; cannot play mpegts stream');
+                return;
+            }
+
+            // Diagnostic: log feature list so we can inspect in Cast remote debugger
+            try {
+                var fl = mpegts.getFeatureList();
+                console.log('[mpegts-bg] featureList:', JSON.stringify(fl));
+            } catch (fe) { console.warn('[mpegts-bg] getFeatureList threw:', fe); }
+
+            if (!mpegts.isSupported()) {
+                console.error('[mpegts-bg] mpegts.isSupported()=false — MSE H264 not available on this device; cannot play mpegts stream');
+                return;
+            }
+
+            if (_mpegtsPlayer) {
+                try { _mpegtsPlayer.destroy(); } catch (e) {}
+                _mpegtsPlayer = null;
+            }
+
+            var url = baseUrl + 'cast/videolive';
+            console.log('[mpegts-bg] starting via mpegts.js:', url);
+
+            try {
+                _mpegtsPlayer = mpegts.createPlayer({
+                    type: 'mpegts',
+                    isLive: true,
+                    url: url
+                }, {
+                    // enableWorker: false — the Cast SDK context gives blob workers an HTTPS
+                    // origin, which blocks fetches to our HTTP plugin server as mixed content.
+                    // Running on the main thread avoids the worker HTTPS context entirely.
+                    enableWorker: false,
+                    liveBufferLatencyChasing: true,
+                    liveBufferLatencyMaxLatency: 3.0,
+                    liveBufferLatencyMinRemain: 0.5
+                });
+
+                _mpegtsPlayer.attachMediaElement(video);
+                _mpegtsPlayer.load();
+
+                // Show and start playback immediately — don't wait for MEDIA_INFO.
+                // The video is muted+playsinline so autoplay policy allows it.
+                // Waiting for MEDIA_INFO causes a black screen because the event fires
+                // asynchronously after the init segment, while the element stays display:none.
+                video.style.display = 'block';
+                video.play().catch(function (e) { console.warn('[mpegts-bg] initial play() rejected:', e); });
+            } catch (setupErr) {
+                // attachMediaElement or load() threw (e.g. ManagedMediaSource /
+                // disableRemotePlayback conflict on some Chromecast hardware).
+                console.error('[mpegts-bg] setup threw:', setupErr && setupErr.message ? setupErr.message : String(setupErr));
+                try { if (_mpegtsPlayer) { _mpegtsPlayer.destroy(); } } catch (e) {}
+                _mpegtsPlayer = null;
+                // Server is in mpegts mode — no HLS segments available, so retry mpegts after 5 s.
+                setTimeout(function () { startMpegTsBg(baseUrl); }, 5000);
+                return;
+            }
+
+            _mpegtsPlayer.on(mpegts.Events.MEDIA_INFO, function () {
+                console.log('[mpegts-bg] media info received');
+                // play()/display already set after load(); retry play() only if still paused.
+                if (video.paused) video.play().catch(function (e) { console.warn('[mpegts-bg] play() rejected on MEDIA_INFO:', e); });
             });
 
-            // TIME_UPDATE: log every 5 s so CAF + player progress is visible in remote log.
-            playerManager.addEventListener(EV.TIME_UPDATE, function () {
-                var now = Date.now();
-                if (!_wireCafDiagnostics._lastTU ||
-                    now - _wireCafDiagnostics._lastTU > 5000) {
-                    _wireCafDiagnostics._lastTU = now;
-                    var cafEl = document.getElementById('caf-el');
-                    var p     = document.getElementById('player');
-                    console.log('[caf-diag] TIME_UPDATE' +
-                        ' cafT='    + (cafEl ? cafEl.currentTime.toFixed(2) : 'n/a') +
-                        ' playerT=' + (p ? p.currentTime.toFixed(2) : 'n/a') +
-                        ' paused='  + (p ? p.paused : '?'));
+            _mpegtsPlayer.on(mpegts.Events.ERROR, function (errType, errDetail, info) {
+                console.error('[mpegts-bg] error type:', errType, 'detail:', errDetail, info);
+                // Network or fatal error — restart after 3 s
+                try { _mpegtsPlayer.destroy(); } catch (e) {}
+                _mpegtsPlayer = null;
+                setTimeout(function () { startMpegTsBg(baseUrl); }, 3000);
+            });
+        }
+
+        function _hlsReset(video) {
+            _hlsStarted = false;
+            if (_hlsInstance) {
+                try { _hlsInstance.destroy(); } catch (e) {}
+                _hlsInstance = null;
+            }
+            if (_splitSyncTimer) { clearInterval(_splitSyncTimer); _splitSyncTimer = null; }
+            if (_splitVideoHls) {
+                try { _splitVideoHls.destroy(); } catch (e) {}
+                _splitVideoHls = null;
+            }
+            if (_splitAudioHls) {
+                try { _splitAudioHls.destroy(); } catch (e) {}
+                _splitAudioHls = null;
+            }
+            _splitAudioOnlyMode = false;
+            if (video) video.style.display = 'none';
+            console.warn('[hls-bg] stream reset — waiting for restart');
+        }
+
+        // Destroys any active HLS or mpegts player, clearing all MSE source buffers.
+        // Called on every new LOAD so the receiver connects to the fresh FFmpeg pipeline
+        // with no stale frames, and when calibration ends to drop buffered calibration content.
+        function resetBgVideo() {
+            var video = document.getElementById('hls-bg');
+            var audio = document.getElementById('flac-audio');
+            if (_mpegtsPlayer) {
+                try { _mpegtsPlayer.destroy(); } catch (e) {}
+                _mpegtsPlayer = null;
+                _mpegtsLastStartMs = 0;
+                if (video) { try { video.pause(); } catch (e) {} video.style.display = 'none'; }
+            }
+            if (video && (_hlsStarted || _hlsInstance || _splitVideoHls || _splitAudioHls)) {
+                _hlsReset(video);
+            }
+            if (audio) { try { audio.pause(); } catch (e) {} }
+            console.log('[receiver] bg video reset — buffers dropped');
+        }
+
+        // Polls /cast/state once per second after a LOAD.  The first time it sees
+        // calibrationMode == true it arms itself; when it then sees calibrationMode == false
+        // it calls resetBgVideo() so the TV goes dark immediately on Stop Calibration
+        // rather than draining up to 12 s of stale buffered content.
+        function _startCalibrationWatch() {
+            if (_calibPollTimer) { clearTimeout(_calibPollTimer); }
+            // Keep _sawCalibrationMode if already set — avoids repeated live-edge
+            // seeks when LOADs arrive while calibration is active.
+            _calibPollTimer = setTimeout(_calibPoll, 1000);
+        }
+
+        function _calibPoll() {
+            _calibPollTimer = null;
+            if (!_castBaseUrl) return;
+            fetch(_castBaseUrl + 'cast/state')
+                .then(function (r) { return r.json(); })
+                .then(function (s) {
+                    if (s.calibrationMode) {
+                        if (!_sawCalibrationMode) {
+                            _sawCalibrationMode = true;
+                            // In split mode, seek video to live edge after a short delay
+                            // so the Chromecast drops buffered pre-calibration frames and
+                            // shows the calibration display as soon as FFmpeg encodes it.
+                            if (_lastHlsMode === 'fmp4_split' && _splitVideoHls) {
+                                setTimeout(function () {
+                                    var bg = document.getElementById('hls-bg');
+                                    if (bg && _splitVideoHls && _splitVideoHls.liveSyncPosition) {
+                                        bg.currentTime = _splitVideoHls.liveSyncPosition;
+                                        console.log('[receiver] calibration start — video seeked to live edge ' + _splitVideoHls.liveSyncPosition.toFixed(2));
+                                    }
+                                }, 3000);
+                            }
+                        }
+                        _calibPollTimer = setTimeout(_calibPoll, 1000);
+                    } else if (_sawCalibrationMode) {
+                        _sawCalibrationMode = false;
+                        console.log('[receiver] calibration ended');
+                        if (_lastHlsMode === 'fmp4_split') {
+                            // Seek video to live edge to flush calibration frames quickly.
+                            setTimeout(function () {
+                                var bg = document.getElementById('hls-bg');
+                                if (bg && _splitVideoHls && _splitVideoHls.liveSyncPosition) {
+                                    bg.currentTime = _splitVideoHls.liveSyncPosition;
+                                    console.log('[receiver] calibration end — video seeked to live edge ' + _splitVideoHls.liveSyncPosition.toFixed(2));
+                                }
+                            }, 3000);
+                        } else {
+                            resetBgVideo();
+                        }
+                    }
+                    // !_sawCalibrationMode && !s.calibrationMode: not in calib, stop polling.
+                })
+                .catch(function () {
+                    if (_sawCalibrationMode) {
+                        _calibPollTimer = setTimeout(_calibPoll, 2000);
+                    }
+                });
+        }
+
+        // FLAC fMP4 HLS proof-of-concept mode.
+        // Plays /flactest/stream.m3u8 (audio-only, lossless FLAC in fMP4 segments)
+        // through #hls-bg unmuted.  The normal CAF WAV stream continues in parallel so
+        // you can A/B compare the two paths by ear before committing to the new pipeline.
+        function startFlacHlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('flac-audio');
+            if (!video) return;
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[flac-hls] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+            video.muted = false;
+            var url = baseUrl + 'flactest/stream.m3u8';
+            var flacSupported = window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="flac"');
+            var flacOpusSupported = window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="opus"');
+            console.log('[flac-hls] MSE codec support — flac:', flacSupported, ' opus:', flacOpusSupported);
+            console.log('[flac-hls] starting:', url);
+
+            var _mediaErrorCount = 0;
+            _hlsInstance = new Hls({
+                lowLatencyMode: false,
+                maxBufferLength: 30,
+                backBufferLength: 0,
+                manifestLoadingMaxRetry: 12,
+                manifestLoadingRetryDelay: 1000,
+                manifestLoadingMaxRetryTimeout: 12000,
+                // Force codec so MSE opens SourceBuffer with the correct type.
+                // Without this, audio-only fMP4 manifests expose codec info as null
+                // and hls.js falls back to audio/mp4 with no codec string.
+                audioPreference: { audioCodec: 'fLaC' },
+            });
+            _hlsInstance.loadSource(url);
+            _hlsInstance.attachMedia(video);
+            _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[flac-hls] manifest parsed — codec info:', _hlsInstance.levels && JSON.stringify(_hlsInstance.levels.map(function(l){ return l.audioCodec; })));
+                video.volume = 1;
+                video.play().catch(function (e) { console.warn('[flac-hls] play() rejected:', e); });
+            });
+            _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[flac-hls] non-fatal error:', data.type, data.details); return; }
+                console.error('[flac-hls] fatal error type:', data.type, 'details:', data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && _mediaErrorCount++ < 2) {
+                    console.warn('[flac-hls] recoverMediaError() attempt', _mediaErrorCount);
+                    _hlsInstance.recoverMediaError();
+                    _hlsInstance.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    video.muted = true;
+                    setTimeout(function () { startFlacHlsBg(baseUrl); }, 3000);
+                }
+            });
+        }
+
+        // Split A/V fMP4 HLS mode.
+        // Two separate HLS streams: video-only H.264 (/cast/split_video/) and audio-only
+        // FLAC (/cast/split_audio/). The audio element is the master clock; the video
+        // element's playbackRate is nudged to keep it in sync, avoiding the CC v2 CPU
+        // overload that occurs when decoding muxed H.264+FLAC in a single MSE pipeline.
+        function startSplitHlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            var audio = document.getElementById('flac-audio');
+            if (!video || !audio) { console.error('[split-hls] missing video/audio elements'); return; }
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[split-hls] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+
+            fetch(baseUrl + 'api/settings')
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .catch(function () { return null; })
+                .then(function (cfg) {
+                    if (cfg && cfg.splitHlsAudioOnly) {
+                        video.style.display = 'none';
+                        _splitAudioOnlyMode = true;
+                        _initSplitHls(baseUrl, null, audio, cfg);
+                    } else {
+                        _splitAudioOnlyMode = false;
+                        _initSplitHls(baseUrl, video, audio, cfg);
+                    }
+                });
+        }
+
+        function _initSplitHls(baseUrl, video, audio, cfg) {
+            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 3;
+            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
+            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 12;
+            var audioOnly = !!(cfg && cfg.splitHlsAudioOnly);
+
+            var videoUrl = baseUrl + 'cast/split_video/stream.m3u8';
+            var audioUrl = baseUrl + 'cast/split_audio/stream.m3u8';
+            console.log('[split-hls] starting' + (audioOnly ? ' (audio-only)' : '') + ' video:', videoUrl, 'audio:', audioUrl);
+
+            var commonCfg = {
+                lowLatencyMode: false,
+                liveSyncDurationCount: liveSyncDurationCount,
+                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
+                maxBufferLength: maxBufferLength,
+                backBufferLength: 0,
+                manifestLoadingMaxRetry: 12,
+                manifestLoadingRetryDelay: 1000,
+                manifestLoadingMaxRetryTimeout: 12000,
+            };
+
+            var audioMediaErrors = 0;
+            var videoMediaErrors = 0;
+
+            // Startup gate: wait for both players to have a valid liveSyncPosition
+            // before playing. Without this, play() fires before hls.js knows the
+            // live edge, and both players race ahead of liveSyncPosition (negative
+            // buffers, zero safety margin for segment delivery jitter).
+            var _audioReady = false;
+            var _videoReady = audioOnly;  // audio-only: no video gate needed
+
+            function _trySplitStart() {
+                if (!_audioReady || !_videoReady) return;
+                var aSync = _splitAudioHls.liveSyncPosition;
+                var vSync = _splitVideoHls ? _splitVideoHls.liveSyncPosition : null;
+                if (aSync != null) {
+                    audio.currentTime = aSync;
+                    console.log('[split-hls] audio seeking to liveSyncPosition ' + aSync.toFixed(2));
+                }
+                if (vSync != null) {
+                    video.currentTime = vSync;
+                    console.log('[split-hls] video seeking to liveSyncPosition ' + vSync.toFixed(2));
+                }
+                audio.play().catch(function (e) { console.warn('[split-hls] audio play() rejected:', e); });
+                if (video && !audioOnly) video.play().catch(function (e) { console.warn('[split-hls] video play() rejected:', e); });
+            }
+
+            // Audio player (master clock, unmuted)
+            // Map the server's codec setting to the hls.js audioPreference fourcc.
+            var codecMap = { flac: 'fLaC', opus: 'opus', aac: 'mp4a' };
+            var hlsCodec = (cfg && cfg.hlsAudioCodec) ? (codecMap[cfg.hlsAudioCodec] || null) : null;
+            // Audio uses the same liveSyncDurationCount as video so both players target
+            // the same position in the HLS timeline on startup. Diverging values cause
+            // _audioReady to fire much later than _videoReady (blocking playback) and
+            // seeking each player to a different PTS at _trySplitStart (A/V desync).
+            // maxBufferLength is kept at 15s to balance two opposing failure modes on CC v2:
+            //   - Too large (>=30s): MSE bufferFullError — SourceBuffer fills, hls.js stalls
+            //     appending, and the player starves.
+            //   - Too small (<=10s): buffer underrun — with liveSyncDurationCount=3 (6s target)
+            //     only 4s of forward buffer remains, which a CC v2 GC pause easily drains.
+            // 15s gives 9s of forward headroom (15 - 6) = ~4 segments of jitter tolerance.
+            var audioCfg = Object.assign({}, commonCfg, {
+                maxBufferLength: 15,
+                backBufferLength: 0,
+                maxLiveSyncPlaybackRate: 1.0,
+            });
+            if (hlsCodec) audioCfg.audioPreference = { audioCodec: hlsCodec };
+            _splitAudioHls = new Hls(audioCfg);
+            _splitAudioHls.loadSource(audioUrl);
+            _splitAudioHls.attachMedia(audio);
+            _splitAudioHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[split-hls] audio manifest parsed');
+                audio.muted = false;
+                audio.volume = 1;
+            });
+            _splitAudioHls.on(Hls.Events.LEVEL_LOADED, function () {
+                if (!_audioReady) {
+                    var pos = _splitAudioHls.liveSyncPosition;
+                    console.log('[split-hls] audio level loaded, liveSyncPosition=' + (pos ?? 'null'));
+                    if (pos != null && pos > 0) {
+                        _audioReady = true;
+                        _trySplitStart();
+                    }
+                }
+            });
+            _splitAudioHls.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[split-hls] audio non-fatal:', data.type, data.details); return; }
+                console.error('[split-hls] audio fatal:', data.type, data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && audioMediaErrors++ < 2) {
+                    _splitAudioHls.recoverMediaError();
+                    _splitAudioHls.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startSplitHlsBg(baseUrl); }, 3000);
                 }
             });
 
-            var SYS = cast.framework.system.EventType;
-            [SYS.READY, SYS.SENDER_CONNECTED, SYS.SENDER_DISCONNECTED,
-             SYS.SYSTEM_VOLUME_CHANGED, SYS.ERROR].forEach(function (sysEvType) {
-                context.addEventListener(sysEvType, function (event) {
-                    var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); }
-                    catch (e) { detail = String(event); }
-                    console.log('[caf-sys] ' + sysEvType + ' ' + detail);
-                });
+            // Video player (muted, playbackRate-steered to chase audio)
+            if (!audioOnly) {
+            _splitVideoHls = new Hls(commonCfg);
+            _splitVideoHls.loadSource(videoUrl);
+            _splitVideoHls.attachMedia(video);
+            _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[split-hls] video manifest parsed');
+                video.muted = true;
+                video.style.display = 'block';
             });
-        })();
+            _splitVideoHls.on(Hls.Events.LEVEL_LOADED, function () {
+                if (!_videoReady) {
+                    var pos = _splitVideoHls.liveSyncPosition;
+                    console.log('[split-hls] video level loaded, liveSyncPosition=' + (pos ?? 'null'));
+                    if (pos != null && pos > 0) {
+                        _videoReady = true;
+                        _trySplitStart();
+                    }
+                }
+            });
+            _splitVideoHls.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[split-hls] video non-fatal:', data.type, data.details); return; }
+                console.error('[split-hls] video fatal:', data.type, data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && videoMediaErrors++ < 2) {
+                    _splitVideoHls.recoverMediaError();
+                    _splitVideoHls.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startSplitHlsBg(baseUrl); }, 3000);
+                }
+            });
+            } // end if (!audioOnly)
 
-    })(); // end IIFE
+            // PlaybackRate steering: every 500ms compare the audio and video live-edge
+            // latency via EXT-X-PROGRAM-DATE-TIME. Both FFmpeg processes write PDT from
+            // the same wall clock, so comparing PDTs gives the A/V drift. Nudge video
+            // playbackRate to converge on the audio position.
+            var _lastLoggedRate = 1.0;  // last emitted rate, to suppress redundant logs
+            var _lastTelemetryMs = 0;   // wall-clock ms of last telemetry POST
+            var _seekCooldownUntil = 0; // suppress steering until this timestamp after a hard-seek
+            _splitSyncTimer = setInterval(function () {
+                if (audioOnly) return;  // no sync needed in audio-only mode
+                if (!_splitAudioHls || !_splitVideoHls) return;
+                if (audio.paused || video.paused) return;
+                                
+                var now = Date.now();
+                if (now < _seekCooldownUntil) return;
+
+                // Use liveSyncPosition as each player's target playback point.
+                // The delta between audio and video liveSyncPosition tells us how far
+                // apart the two streams are in wall-clock time.
+                var audioSync = _splitAudioHls.liveSyncPosition;
+                var videoSync = _splitVideoHls.liveSyncPosition;
+                if (audioSync == null || videoSync == null) return;
+
+                // How far behind its live-sync target each player is.
+                // drift > 0: video has more buffer to consume (further behind live) → speed up
+                // drift < 0: video has less buffer (closer to live than audio) → slow down
+                var audioBuf = audioSync - audio.currentTime;
+                var videoBuf = videoSync - video.currentTime;
+                var drift = videoBuf - audioBuf;
+
+                // Anomaly guard: liveSyncPosition can spike when HLS.js parses a new
+                // manifest (sequence number reset, etc.). Ignore implausible readings.
+                if (Math.abs(drift) > 8.0) {
+                    console.warn('[split-hls] sync: ignoring anomalous drift=' + (drift * 1000).toFixed(0) + 'ms (liveSyncPosition glitch)');
+                    return;
+                }
+
+                // Large drift (>1s): rate steering (10%) needs 10+ s to recover — hard-seek
+                // before both MSE buffers drain past the live edge.
+                if (Math.abs(drift) > 1.0) {
+                    var targetTime = video.currentTime + drift;
+                    console.log('[split-hls] sync: hard-seek — drift=' + (drift * 1000).toFixed(0) + 'ms, seeking video to ' + targetTime.toFixed(2));
+                    video.currentTime = targetTime;
+                    video.playbackRate = 1.0;
+                    _lastLoggedRate = 1.0;
+                    _seekCooldownUntil = now + 2500;  // suppress steering for 2.5 s while seek completes
+                    // Hard-seeks are buffer anomalies — always POST regardless of calibration state.
+                    _lastTelemetryMs = now;
+                    _postSplitTelemetry({
+                        driftMs: Math.round(drift * 1000),
+                        rate: 1.0,
+                        hardSeek: true,
+                        audioCurrentTime: audio.currentTime,
+                        videoCurrentTime: video.currentTime,
+                        audioLiveSync: audioSync,
+                        videoLiveSync: videoSync,
+                        audioBuf: audioBuf,
+                        videoBuf: videoBuf,
+                        audioBufferedEnd: audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0,
+                        videoBufferedEnd: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
+                        audioLevels: _splitAudioHls.levels ? _splitAudioHls.levels.length : 0,
+                        videoLevels: _splitVideoHls.levels ? _splitVideoHls.levels.length : 0
+                    });
+                    return;
+                }
+
+                var rate;
+                // Dead zone: if within 150ms, keep 1.0x — nothing to post.
+                if (Math.abs(drift) < 0.15) {
+                    rate = 1.0;
+                    if (video.playbackRate !== 1.0) {
+                        video.playbackRate = 1.0;
+                    }
+                    if (_lastLoggedRate !== 1.0) {
+                        console.log('[split-hls] sync: back in dead zone — rate=1.0');
+                        _lastLoggedRate = 1.0;
+                    }
+                    // Dead zone: nothing interesting — skip telemetry POST.
+                    return;
+                } else {
+                    // Proportional steering: half-gain to dampen oscillation, clamp +/-0.10x
+                    rate = 1.0 + Math.max(-0.10, Math.min(0.10, drift * 0.5));
+                    video.playbackRate = rate;
+                    // Log only on rate transitions to avoid console spam.
+                    var roundedRate = Math.round(rate * 1000);
+                    var roundedLast = Math.round(_lastLoggedRate * 1000);
+                    if (Math.abs(roundedRate - roundedLast) >= 5) {
+                        console.log('[split-hls] sync: drift=' + (drift * 1000).toFixed(0) + 'ms — rate=' + rate.toFixed(3));
+                        _lastLoggedRate = rate;
+                    }
+                }
+
+                // Throttled telemetry: calibration page gets 1 update/s; outside calibration
+                // only post on notable drift (>500ms) at most every 2s.
+                var throttleMs = _sawCalibrationMode ? 1000 : 2000;
+                if (!_sawCalibrationMode && Math.abs(drift) < 0.5) return;
+                if ((now - _lastTelemetryMs) < throttleMs) return;
+
+                _lastTelemetryMs = now;
+                _postSplitTelemetry({
+                    driftMs: Math.round(drift * 1000),
+                    rate: rate,
+                    audioCurrentTime: audio.currentTime,
+                    videoCurrentTime: video.currentTime,
+                    audioLiveSync: audioSync,
+                    videoLiveSync: videoSync,
+                    audioBuf: audioBuf,
+                    videoBuf: videoBuf,
+                    audioBufferedEnd: audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0,
+                    videoBufferedEnd: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
+                    audioLevels: _splitAudioHls.levels ? _splitAudioHls.levels.length : 0,
+                    videoLevels: _splitVideoHls.levels ? _splitVideoHls.levels.length : 0
+                });
+            }, 500);
+        }
+
+        // Unified A+V fMP4 HLS mode.
+        // Plays /fmp4hls/stream.m3u8 — muxed H.264 video + FLAC audio in fMP4 segments
+        // produced by a single FFmpeg process (Fmp4HlsRunner on the server).
+        // Uses #hls-bg (full-screen video element) so both tracks display naturally.
+        // CAF's receiverVideoElement is muted in this mode (handled in the LOAD interceptor).
+        function startFmp4HlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            if (!video) { console.error('[fmp4-hls] hls-bg element missing'); return; }
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[fmp4-hls] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+
+            // Fetch configurable HLS buffer settings, then create the player.
+            fetch(baseUrl + 'api/settings')
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .catch(function () { return null; })
+                .then(function (cfg) { _initFmp4Hls(baseUrl, video, cfg); });
+        }
+
+        function _initFmp4Hls(baseUrl, video, cfg) {
+            var liveSyncDurationCount    = (cfg && cfg.hlsLiveSyncSegments > 0)    ? cfg.hlsLiveSyncSegments    : 3;
+            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
+            var maxBufferLength          = (cfg && cfg.hlsMaxBufferSeconds > 0)     ? cfg.hlsMaxBufferSeconds    : 12;
+
+            var url = baseUrl + 'fmp4hls/stream.m3u8';
+            console.log('[fmp4-hls] starting:', url,
+                'liveSyncDurationCount=' + liveSyncDurationCount,
+                'liveMaxLatencyDurationCount=' + liveMaxLatencyDurationCount,
+                'maxBufferLength=' + maxBufferLength);
+
+            var _mediaErrorCount = 0;
+            _hlsInstance = new Hls({
+                lowLatencyMode: false,
+                liveSyncDurationCount: liveSyncDurationCount,
+                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
+                maxBufferLength: maxBufferLength,
+                backBufferLength: 4,
+                manifestLoadingMaxRetry: 12,
+                manifestLoadingRetryDelay: 1000,
+                manifestLoadingMaxRetryTimeout: 12000,
+            });
+            _hlsInstance.loadSource(url);
+            _hlsInstance.attachMedia(video);
+            _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[fmp4-hls] manifest parsed — levels:', _hlsInstance.levels && JSON.stringify(_hlsInstance.levels.map(function(l){ return { v: l.videoCodec, a: l.audioCodec }; })));
+                video.muted = false;
+                video.volume = 1;
+                video.style.display = 'block';
+                video.play().catch(function (e) { console.warn('[fmp4-hls] play() rejected:', e); });
+            });
+            _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[fmp4-hls] non-fatal error:', data.type, data.details); return; }
+                console.error('[fmp4-hls] fatal error type:', data.type, 'details:', data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && _mediaErrorCount++ < 2) {
+                    console.warn('[fmp4-hls] recoverMediaError() attempt', _mediaErrorCount);
+                    _hlsInstance.recoverMediaError();
+                    _hlsInstance.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startFmp4HlsBg(baseUrl); }, 3000);
+                }
+            });
+        }
+
+        // Offline mux fMP4 HLS mode.
+        // Plays /cast/offline/stream.m3u8 — single muxed H.264+FLAC fMP4 segments
+        // produced offline by OfflineMuxCoordinator. The server withholds the manifest
+        // until 16 s of segments are buffered, so we use aggressive manifest retry
+        // settings (30 retries / 2 s interval = 60 s patience). Once the manifest
+        // appears, hls.js loads all buffered segments quickly and playback begins.
+        // The CAF audio element is muted; this #hls-bg video carries both tracks.
+        function startOfflineHlsBg(baseUrl) {
+            if (_hlsInstance || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            if (!video) { console.error('[offline-hls] hls-bg element missing'); return; }
+            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[offline-hls] hls.js not available or MSE not supported');
+                return;
+            }
+
+            _hlsStarted = true;
+            var url = baseUrl + 'cast/offline/stream.m3u8';
+            console.log('[offline-hls] starting:', url);
+
+            var _mediaErrorCount = 0;
+            _hlsInstance = new Hls({
+                lowLatencyMode: false,
+                // Non-live: segments are pre-muxed and buffered server-side.
+                // Use larger buffer so the full 16 s pre-roll is consumed smoothly.
+                maxBufferLength: 30,
+                backBufferLength: 0,
+                // Manifest only appears after server-side 16 s pre-buffer gate.
+                // Retry aggressively so hls.js waits rather than declaring a fatal error.
+                manifestLoadingMaxRetry: 30,
+                manifestLoadingRetryDelay: 2000,
+                manifestLoadingMaxRetryTimeout: 60000,
+            });
+            _hlsInstance.loadSource(url);
+            _hlsInstance.attachMedia(video);
+            _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
+                console.log('[offline-hls] manifest parsed — levels:', _hlsInstance.levels && JSON.stringify(_hlsInstance.levels.map(function(l){ return { v: l.videoCodec, a: l.audioCodec }; })));
+                video.muted = false;
+                video.volume = 1;
+                video.style.display = 'block';
+                video.play().catch(function (e) { console.warn('[offline-hls] play() rejected:', e); });
+            });
+            _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) { console.warn('[offline-hls] non-fatal error:', data.type, data.details); return; }
+                console.error('[offline-hls] fatal error type:', data.type, 'details:', data.details);
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && _mediaErrorCount++ < 2) {
+                    console.warn('[offline-hls] recoverMediaError() attempt', _mediaErrorCount);
+                    _hlsInstance.recoverMediaError();
+                    _hlsInstance.startLoad(-1);
+                } else {
+                    _hlsReset(video);
+                    setTimeout(function () { startOfflineHlsBg(baseUrl); }, 3000);
+                }
+            });
+        }
+
+        function startHlsBg(baseUrl) {
+            if (_hlsStarted || !baseUrl) return;
+            var video = document.getElementById('hls-bg');
+            if (!video) return;
+
+            _hlsStarted = true;
+            var url = baseUrl + 'cast/stream/stream.m3u8';
+            console.log('[hls-bg] starting:', url);
+
+            if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+                console.log('[hls-bg] using hls.js (MSE)');
+                var _mediaErrorCount = 0;
+                _hlsInstance = new Hls({
+                    lowLatencyMode: false,
+                    liveSyncDurationCount: 3,
+                    liveMaxLatencyDurationCount: 6,
+                    maxBufferLength: 12,
+                    backBufferLength: 0,
+                    maxLiveSyncPlaybackRate: 1.1,
+                    // Manifest may not appear until ffmpeg has fully started (~5 s).
+                    // Raise retries so hls.js waits in place rather than firing a
+                    // fatal error that triggers the outer 2 s restart loop.
+                    manifestLoadingMaxRetry: 8,
+                    manifestLoadingRetryDelay: 1000,
+                    manifestLoadingMaxRetryTimeout: 8000
+                });
+                _hlsInstance.loadSource(url);
+                _hlsInstance.attachMedia(video);
+                _hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
+                    console.log('[hls-bg] manifest parsed — starting playback');
+                    video.style.display = 'block';
+                    video.play().catch(function (e) { console.warn('[hls-bg] play() rejected:', e); });
+                });
+                // A/V sync auto-tuning: measure video pipeline latency via EXT-X-PROGRAM-DATE-TIME.
+                // programDateTime is the wall-clock ms when FFmpeg captured the segment; the
+                // difference from Date.now() is the total end-to-end video delay.
+                var _avEma = 0;           // exponential moving average of latency (ms)
+                var _avFragCount = 0;     // fragments seen since last report
+                var _avSampleCount = 0;   // total samples collected
+                var _avLastReported = -1; // last value posted (ms), -1 = never reported
+                _hlsInstance.on(Hls.Events.FRAG_CHANGED, function (event, data) {
+                    var pdt = data.frag && data.frag.programDateTime;
+                    if (!pdt) return;
+                    var latencyMs = Date.now() - pdt;
+                    if (latencyMs < 1000 || latencyMs > 60000) return; // ignore bogus values
+                    // Exponential moving average — alpha=0.15 converges in ~20 fragments
+                    _avEma = _avSampleCount === 0 ? latencyMs : _avEma * 0.85 + latencyMs * 0.15;
+                    _avSampleCount++;
+                    _avFragCount++;
+                    // Wait for 20 samples to stabilise, then report once.
+                    // After the first report, only update again if the EMA has shifted
+                    // by more than 1500 ms — this prevents buffer-level noise (from
+                    // maxBufferLength jitter) from constantly changing the stored value.
+                    if (_avSampleCount >= 20 && _avFragCount >= 3) {
+                        _avFragCount = 0;
+                        var reportMs = Math.round(_avEma);
+                        if (_avLastReported < 0 || Math.abs(reportMs - _avLastReported) > 1500) {
+                            _avLastReported = reportMs;
+                            console.log('[hls-bg] A/V latency EMA:', reportMs, 'ms (reporting)');
+                            fetch(baseUrl + 'cast/avdelay', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ delayMs: reportMs })
+                            }).catch(function () {});
+                        } else {
+                            console.log('[hls-bg] A/V latency EMA:', reportMs, 'ms (stable, no update)');
+                        }
+                    }
+                });
+                _hlsInstance.on(Hls.Events.ERROR, function (event, data) {
+                    if (!data.fatal) return;
+                    console.error('[hls-bg] fatal error type:', data.type, 'details:', data.details);
+                    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                        _mediaErrorCount++;
+                        if (_mediaErrorCount <= 2) {
+                            // hls.js 1.x: recoverMediaError() re-attaches the codec;
+                            // startLoad(-1) is required to resume segment fetching.
+                            console.warn('[hls-bg] recoverMediaError() attempt', _mediaErrorCount);
+                            _hlsInstance.recoverMediaError();
+                            _hlsInstance.startLoad(-1);
+                        } else {
+                            console.warn('[hls-bg] media error unrecoverable after', _mediaErrorCount, 'attempts — restarting');
+                            _hlsReset(video);
+                            setTimeout(function () { startHlsBg(baseUrl); }, 2000);
+                        }
+                    } else {
+                        // Network or unrecoverable — auto-restart after 2s
+                        console.warn('[hls-bg] restarting HLS stream in 2s');
+                        _hlsReset(video);
+                        setTimeout(function () {
+                            _hlsStarted = false;
+                            startHlsBg(baseUrl);
+                        }, 2000);
+                    }
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                console.log('[hls-bg] using native HLS');
+                video.src = url;
+                video.addEventListener('canplay', function onCanPlay() {
+                    video.removeEventListener('canplay', onCanPlay);
+                    video.style.display = 'block';
+                    video.play().catch(function (e) { console.warn('[hls-bg] play() rejected:', e); });
+                });
+                video.addEventListener('error', function onError() {
+                    video.removeEventListener('error', onError);
+                    console.error('[hls-bg] native HLS error:', video.error);
+                    _hlsReset(video);
+                });
+                video.load();
+            } else {
+                console.warn('[hls-bg] HLS not supported (no hls.js, no native HLS)');
+                _hlsStarted = false;
+            }
+        }
     </script>
 </body>
 </html>
