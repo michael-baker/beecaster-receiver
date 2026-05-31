@@ -76,8 +76,19 @@
             const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
             console.log('[receiver] LOAD interceptor: baseUrl=' + baseUrl);
             if (baseUrl) {
-                _castBaseUrl = baseUrl;
+                _castBaseUrl      = baseUrl;
+                _hlsStreamingMode = (request.media && request.media.customData && request.media.customData.HlsStreamingMode) || '';
                 _fetchRemoteLogSetting(baseUrl);
+
+                // In pcm_stream mode audio comes from the Web Audio API — silence the CAF
+                // media element IMMEDIATELY (before any async work) so the WAV stream that
+                // CAF loads into receiverVideoElement never reaches the speakers.
+                var caf = document.getElementById('receiverVideoElement');
+                if (caf) {
+                    caf.muted  = (_hlsStreamingMode === 'pcm_stream');
+                    caf.volume = (_hlsStreamingMode === 'pcm_stream') ? 0 : 1;
+                }
+
                 // Invalidate the sync epoch so the loop does not use a stale value
                 // from the previous track while waiting for the next /cast/audio-clock poll.
                 _epochWallMs    = -1;
@@ -87,12 +98,12 @@
                     if (!_splitVideoHls) {
                         _showAudioSyncOverlay();
                         resetBgVideo();
-                        startCafWavSync(baseUrl);
+                        _dispatchStream(baseUrl);
                     } else {
                         console.log('[receiver] LOAD: HLS already running — skipping reset');
                     }
                 } catch (e) {
-                    console.error('[receiver] startCafWavSync threw (non-fatal):', e && e.message ? e.message : String(e));
+                    console.error('[receiver] _dispatchStream threw (non-fatal):', e && e.message ? e.message : String(e));
                 }
                 _startCalibrationWatch();
             }
@@ -150,6 +161,11 @@
             // Resume Web Audio playback (pcm_stream mode).
             if (_audioCtx && _audioCtx.state === 'suspended') {
                 _audioCtx.resume().catch(function () {});
+            }
+            // Re-enforce mute on CAF element — CAF may reset it when it fires PLAYING.
+            if (_hlsStreamingMode === 'pcm_stream') {
+                var cafEl = document.getElementById('receiverVideoElement');
+                if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
             }
             if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
             
@@ -246,6 +262,7 @@
         var _splitVideoHls = null;
         var _syncTimer     = null;   // A/V sync loop interval handle
         var _castBaseUrl   = '';     // set on LOAD from customData.MediaBaseUrl
+        var _hlsStreamingMode = '';  // set on LOAD from customData.HlsStreamingMode
         var _calibPollTimer = null;
         var _sawCalibrationMode = false;
 
