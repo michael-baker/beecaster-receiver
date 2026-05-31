@@ -219,20 +219,23 @@
                         lowLatencyMode:              false,
                         liveSyncDurationCount:       liveSyncCount,
                         liveMaxLatencyDurationCount: liveMaxCount,
-                        maxBufferLength:             25,
+                        maxBufferLength:             30,
+                        maxMaxBufferLength:          60,
+                        maxBufferSize:               60 * 1024 * 1024,
                         backBufferLength:            0,
                         enableWorker:                true,
                         abrEnabled:                  false,
                         startLevel:                  0,
                         debug:                       false,
+                        progressive:                 true,
                         manifestLoadingMaxRetry:     12,
                         manifestLoadingRetryDelay:   1000,
                         manifestLoadingMaxRetryTimeout: 12000,
                     });
 
-                    // Defer play() until enough fragments are buffered to avoid an
-                    // immediate stall when the playlist has only 1 fragment.
+                    // Defer play() until enough fragments are buffered.
                     var _playStarted = false;
+                    var _fragsBuffered = 0;
                     function _tryStartPlayback() {
                         if (_playStarted) return;
                         _playStarted = true;
@@ -251,13 +254,17 @@
                     }
 
                     _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
-                        if (!_playStarted && d.details.fragments.length >= 2) {
+                        if (!_playStarted && d.details.fragments.length >= 3) {
                             _tryStartPlayback();
                         }
                     });
 
                     _hls.on(Hls.Events.FRAG_BUFFERED, function () {
+                        _fragsBuffered++;
                         if (_stallTimer) { clearTimeout(_stallTimer); _stallTimer = null; }
+                        if (!_playStarted && _fragsBuffered >= 3) {
+                            _tryStartPlayback();
+                        }
                     });
 
                     _hls.on(Hls.Events.BUFFER_STALLED, function () {
