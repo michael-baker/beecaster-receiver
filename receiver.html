@@ -166,6 +166,32 @@
 
         context.start(options);
 
+        // ── Permanently silence #caf-el via Web Audio API ──────────────────────
+        // CAF owns #caf-el and overrides muted/volume on every PLAYING event,
+        // making the /live WAV audible regardless of what JS sets.
+        // createMediaElementSource() permanently re-routes the element's audio
+        // output into the Web Audio graph and away from the speakers.
+        // We deliberately do NOT connect the source node to AudioContext.destination,
+        // so the audio is consumed (keeping the element playing for CAF state) but
+        // produces zero output. CAF state tracking is unaffected.
+        (function _silenceCafElement() {
+            var cafEl = document.getElementById('caf-el');
+            if (!cafEl) return;
+            try {
+                var silenceCtx = new (window.AudioContext || window.webkitAudioContext)();
+                var src = silenceCtx.createMediaElementSource(cafEl);
+                // Intentionally not connected to silenceCtx.destination.
+                console.log('[caf-silence] caf-el audio permanently routed off speakers');
+            } catch (e) {
+                // Fallback: keep trying to zero volume on every timeupdate.
+                console.warn('[caf-silence] AudioContext unavailable, using volume=0 fallback:', e);
+                cafEl.addEventListener('volumechange', function () {
+                    if (cafEl.volume !== 0) { cafEl.volume = 0; }
+                });
+                cafEl.volume = 0;
+            }
+        })();
+
         // ══════════════════════════════════════════════════════════════════════
         // fmp4_muxed pipeline
         //
