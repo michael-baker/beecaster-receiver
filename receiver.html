@@ -82,9 +82,7 @@
                 // from the previous track while waiting for the next /cast/audio-clock poll.
                 _epochWallMs    = -1;
                 _videoStartDate = null;
-                // CAF IS the audio source in caf_wav_sync — must remain unmuted.
-                var caf = document.getElementById('receiverVideoElement');
-                if (caf) caf.muted = false;
+                _resetPcmStream(); // tear down any previous AudioWorklet + Worker
                 try {
                     if (!_splitVideoHls) {
                         _showAudioSyncOverlay();
@@ -118,6 +116,10 @@
                 var bg = document.getElementById('hls-bg');
                 if (bg) try { bg.pause(); } catch (e) {}
             }
+            // Suspend Web Audio playback (pcm_stream mode).
+            if (_audioCtx && _audioCtx.state === 'running') {
+                _audioCtx.suspend().catch(function () {});
+            }
 
             _pauseRevealTimer = setTimeout(function () {
                 _pauseRevealTimer = null;
@@ -141,9 +143,13 @@
                 // Do NOT hard-seek to liveSyncPosition here — that would jump the video
                 // forward by the full HLS latency on every resume, causing a large drift
                 // spike that the sync loop then has to fight against.
-                // Instead: just unpause and let _cafWavSyncVideoSync correct any drift
+                // Instead: just unpause and let the sync loop correct any drift
                 // with a hard-seek to the audio-aligned position within one tick.
                 if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
+            }
+            // Resume Web Audio playback (pcm_stream mode).
+            if (_audioCtx && _audioCtx.state === 'suspended') {
+                _audioCtx.resume().catch(function () {});
             }
             if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
             
@@ -248,6 +254,17 @@
         var _epochWallMs      = -1;  // server UTC ms when CAF connected (caf.currentTime=0)
         var _videoStartDate   = null; // cached result of video.getStartDate()
         var _videoStartDateAt = 0;    // wall time when _videoStartDate was last refreshed
+
+        // pcm_stream state — AudioWorklet + Web Worker audio pipeline.
+        var _audioCtx           = null;    // AudioContext
+        var _workletNode        = null;    // AudioWorkletNode (pcm-sink)
+        var _pcmWorker          = null;    // Web Worker (pcm-fetch-worker.js)
+        var _pcmStartWallMs     = -1;      // X-PCM-Start-Wall-Ms header value
+        var _pcmAudioMs         = 0;       // audioTimeMs from last worklet clock message
+        var _pcmRingFill        = 0;       // ringFill (samples) from last worklet clock message
+        var _pcmSampleRate      = 48000;   // X-PCM-SampleRate header value
+        var _pcmSamplesBuffered = 0;       // total Float32 samples delivered to worklet
+        var _pcmPrerollSent     = false;   // true after 'start' sent to worklet
 
         function _postSplitTelemetry(data) {
             if (!_castBaseUrl) return;
@@ -537,6 +554,337 @@
                 var roundedRate = Math.round(rate * 1000);
                 if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 3) {
                     console.log('[caf-wav-sync] sync: drift=' + drift.toFixed(0) + 'ms rate=' + rate.toFixed(3) + ' cafT=' + caf.currentTime.toFixed(2) + ' vidT=' + video.currentTime.toFixed(2));
+                    _lastLoggedRate = rate;
+                }
+            }, SYNC_TICK_MS);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // pcm_stream pipeline — AudioWorklet + Web Worker for near-bit-perfect audio
+        // + wall-clock A/V synchronisation against HLS video EXT-X-PROGRAM-DATE-TIME.
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        // Tear down any live pcm_stream components (called on every LOAD / teardown).
+        function _resetPcmStream() {
+            if (_pcmWorker)   { try { _pcmWorker.terminate();    } catch (e) {} _pcmWorker   = null; }
+            if (_workletNode) { try { _workletNode.disconnect(); } catch (e) {} _workletNode = null; }
+            if (_audioCtx)    { try { _audioCtx.close();         } catch (e) {} _audioCtx    = null; }
+            _pcmStartWallMs     = -1;
+            _pcmAudioMs         = 0;
+            _pcmRingFill        = 0;
+            _pcmSamplesBuffered = 0;
+            _pcmPrerollSent     = false;
+        }
+
+        // Reads api/settings to detect the active streaming mode and dispatches to the
+        // appropriate pipeline start function.  Both paths are kept so settings changes
+        // take effect on the next LOAD without redeploying the receiver.
+        function _dispatchStream(baseUrl) {
+            fetch(baseUrl + 'api/settings')
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .catch(function () { return null; })
+                .then(function (cfg) {
+                    var mode = (cfg && cfg.hlsStreamingMode) || '';
+                    console.log('[receiver] streaming mode: ' + (mode || '(unknown)'));
+                    if (mode === 'pcm_stream') {
+                        startPcmStream(baseUrl, cfg);
+                    } else {
+                        // caf_wav_sync and all legacy modes — existing path.
+                        // startCafWavSync does its own settings fetch internally.
+                        startCafWavSync(baseUrl);
+                    }
+                });
+        }
+
+        // ── startPcmStream ────────────────────────────────────────────────────────
+        // Mutes the CAF media element (audio comes from Web Audio API), starts the
+        // HLS video pipeline, then starts the AudioWorklet + PCM fetch worker.
+        function startPcmStream(baseUrl, cfg) {
+            if (_hlsStarted || !baseUrl) return;
+            _hlsStarted = true;
+
+            // Audio comes from the Web Audio API — keep CAF element muted.
+            var caf = document.getElementById('receiverVideoElement');
+            if (caf) caf.muted = true;
+
+            var video = document.getElementById('hls-bg');
+            if (!video || typeof Hls === 'undefined' || !Hls.isSupported()) {
+                console.error('[pcm-stream] hls.js not available or video element missing');
+                return;
+            }
+
+            var liveSyncDurationCount       = (cfg && cfg.hlsLiveSyncSegments  > 0) ? cfg.hlsLiveSyncSegments  : 3;
+            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
+
+            _splitVideoHls = new Hls({
+                lowLatencyMode:              false,
+                liveSyncDurationCount:       liveSyncDurationCount,
+                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
+                maxBufferLength:             25,
+                backBufferLength:            20,
+                enableWorker:                false,
+                abrEnabled:                  false,
+                startLevel:                  0,
+                manifestLoadingMaxRetry:     12,
+                manifestLoadingRetryDelay:   1000,
+                manifestLoadingMaxRetryTimeout: 12000,
+            });
+
+            _splitVideoHls.loadSource(baseUrl + 'cast/split_video/stream.m3u8');
+            _splitVideoHls.attachMedia(video);
+
+            _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
+                video.muted = true;
+                video.style.display = 'block';
+                var pos = _splitVideoHls.liveSyncPosition;
+                if (pos != null) { video.currentTime = pos; }
+                video.play().catch(function (e) { console.warn('[pcm-stream] video play() rejected:', e); });
+                console.log('[pcm-stream] HLS manifest parsed — starting AudioWorklet pipeline');
+                _startPcmAudioWorklet(baseUrl);
+                _pcmSyncVideoSync();
+            });
+
+            _splitVideoHls.on(Hls.Events.ERROR, function (evt, data) {
+                if (!data.fatal) return;
+                console.error('[pcm-stream] fatal HLS error:', data.type, data.details);
+                if (_splitVideoHls) { try { _splitVideoHls.destroy(); } catch (e) {} _splitVideoHls = null; }
+                if (_syncTimer) { clearInterval(_syncTimer); _syncTimer = null; }
+                _hlsStarted = false;
+                setTimeout(function () { startPcmStream(baseUrl, cfg); }, 3000);
+            });
+        }
+
+        // ── _startPcmAudioWorklet ─────────────────────────────────────────────────
+        // Creates AudioContext → loads pcm-worklet.js → creates PcmSinkProcessor node
+        // → starts pcm-fetch-worker.js → opens /cast/pcmlive stream.
+        function _startPcmAudioWorklet(baseUrl) {
+            try {
+                _audioCtx = new AudioContext({ sampleRate: _pcmSampleRate });
+
+                _audioCtx.audioWorklet.addModule(baseUrl + 'receiver/pcm-worklet.js')
+                    .then(function () {
+                        _workletNode = new AudioWorkletNode(_audioCtx, 'pcm-sink');
+                        _workletNode.connect(_audioCtx.destination);
+
+                        _workletNode.port.onmessage = function (e) {
+                            var msg = e.data;
+                            if (msg.type === 'clock') {
+                                // audioTimeMs: content timestamp of the last chunk written to ring.
+                                // ringFill: samples currently buffered ahead of the playhead.
+                                // currentPcmMs ≈ audioTimeMs − ringFill/sampleRate
+                                // → what the DAC is sending right now.
+                                _pcmAudioMs  = msg.audioTimeMs;
+                                _pcmRingFill = msg.ringFill;
+                            } else if (msg.type === 'underrun') {
+                                console.warn('[pcm-stream] worklet underrun ringFill=' + msg.ringFill + ' — re-arming pre-roll');
+                                // Re-arm pre-roll so we buffer again before restarting output.
+                                _pcmPrerollSent     = false;
+                                _pcmSamplesBuffered = 0;
+                                if (_workletNode) _workletNode.port.postMessage({ type: 'reset' });
+                            }
+                        };
+
+                        // Start the Web Worker that fetches and parses the framed PCM stream.
+                        _pcmWorker = new Worker(baseUrl + 'receiver/pcm-fetch-worker.js');
+                        _pcmWorker.onmessage = function (e) {
+                            var msg = e.data;
+                            if (msg.type === 'pcm') {
+                                if (_workletNode) {
+                                    _workletNode.port.postMessage(
+                                        { type: 'pcm', left: msg.left, right: msg.right, audioTimeMs: msg.audioTimeMs },
+                                        [msg.left.buffer, msg.right.buffer]
+                                    );
+                                }
+                                _pcmSamplesBuffered += msg.left.length;
+                                // Send 'start' to worklet after 1 s pre-roll (48000 samples at 48 kHz).
+                                if (!_pcmPrerollSent && _pcmSamplesBuffered >= 48000) {
+                                    _pcmPrerollSent = true;
+                                    if (_workletNode) _workletNode.port.postMessage({ type: 'start' });
+                                    console.log('[pcm-stream] pre-roll complete (' + _pcmSamplesBuffered + ' samples) — audio starting');
+                                }
+                            } else if (msg.type === 'syncLost') {
+                                console.warn('[pcm-stream] frame sync lost — scanning for magic');
+                            }
+                        };
+
+                        _startPcmFetch(baseUrl);
+                        console.log('[pcm-stream] AudioWorklet + Worker ready');
+                    })
+                    .catch(function (err) {
+                        console.error('[pcm-stream] audioWorklet.addModule failed:', err);
+                    });
+            } catch (err) {
+                console.error('[pcm-stream] AudioContext/Worklet setup failed:', err);
+            }
+        }
+
+        // ── _startPcmFetch ────────────────────────────────────────────────────────
+        // Opens a streaming GET to /cast/pcmlive, reads the start wall-clock from the
+        // response header, and pumps raw byte chunks to the Web Worker for parsing.
+        function _startPcmFetch(baseUrl) {
+            if (!_pcmWorker) return;
+            fetch(baseUrl + 'cast/pcmlive', { cache: 'no-store' })
+                .then(function (resp) {
+                    if (!resp.ok) {
+                        console.error('[pcm-stream] /cast/pcmlive HTTP ' + resp.status + ' — retrying in 3 s');
+                        setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
+                        return;
+                    }
+
+                    // X-PCM-Start-Wall-Ms: server UTC ms when AudioClockTee audioTimeMs = 0.
+                    // Used as the fixed anchor: audioWallMs = startWallMs + currentPcmMs.
+                    var startHdr = resp.headers.get('X-PCM-Start-Wall-Ms');
+                    if (startHdr) {
+                        var parsed = parseInt(startHdr, 10);
+                        if (!isNaN(parsed) && parsed > 0) {
+                            _pcmStartWallMs = parsed;
+                            console.log('[pcm-stream] startWallMs=' + _pcmStartWallMs);
+                        }
+                    }
+                    var srHdr = resp.headers.get('X-PCM-SampleRate');
+                    if (srHdr) { var sr = parseInt(srHdr, 10); if (sr > 0) _pcmSampleRate = sr; }
+
+                    if (!resp.body) {
+                        console.error('[pcm-stream] response has no body — retrying');
+                        setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
+                        return;
+                    }
+
+                    var reader = resp.body.getReader();
+                    function pump() {
+                        reader.read().then(function (result) {
+                            if (result.done) {
+                                console.log('[pcm-stream] stream ended — reconnecting in 2 s');
+                                if (_pcmWorker) _pcmWorker.postMessage({ type: 'reset' });
+                                setTimeout(function () { _startPcmFetch(baseUrl); }, 2000);
+                                return;
+                            }
+                            if (_pcmWorker) {
+                                _pcmWorker.postMessage({ type: 'chunk', data: result.value }, [result.value.buffer]);
+                            }
+                            pump();
+                        }).catch(function (err) {
+                            if (_pcmWorker) {
+                                console.warn('[pcm-stream] fetch read error:', err, '— retrying in 3 s');
+                                setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
+                            }
+                        });
+                    }
+                    pump();
+                })
+                .catch(function (err) {
+                    console.error('[pcm-stream] fetch error:', err, '— retrying in 3 s');
+                    setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
+                });
+        }
+
+        // ── _pcmSyncVideoSync ─────────────────────────────────────────────────────
+        //
+        // A/V sync loop for pcm_stream mode.
+        //
+        // The AudioWorklet posts 'clock' messages every 1024 samples (~21 ms at 48 kHz).
+        // Each message carries:
+        //   audioTimeMs — content timestamp of the last frame written to the ring
+        //   ringFill    — samples currently buffered ahead of the hardware playhead
+        //
+        // The DAC is currently playing content at approximately:
+        //   currentPcmMs ≈ audioTimeMs − ringFill × 1000 / sampleRate
+        //   audioWallMs  = pcmStartWallMs + currentPcmMs
+        //
+        // Video wall time comes directly from EXT-X-PROGRAM-DATE-TIME (PDT), avoiding
+        // the liveSyncPosition sawtooth that broke the previous caf_wav_sync design:
+        //   videoWallMs  = video.getStartDate().getTime() + video.currentTime × 1000
+        //
+        // drift = audioWallMs − videoWallMs
+        //   > 0 : audio is ahead → video must catch up (rate > 1, or hard-seek forward)
+        //   < 0 : video is ahead → video must slow down (rate < 1, or hard-seek back)
+        //
+        function _pcmSyncVideoSync() {
+            if (_syncTimer) clearInterval(_syncTimer);
+
+            var SYNC_TICK_MS   = 100;   // evaluation interval
+            var SEEK_THRESHOLD = 400;   // ms: hard-seek when |drift| exceeds this
+            var DEAD_ZONE      = 40;    // ms: no correction within ±40 ms
+            var RATE_GAIN      = 0.5;   // proportional gain (drift_s → rate delta)
+            var MAX_RATE_DELTA = 0.10;  // ±10 % max playback rate adjustment
+            var SEEK_COOLDOWN  = 2000;  // ms: suppress consecutive seeks
+
+            var _lastLoggedRate = 1.0;
+            var _graceUntil     = Date.now() + 5000; // 5 s for HLS latch + pre-roll
+            var _lastHardSeekAt = 0;
+
+            _syncTimer = setInterval(function () {
+                var now = Date.now();
+                if (now < _graceUntil)      return;
+                if (!_splitVideoHls)        return;
+                if (!_pcmPrerollSent)       return; // worklet not yet playing
+                if (_pcmStartWallMs < 0)    return; // header not received yet
+                if (_pcmAudioMs === 0 && _pcmRingFill === 0) return; // no worklet clock yet
+
+                var video = document.getElementById('hls-bg');
+                if (!video || video.paused)  return;
+
+                // ── Audio wall clock ──────────────────────────────────────────────
+                // currentPcmMs: content time currently at the DAC output.
+                // audioTimeMs is the content timestamp of the last chunk pushed to the
+                // ring write head; subtracting ringFill gives the read head content time.
+                var currentPcmMs = _pcmAudioMs - (_pcmRingFill * 1000 / _pcmSampleRate);
+                var audioWallMs  = _pcmStartWallMs + Math.max(0, currentPcmMs);
+
+                // ── Video wall clock ──────────────────────────────────────────────
+                var startDate = _getVideoStartDate(video);
+                if (!startDate) {
+                    if (!_pcmSyncVideoSync._pdtWarned) {
+                        _pcmSyncVideoSync._pdtWarned = true;
+                        console.warn('[pcm-stream] EXT-X-PROGRAM-DATE-TIME not yet in manifest — waiting');
+                    }
+                    return;
+                }
+                var videoWallMs = startDate.getTime() + video.currentTime * 1000;
+
+                var drift = audioWallMs - videoWallMs; // ms; > 0 = video behind audio
+
+                if (!isFinite(drift) || Math.abs(drift) > 30000) {
+                    console.warn('[pcm-stream] anomalous drift=' + drift.toFixed(0) + 'ms (pcmAudio=' + _pcmAudioMs + ' ringFill=' + _pcmRingFill + ') — skipping');
+                    return;
+                }
+
+                // ── Hard-seek ─────────────────────────────────────────────────────
+                if (Math.abs(drift) > SEEK_THRESHOLD && (now - _lastHardSeekAt) > SEEK_COOLDOWN) {
+                    var targetVideoTime = (audioWallMs - startDate.getTime()) / 1000;
+                    if (video.buffered.length > 0) {
+                        var bufStart = video.buffered.start(0) + 0.1;
+                        var bufEnd   = video.buffered.end(video.buffered.length - 1) - 0.1;
+                        targetVideoTime = Math.max(bufStart, Math.min(bufEnd, targetVideoTime));
+                    }
+                    if (targetVideoTime > 0) {
+                        video.currentTime = targetVideoTime;
+                        video.playbackRate = 1.0;
+                        _lastHardSeekAt = now;
+                        _lastLoggedRate = 1.0;
+                        _videoStartDate = null; // force PDT re-read after seek
+                        console.log('[pcm-stream] hard-seek: drift=' + drift.toFixed(0) + 'ms curPcm=' + currentPcmMs.toFixed(0) + 'ms → seekTo=' + targetVideoTime.toFixed(3));
+                        _postSplitTelemetry({ type: 'pcm_seek', driftMs: Math.round(drift), targetTime: targetVideoTime, audioWallMs: Math.round(audioWallMs), videoWallMs: Math.round(videoWallMs), currentPcmMs: Math.round(currentPcmMs) });
+                    }
+                    return;
+                }
+
+                // ── Dead zone ─────────────────────────────────────────────────────
+                if (Math.abs(drift) < DEAD_ZONE) {
+                    if (video.playbackRate !== 1.0) {
+                        video.playbackRate = 1.0;
+                        console.log('[pcm-stream] sync: dead zone — rate=1.0 drift=' + drift.toFixed(0) + 'ms');
+                        _lastLoggedRate = 1.0;
+                    }
+                    return;
+                }
+
+                // ── Rate trim ─────────────────────────────────────────────────────
+                var rate = 1.0 + Math.max(-MAX_RATE_DELTA, Math.min(MAX_RATE_DELTA, (drift / 1000) * RATE_GAIN));
+                video.playbackRate = rate;
+                var roundedRate = Math.round(rate * 1000);
+                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 3) {
+                    console.log('[pcm-stream] sync: drift=' + drift.toFixed(0) + 'ms rate=' + rate.toFixed(3) + ' curPcm=' + currentPcmMs.toFixed(0) + 'ms vidT=' + video.currentTime.toFixed(2));
                     _lastLoggedRate = rate;
                 }
             }, SYNC_TICK_MS);
