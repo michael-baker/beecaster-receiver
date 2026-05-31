@@ -223,7 +223,7 @@
                         maxBufferLength:             30,
                         maxMaxBufferLength:          60,
                         maxBufferSize:               60 * 1024 * 1024,
-                        backBufferLength:            0,
+                        backBufferLength:            Infinity,  // NEVER remove back buffer — remove() stalls audio on CC v2
                         enableWorker:                false,
                         abrEnabled:                  false,
                         startLevel:                  0,
