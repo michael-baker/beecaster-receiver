@@ -396,18 +396,28 @@
             var audioMs = _getAudioClockMs(cafEl);
             var targetSec = audioMs / 1000;
 
-            // Find the best starting position within the buffered range
+            // Wait until the video buffer extends past the current audio position.
+            // Without this, the PLL starts with zero headroom and immediately stalls.
             var buf = player.buffered;
-            if (buf.length > 0) {
-                var bufStart = buf.start(0);
-                var bufEnd   = buf.end(buf.length - 1);
-                if (targetSec >= bufStart && targetSec <= bufEnd) {
-                    player.currentTime = targetSec;
-                } else if (targetSec < bufStart) {
-                    // Audio hasn't caught up to buffered video — start at buffer start
-                    // PLL will slow video until audio catches up
-                    player.currentTime = bufStart;
-                } else {
+            var bufEnd = buf.length > 0 ? buf.end(buf.length - 1) : 0;
+
+            if (bufEnd < targetSec + 2) {
+                // Not enough buffer ahead of audio — wait for more segments
+                console.log('[cws] Waiting for video buffer to cover audio position: bufEnd=' +
+                            bufEnd.toFixed(2) + 's, audioTarget=' + targetSec.toFixed(2) + 's');
+                setTimeout(function () { _beginSyncedPlayback(player, cafEl); }, 500);
+                return;
+            }
+
+            // We have buffer past the audio position. Seek video to match audio.
+            var bufStart = buf.start(0);
+            if (targetSec >= bufStart && targetSec <= bufEnd) {
+                player.currentTime = targetSec;
+            } else if (targetSec < bufStart) {
+                // Audio hasn't caught up to buffered video — start at buffer start
+                // PLL will slow video until audio catches up
+                player.currentTime = bufStart;
+            } else {
                     // Audio is past buffered video — start at end, PLL will adjust
                     player.currentTime = bufEnd - 0.5;
                 }
