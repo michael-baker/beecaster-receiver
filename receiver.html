@@ -258,6 +258,52 @@
             } catch(e) { _remoteLogEnabled = false; }
         }
 
+        // ── CAF player state diagnostics ────────────────────────────────────────
+        // Subscribe to every significant CAF event so we can trace the full lifecycle
+        // in the remote log without needing a physical monitor attached.
+        (function _wireCafDiagnostics() {
+            var EV = cast.framework.events.EventType;
+            var interesting = [
+                EV.MEDIA_STATUS, EV.PLAYER_LOAD_COMPLETE, EV.PLAYER_LOAD_FAILED,
+                EV.PLAY, EV.PAUSE, EV.PLAYING, EV.ENDED, EV.BUFFERING,
+                EV.TIME_UPDATE, EV.BITRATE_CHANGED, EV.SEGMENT_DOWNLOADED,
+                EV.ERROR, EV.MEDIA_FINISHED, EV.REQUEST_LOAD
+            ];
+            interesting.forEach(function (evType) {
+                playerManager.addEventListener(evType, function (event) {
+                    // TIME_UPDATE fires very frequently — only log every 5 s
+                    if (evType === EV.TIME_UPDATE) {
+                        var now = Date.now();
+                        if (!_wireCafDiagnostics._lastTimeUpdate || now - _wireCafDiagnostics._lastTimeUpdate > 5000) {
+                            _wireCafDiagnostics._lastTimeUpdate = now;
+                            var caf = document.getElementById('receiverVideoElement');
+                            console.log('[caf-diag] TIME_UPDATE currentTime=' +
+                                (caf ? caf.currentTime.toFixed(2) : 'n/a') +
+                                ' muted=' + (caf ? caf.muted : '?') +
+                                ' volume=' + (caf ? caf.volume : '?') +
+                                ' readyState=' + (caf ? caf.readyState : '?') +
+                                ' paused=' + (caf ? caf.paused : '?'));
+                        }
+                        return;
+                    }
+                    var detail = '';
+                    try { detail = JSON.stringify(event).substring(0, 200); } catch(e) { detail = String(event); }
+                    console.log('[caf-diag] ' + evType + ' ' + detail);
+                });
+            });
+
+            // Also log CAF context-level events
+            var SYS = cast.framework.system.EventType;
+            [SYS.READY, SYS.SENDER_CONNECTED, SYS.SENDER_DISCONNECTED,
+             SYS.SYSTEM_VOLUME_CHANGED, SYS.ERROR].forEach(function (sysEvType) {
+                context.addEventListener(sysEvType, function (event) {
+                    var detail = '';
+                    try { detail = JSON.stringify(event).substring(0, 200); } catch(e) { detail = String(event); }
+                    console.log('[caf-sys] ' + sysEvType + ' ' + detail);
+                });
+            });
+        })();
+
         var _hlsStarted    = false;
         var _splitVideoHls = null;
         var _syncTimer     = null;   // A/V sync loop interval handle
@@ -583,6 +629,7 @@
 
         // Tear down any live pcm_stream components (called on every LOAD / teardown).
         function _resetPcmStream() {
+            console.log('[pcm-stream] _resetPcmStream — tearing down pipeline');
             if (_pcmWorker)   { try { _pcmWorker.terminate();    } catch (e) {} _pcmWorker   = null; }
             if (_workletNode) { try { _workletNode.disconnect(); } catch (e) {} _workletNode = null; }
             if (_audioCtx)    { try { _audioCtx.close();         } catch (e) {} _audioCtx    = null; }
@@ -591,6 +638,7 @@
             _pcmRingFill        = 0;
             _pcmSamplesBuffered = 0;
             _pcmPrerollSent     = false;
+            console.log('[pcm-stream] _resetPcmStream — done');
         }
 
         // Reads api/settings to detect the active streaming mode and dispatches to the
@@ -620,13 +668,16 @@
             if (_hlsStarted || !baseUrl) return;
             _hlsStarted = true;
 
+            console.log('[pcm-stream] startPcmStream — baseUrl=' + baseUrl);
+
             // Audio comes from the Web Audio API — keep CAF element muted.
             var caf = document.getElementById('receiverVideoElement');
             if (caf) caf.muted = true;
+            console.log('[pcm-stream] CAF element muted=' + (caf ? caf.muted : 'no-element') + ' volume=' + (caf ? caf.volume : '?'));
 
             var video = document.getElementById('hls-bg');
             if (!video || typeof Hls === 'undefined' || !Hls.isSupported()) {
-                console.error('[pcm-stream] hls.js not available or video element missing');
+                console.error('[pcm-stream] hls.js not available or video element missing — Hls defined=' + (typeof Hls !== 'undefined') + ' isSupported=' + (typeof Hls !== 'undefined' && Hls.isSupported()));
                 return;
             }
 
@@ -649,11 +700,30 @@
 
             _splitVideoHls.loadSource(baseUrl + 'cast/split_video/stream.m3u8');
             _splitVideoHls.attachMedia(video);
+            console.log('[pcm-stream] HLS loading source: ' + baseUrl + 'cast/split_video/stream.m3u8');
+
+            // ── Comprehensive hls.js event instrumentation ──
+            _splitVideoHls.on(Hls.Events.MANIFEST_LOADING,  function (e, d) { console.log('[hls-diag] MANIFEST_LOADING url=' + d.url); });
+            _splitVideoHls.on(Hls.Events.MANIFEST_LOADED,   function (e, d) { console.log('[hls-diag] MANIFEST_LOADED levels=' + d.levels.length); });
+            _splitVideoHls.on(Hls.Events.MANIFEST_PARSED,   function (e, d) { console.log('[hls-diag] MANIFEST_PARSED levels=' + d.levels.length + ' firstLevel=' + d.firstLevel); });
+            _splitVideoHls.on(Hls.Events.LEVEL_LOADED,      function (e, d) { console.log('[hls-diag] LEVEL_LOADED fragments=' + d.details.fragments.length + ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration); });
+            _splitVideoHls.on(Hls.Events.FRAG_LOADING,      function (e, d) { console.log('[hls-diag] FRAG_LOADING sn=' + d.frag.sn + ' url=' + d.frag.url.split('/').pop()); });
+            _splitVideoHls.on(Hls.Events.FRAG_LOADED,       function (e, d) { console.log('[hls-diag] FRAG_LOADED sn=' + d.frag.sn + ' bytes=' + (d.networkDetails ? d.networkDetails.response : '?')); });
+            _splitVideoHls.on(Hls.Events.FRAG_BUFFERED,     function (e, d) { console.log('[hls-diag] FRAG_BUFFERED sn=' + d.frag.sn + ' id=' + d.frag.level); });
+            _splitVideoHls.on(Hls.Events.BUFFER_APPENDED,   function () { /* very frequent — omit */ });
+            _splitVideoHls.on(Hls.Events.BUFFER_EOS,        function () { console.log('[hls-diag] BUFFER_EOS'); });
+            _splitVideoHls.on(Hls.Events.BUFFER_STALLED,    function () { console.log('[hls-diag] BUFFER_STALLED'); });
+            _splitVideoHls.on(Hls.Events.BUFFER_FLUSHED,    function () { console.log('[hls-diag] BUFFER_FLUSHED'); });
+            _splitVideoHls.on(Hls.Events.ERROR,              function (evt, data) {
+                var lvl = data.fatal ? 'error' : 'warn';
+                console[lvl]('[hls-diag] ERROR fatal=' + data.fatal + ' type=' + data.type + ' details=' + data.details + (data.response ? ' status=' + data.response.code : ''));
+            });
 
             _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
                 video.muted = true;
                 video.style.display = 'block';
                 var pos = _splitVideoHls.liveSyncPosition;
+                console.log('[pcm-stream] HLS manifest parsed liveSyncPos=' + pos);
                 if (pos != null) { video.currentTime = pos; }
                 video.play().catch(function (e) { console.warn('[pcm-stream] video play() rejected:', e); });
                 console.log('[pcm-stream] HLS manifest parsed — starting AudioWorklet pipeline');
@@ -663,7 +733,7 @@
 
             _splitVideoHls.on(Hls.Events.ERROR, function (evt, data) {
                 if (!data.fatal) return;
-                console.error('[pcm-stream] fatal HLS error:', data.type, data.details);
+                console.error('[pcm-stream] fatal HLS error — destroying and retrying in 3 s: type=' + data.type + ' details=' + data.details);
                 if (_splitVideoHls) { try { _splitVideoHls.destroy(); } catch (e) {} _splitVideoHls = null; }
                 if (_syncTimer) { clearInterval(_syncTimer); _syncTimer = null; }
                 _hlsStarted = false;
@@ -677,32 +747,41 @@
         function _startPcmAudioWorklet(baseUrl) {
             try {
                 _audioCtx = new AudioContext({ sampleRate: _pcmSampleRate });
+                console.log('[pcm-stream] AudioContext created state=' + _audioCtx.state + ' sampleRate=' + _audioCtx.sampleRate);
 
                 // Chrome creates AudioContext in 'suspended' state unless a user gesture
                 // has occurred. On Chromecast there is no gesture, and the CAF PLAYING event
                 // (which calls _audioCtx.resume()) fires before this function is even called.
                 // Resume unconditionally here so the context is running before any audio arrives.
-                _audioCtx.resume().catch(function (e) {
+                _audioCtx.resume().then(function () {
+                    console.log('[pcm-stream] AudioContext.resume() resolved — state=' + _audioCtx.state);
+                }).catch(function (e) {
                     console.warn('[pcm-stream] AudioContext.resume() failed:', e);
                 });
 
                 _audioCtx.audioWorklet.addModule('./pcm-worklet.js')
                     .then(function () {
+                        console.log('[pcm-stream] pcm-worklet.js loaded — AudioContext state=' + _audioCtx.state);
                         _workletNode = new AudioWorkletNode(_audioCtx, 'pcm-sink');
                         _workletNode.connect(_audioCtx.destination);
+                        console.log('[pcm-stream] PcmSinkProcessor node connected to destination');
 
                         _workletNode.port.onmessage = function (e) {
                             var msg = e.data;
                             if (msg.type === 'clock') {
-                                // audioTimeMs: content timestamp of the last chunk written to ring.
-                                // ringFill: samples currently buffered ahead of the playhead.
-                                // currentPcmMs ≈ audioTimeMs − ringFill/sampleRate
-                                // → what the DAC is sending right now.
                                 _pcmAudioMs  = msg.audioTimeMs;
                                 _pcmRingFill = msg.ringFill;
+                                // Log first clock tick as confirmation audio pipeline is alive
+                                if (!_startPcmAudioWorklet._firstClockLogged) {
+                                    _startPcmAudioWorklet._firstClockLogged = true;
+                                    console.log('[pcm-stream] FIRST WORKLET CLOCK: audioTimeMs=' + msg.audioTimeMs +
+                                        ' samplesPlayed=' + msg.samplesPlayed +
+                                        ' ringFill=' + msg.ringFill +
+                                        ' ringCapacity=' + msg.ringCapacity +
+                                        ' AudioCtx.state=' + (_audioCtx ? _audioCtx.state : 'null'));
+                                }
                             } else if (msg.type === 'underrun') {
                                 console.warn('[pcm-stream] worklet underrun ringFill=' + msg.ringFill + ' — re-arming pre-roll');
-                                // Re-arm pre-roll so we buffer again before restarting output.
                                 _pcmPrerollSent     = false;
                                 _pcmSamplesBuffered = 0;
                                 if (_workletNode) _workletNode.port.postMessage({ type: 'reset' });
@@ -711,9 +790,20 @@
 
                         // Start the Web Worker that fetches and parses the framed PCM stream.
                         _pcmWorker = new Worker('./pcm-fetch-worker.js');
+                        console.log('[pcm-stream] pcm-fetch-worker.js Worker created');
+                        var _workerPcmFrames = 0;
                         _pcmWorker.onmessage = function (e) {
                             var msg = e.data;
                             if (msg.type === 'pcm') {
+                                _workerPcmFrames++;
+                                // Log first frame + every 500th to confirm worker is parsing
+                                if (_workerPcmFrames === 1 || _workerPcmFrames % 500 === 0) {
+                                    console.log('[pcm-stream] worker pcm frame #' + _workerPcmFrames +
+                                        ' audioTimeMs=' + msg.audioTimeMs +
+                                        ' samples=' + msg.left.length +
+                                        ' buffered=' + _pcmSamplesBuffered +
+                                        ' prerollSent=' + _pcmPrerollSent);
+                                }
                                 if (_workletNode) {
                                     _workletNode.port.postMessage(
                                         { type: 'pcm', left: msg.left, right: msg.right, audioTimeMs: msg.audioTimeMs },
@@ -721,19 +811,37 @@
                                     );
                                 }
                                 _pcmSamplesBuffered += msg.left.length;
-                                // Send 'start' to worklet after 1 s pre-roll (48000 samples at 48 kHz).
                                 if (!_pcmPrerollSent && _pcmSamplesBuffered >= 48000) {
                                     _pcmPrerollSent = true;
                                     if (_workletNode) _workletNode.port.postMessage({ type: 'start' });
-                                    console.log('[pcm-stream] pre-roll complete (' + _pcmSamplesBuffered + ' samples) — audio starting');
+                                    console.log('[pcm-stream] pre-roll complete (' + _pcmSamplesBuffered + ' samples) — sending start to worklet. AudioCtx.state=' + (_audioCtx ? _audioCtx.state : 'null'));
                                 }
                             } else if (msg.type === 'syncLost') {
                                 console.warn('[pcm-stream] frame sync lost — scanning for magic');
                             }
                         };
+                        _pcmWorker.onerror = function (e) {
+                            console.error('[pcm-stream] Worker error: ' + e.message + ' at ' + e.filename + ':' + e.lineno);
+                        };
 
                         _startPcmFetch(baseUrl);
                         console.log('[pcm-stream] AudioWorklet + Worker ready');
+
+                        // ── Periodic status heartbeat ────────────────────────────────
+                        // Logs the full pipeline state every 10 s so we can confirm
+                        // data is flowing even if no other events fire.
+                        setInterval(function () {
+                            if (!_audioCtx) return;
+                            var currentPcmMs = _pcmAudioMs - (_pcmRingFill * 1000 / _pcmSampleRate);
+                            console.log('[pcm-stream] HEARTBEAT' +
+                                ' ctxState=' + _audioCtx.state +
+                                ' buffered=' + _pcmSamplesBuffered +
+                                ' prerollSent=' + _pcmPrerollSent +
+                                ' audioTimeMs=' + _pcmAudioMs +
+                                ' ringFill=' + _pcmRingFill +
+                                ' currentPcmMs=' + currentPcmMs.toFixed(0) +
+                                ' startWallMs=' + _pcmStartWallMs);
+                        }, 10000);
                     })
                     .catch(function (err) {
                         console.error('[pcm-stream] audioWorklet.addModule failed:', err);
@@ -748,8 +856,15 @@
         // response header, and pumps raw byte chunks to the Web Worker for parsing.
         function _startPcmFetch(baseUrl) {
             if (!_pcmWorker) return;
+            console.log('[pcm-stream] _startPcmFetch — opening ' + baseUrl + 'cast/pcmlive');
+            var _fetchChunks = 0;
+            var _fetchBytes  = 0;
             fetch(baseUrl + 'cast/pcmlive', { cache: 'no-store' })
                 .then(function (resp) {
+                    console.log('[pcm-stream] /cast/pcmlive response status=' + resp.status +
+                        ' X-PCM-Start-Wall-Ms=' + resp.headers.get('X-PCM-Start-Wall-Ms') +
+                        ' X-PCM-SampleRate='    + resp.headers.get('X-PCM-SampleRate') +
+                        ' Content-Type='        + resp.headers.get('Content-Type'));
                     if (!resp.ok) {
                         console.error('[pcm-stream] /cast/pcmlive HTTP ' + resp.status + ' — retrying in 3 s');
                         setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
@@ -779,10 +894,19 @@
                     function pump() {
                         reader.read().then(function (result) {
                             if (result.done) {
-                                console.log('[pcm-stream] stream ended — reconnecting in 2 s');
+                                console.log('[pcm-stream] stream ended after ' + _fetchChunks + ' chunks / ' + _fetchBytes + ' bytes — reconnecting in 2 s');
                                 if (_pcmWorker) _pcmWorker.postMessage({ type: 'reset' });
                                 setTimeout(function () { _startPcmFetch(baseUrl); }, 2000);
                                 return;
+                            }
+                            _fetchChunks++;
+                            _fetchBytes += result.value.length;
+                            // Log first chunk and every 200th to confirm bytes are flowing
+                            if (_fetchChunks === 1 || _fetchChunks % 200 === 0) {
+                                console.log('[pcm-stream] fetch chunk #' + _fetchChunks +
+                                    ' bytes=' + result.value.length +
+                                    ' total=' + _fetchBytes +
+                                    ' workerAlive=' + (!!_pcmWorker));
                             }
                             if (_pcmWorker) {
                                 _pcmWorker.postMessage({ type: 'chunk', data: result.value }, [result.value.buffer]);
