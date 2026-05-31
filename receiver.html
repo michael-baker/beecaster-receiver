@@ -228,7 +228,7 @@
                         abrEnabled:                  false,
                         startLevel:                  0,
                         debug:                       true,  // DIAGNOSTIC: see segment transition details
-                        progressive:                 true,
+                        progressive:                 false,  // download full segment before appendBuffer — avoids hundreds of small appends that stall CC v2
                         manifestLoadingMaxRetry:     12,
                         manifestLoadingRetryDelay:   1000,
                         manifestLoadingMaxRetryTimeout: 12000,
