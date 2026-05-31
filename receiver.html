@@ -268,39 +268,50 @@
                     _hls.on(Hls.Events.MANIFEST_LOADED, function (e, d) {
                         console.log('[muxed] MANIFEST_LOADED levels=' + d.levels.length);
                     });
-                    _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
-                        console.log('[muxed] LEVEL_LOADED fragments=' + d.details.fragments.length +
-                            ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration);
-                    });
                     _hls.on(Hls.Events.FRAG_LOADING, function (e, d) {
                         console.log('[muxed] FRAG_LOADING sn=' + d.frag.sn +
                             ' url=' + d.frag.url.split('/').pop());
                     });
 
-                    _hls.on(Hls.Events.MANIFEST_PARSED, function (e, d) {
-                        console.log('[muxed] MANIFEST_PARSED levels=' + d.levels.length);
+                    // Defer play() until enough fragments are buffered to avoid an
+                    // immediate stall.  MANIFEST_PARSED can fire when the playlist has
+                    // only 1 fragment (server just started); playing immediately causes
+                    // bufferStalledError after 4 s.  Wait for LEVEL_LOADED to report
+                    // >= 2 fragments before starting playback.
+                    var _playStarted = false;
+                    function _tryStartPlayback() {
+                        if (_playStarted) return;
+                        _playStarted = true;
+                        console.log('[muxed] starting playback');
                         var pos = _hls.liveSyncPosition;
                         if (pos != null) { player.currentTime = pos; }
                         player.play().catch(function (err) {
                             console.warn('[muxed] play() rejected:', err);
                         });
-                        // Fade overlay when actual playback starts (not a blind timeout).
-                        // 'playing' fires once the decoder has produced its first frame
-                        // and audio has begun — more reliable than a fixed 3-s delay.
+                        // Fade overlay when actual playback starts.
                         var _onPlaying = function () {
                             player.removeEventListener('playing', _onPlaying);
-                            // Small extra delay so a few frames are visible before
-                            // the overlay fades, avoiding a flash of the first I-frame.
                             setTimeout(function () { _showOverlay(0); }, 500);
                         };
                         player.addEventListener('playing', _onPlaying);
-                        // Safety fallback: if 'playing' never fires (e.g. autoplay blocked),
-                        // still remove overlay after 6 s so the user isn't stuck on black.
+                        // Safety fallback if 'playing' never fires.
                         setTimeout(function () {
                             player.removeEventListener('playing', _onPlaying);
                             _showOverlay(0);
                         }, 6000);
                         _startBenchmark(player);
+                    }
+
+                    _hls.on(Hls.Events.MANIFEST_PARSED, function (e, d) {
+                        console.log('[muxed] MANIFEST_PARSED levels=' + d.levels.length);
+                    });
+
+                    _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
+                        console.log('[muxed] LEVEL_LOADED fragments=' + d.details.fragments.length +
+                            ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration);
+                        if (!_playStarted && d.details.fragments.length >= 2) {
+                            _tryStartPlayback();
+                        }
                     });
 
                     _hls.on(Hls.Events.FRAG_BUFFERED, function (e, d) {
@@ -475,12 +486,17 @@
                 EV.PLAY, EV.PAUSE, EV.PLAYING, EV.ENDED,
                 EV.BUFFERING, EV.ERROR, EV.REQUEST_LOAD,
             ].forEach(function (evType) {
-                playerManager.addEventListener(evType, function (event) {
-                    var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); }
-                    catch (e) { detail = String(event); }
-                    console.log('[caf-diag] ' + evType + ' ' + detail);
-                });
+                if (!evType) return;  // skip undefined event types (CAF version compat)
+                try {
+                    playerManager.addEventListener(evType, function (event) {
+                        var detail = '';
+                        try { detail = JSON.stringify(event).substring(0, 200); }
+                        catch (e) { detail = String(event); }
+                        console.log('[caf-diag] ' + evType + ' ' + detail);
+                    });
+                } catch (e) {
+                    console.warn('[caf-diag] skip event ' + evType + ': ' + e.message);
+                }
             });
 
             // TIME_UPDATE: log every 5 s so CAF + player progress is visible in remote log.
