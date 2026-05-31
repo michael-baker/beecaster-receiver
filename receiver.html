@@ -976,10 +976,17 @@
             var _mediaErrorCount = 0;
             _hlsInstance = new Hls({
                 lowLatencyMode: false,
-                // Non-live: segments are pre-muxed and buffered server-side.
-                // Use larger buffer so the full 16 s pre-roll is consumed smoothly.
+                // Live HLS manifest: 4-segment sliding window. Keep sync settings
+                // consistent with fmp4_hls so playback behaviour is predictable.
+                liveSyncDurationCount: 3,
+                liveMaxLatencyDurationCount: 6,
+                // Larger buffer to absorb the 16 s server-side pre-buffer pre-roll.
                 maxBufferLength: 30,
                 backBufferLength: 0,
+                // Explicit codec hint so hls.js opens the MSE audio SourceBuffer with
+                // audio/mp4; codecs="flac" immediately, without waiting for init-segment
+                // auto-detection which can fail on some Chromecast firmware.
+                audioPreference: { audioCodec: 'fLaC' },
                 // Manifest only appears after server-side 16 s pre-buffer gate.
                 // Retry aggressively so hls.js waits rather than declaring a fatal error.
                 manifestLoadingMaxRetry: 30,
