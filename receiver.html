@@ -678,6 +678,14 @@
             try {
                 _audioCtx = new AudioContext({ sampleRate: _pcmSampleRate });
 
+                // Chrome creates AudioContext in 'suspended' state unless a user gesture
+                // has occurred. On Chromecast there is no gesture, and the CAF PLAYING event
+                // (which calls _audioCtx.resume()) fires before this function is even called.
+                // Resume unconditionally here so the context is running before any audio arrives.
+                _audioCtx.resume().catch(function (e) {
+                    console.warn('[pcm-stream] AudioContext.resume() failed:', e);
+                });
+
                 _audioCtx.audioWorklet.addModule(baseUrl + 'receiver/pcm-worklet.js')
                     .then(function () {
                         _workletNode = new AudioWorkletNode(_audioCtx, 'pcm-sink');
