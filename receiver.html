@@ -7,53 +7,48 @@
     <!-- hls.js: Chromecast does not support HLS via canPlayType; MSE (hls.js) is required -->
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
     <!--
-        ogg_flac mode: FLAC audio in fMP4 HLS segments, decoded by Chrome's native FLAC decoder
-        via MSE SourceBuffer. No AudioWorklet, no Web Worker, no ring-buffer arithmetic.
-        The audio element's hardware-backed currentTime is the master A/V sync clock.
-        PDT (EXT-X-PROGRAM-DATE-TIME) from both HLS streams provides the shared wall-clock anchor.
-        Requires Chrome 62+ — CC V2/V3 on Chrome ~72 qualifies.
+        fmp4_muxed mode: single FFmpeg process muxes H.264 video + FLAC audio into
+        fragmented MP4 (fMP4) HLS segments served in-memory from HlsSegmentStore.
+        hls.js drives a single <video id="player"> element via MSE SourceBuffer.
+        A/V sync is guaranteed by the shared PTS timeline in the muxed container —
+        no sync loop, no rate steering, no hard seeks.
+        Confirmed on Chromecast v2 (Chrome 90 / armv7l):
+          MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"') = true
     -->
     <style>
         *, *::before, *::after { box-sizing: border-box; }
         body { overflow: hidden; margin: 0; padding: 0; background: #000; }
 
-        /* Black overlay — shown on load until A/V sync stabilises; fades in on pause */
+        /* Black overlay — full-screen, shown during load and pause */
         #overlay {
             position: absolute; inset: 0;
             background: #000; opacity: 1;
-            transition: opacity 0.35s ease;
+            transition: opacity 0.4s ease;
             pointer-events: none; z-index: 10;
         }
 
-        /* CAF protocol vehicle — invisible, always muted, only here so CAF has a
-           valid media element to report state and accept play/pause commands.     */
+        /* CAF protocol vehicle — invisible, muted, only here so CAF has a
+           valid media element to report state and accept commands.        */
         #caf-el {
             position: absolute; width: 1px; height: 1px;
             opacity: 0; pointer-events: none;
         }
 
-        /* FLAC audio element — invisible, drives actual audio output via MSE */
-        #flac-audio {
-            position: absolute; width: 1px; height: 1px;
-            opacity: 0; pointer-events: none;
-        }
-
-        /* HLS video — full-screen background, muted, slave to audio clock */
-        #hls-bg {
+        /* Muxed player — full-screen, produces both audio and video output. */
+        #player {
             position: absolute; inset: 0;
             width: 100%; height: 100%;
-            object-fit: cover; display: none;
+            object-fit: cover;
         }
     </style>
 </head>
 <body>
-    <!-- CAF protocol vehicle: muted silence WAV from /live/. CAF tracks this
-         element for play/pause state and sends commands to it.             -->
+    <!-- CAF protocol vehicle: loaded with /live WAV by CAF, muted at JS level.
+         CAF needs a media element to track play/pause state and send commands. -->
     <video id="caf-el" class="castMediaElement"></video>
-    <!-- FLAC audio: driven by hls.js + MSE, Chrome native FLAC decoder -->
-    <audio id="flac-audio" playsinline></audio>
-    <!-- HLS video: muted, full-screen, steered by the A/V sync loop -->
-    <video id="hls-bg" muted playsinline autoplay></video>
+    <!-- Muxed player: hls.js drives this element with the H.264+FLAC fMP4 stream.
+         NOT muted — this element produces the actual audio and video output.    -->
+    <video id="player" playsinline></video>
     <!-- Overlay: black during load and pause -->
     <div id="overlay"></div>
 
@@ -61,11 +56,9 @@
     (function () {
         'use strict';
 
-        // ─────────────────────────────────────────────────────────────────────
-        // CAF framework initialisation
-        // ─────────────────────────────────────────────────────────────────────
-        var CHANNEL      = 'urn:x-cast:com.google.cast.media';
-        var context      = cast.framework.CastReceiverContext.getInstance();
+        // ── CAF init ────────────────────────────────────────────────────────────
+        var CHANNEL       = 'urn:x-cast:com.google.cast.media';
+        var context       = cast.framework.CastReceiverContext.getInstance();
         var playerManager = context.getPlayerManager();
 
         playerManager.setSupportedMediaCommands(
@@ -80,128 +73,65 @@
             function (req) { return req; }
         );
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Module state
-        // ─────────────────────────────────────────────────────────────────────
-        var _baseUrl    = '';
-        var _mode       = '';
-        var _audioHls   = null;   // hls.js instance driving #flac-audio
-        var _videoHls   = null;   // hls.js instance driving #hls-bg
-        var _syncTimer  = null;   // setInterval handle for A/V sync loop
-        var _pauseTimer = null;   // setTimeout to lift the pause overlay
-        var _graceUntil = 0;      // wall-clock ms before which sync corrections are suppressed
-        var _lastSeekAt = 0;      // wall-clock ms of the last hard-seek (seek cooldown)
-        var _lastRate   = 1.0;    // last logged playbackRate (avoids log spam)
-
-        // PDT-based wall-clock anchors — refreshed on every FRAG_BUFFERED event.
-        //
-        //   wallMs(el.currentTime) = anchorPdtMs + (el.currentTime - anchorHlsStart) * 1000
-        //
-        // This is accurate because PDT in the HLS manifest advances at exactly 1:1
-        // with the HLS presentation timeline (both set by FFmpeg from the same clock).
-        var _audioAnchorPdtMs    = -1;   // fragment.programDateTime.getTime() (UTC ms)
-        var _audioAnchorHlsStart = 0;    // fragment.start (seconds in HLS timeline)
-        var _videoAnchorPdtMs    = -1;
-        var _videoAnchorHlsStart = 0;
-
-        // Remote logging
+        // ── Module state ───────────────────────────────────────────────────────
+        var _baseUrl      = '';
+        var _hls          = null;   // single hls.js instance for muxed fMP4 stream
+        var _benchTimer   = null;   // setInterval handle for decode benchmark
         var _remoteLogEnabled = false;
 
-        // ─────────────────────────────────────────────────────────────────────
-        // A/V sync constants
-        // ─────────────────────────────────────────────────────────────────────
-        var SYNC_TICK_MS   = 100;   // sync evaluation interval (ms)
-        var SEEK_THRESHOLD = 400;   // hard-seek when |drift| > this (ms)
-        var DEAD_ZONE      = 40;    // no correction within ±40 ms
-        var RATE_GAIN      = 0.5;   // proportional gain: drift_s → rate delta
-        var MAX_RATE_DELTA = 0.10;  // cap rate adjustment at ±10%
-        var SEEK_COOLDOWN  = 2000;  // suppress consecutive hard-seeks (ms)
-
-        // ─────────────────────────────────────────────────────────────────────
-        // LOAD interceptor
-        // ─────────────────────────────────────────────────────────────────────
+        // ── LOAD interceptor ────────────────────────────────────────────────────
         playerManager.setMessageInterceptor(
             cast.framework.messages.MessageType.LOAD,
             function (request) {
                 var custom = request.media && request.media.customData;
                 _baseUrl = (custom && custom.MediaBaseUrl) || '';
-                _mode    = (custom && custom.HlsStreamingMode) || '';
-                console.log('[receiver] LOAD: mode=' + _mode + ' baseUrl=' + _baseUrl);
+                var mode = (custom && custom.HlsStreamingMode) || '';
+                console.log('[receiver] LOAD mode=' + mode + ' baseUrl=' + _baseUrl);
 
-                if (_baseUrl) {
-                    _fetchRemoteLogSetting(_baseUrl);
-                }
+                if (_baseUrl) { _fetchRemoteLogSetting(_baseUrl); }
 
-                // Silence the CAF protocol vehicle immediately.
+                // Keep the CAF protocol vehicle muted — /live WAV must be silent.
                 var cafEl = document.getElementById('caf-el');
                 if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
 
-                // Tear down any live pipeline from the previous track.
                 _reset();
 
-                if (_mode === 'ogg_flac') {
-                    _startOggFlac(_baseUrl);
+                if (mode === 'fmp4_muxed') {
+                    _startMuxed(_baseUrl);
                 } else {
-                    // Wrong mode: show a diagnostic overlay so the user knows
-                    // to switch to ogg_flac in settings.
-                    console.error('[receiver] Unsupported mode "' + _mode +
-                        '" — this receiver build only handles ogg_flac.');
-                    _showOverlay(1); // keep black screen
+                    console.error('[receiver] Unsupported mode "' + mode + '" — expected fmp4_muxed');
+                    _showOverlay(1);
                 }
 
                 return request;
             }
         );
 
-        // ─────────────────────────────────────────────────────────────────────
-        // CAF PAUSE — mirror onto real audio + video elements
-        // ─────────────────────────────────────────────────────────────────────
+        // ── CAF PAUSE ──────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
             console.log('[receiver] PAUSE');
-            _clearPauseTimer();
             _showOverlay(1);
-
-            var audio = document.getElementById('flac-audio');
-            var video = document.getElementById('hls-bg');
-            if (audio && !audio.paused) audio.pause();
-            if (video && !video.paused) video.pause();
-
+            var p = document.getElementById('player');
+            if (p && !p.paused) p.pause();
             _postAck('PAUSED');
-
-            // Lift the overlay after 1.5 s so a paused frame is visible.
-            _pauseTimer = setTimeout(function () {
-                _pauseTimer = null;
-                _showOverlay(0);
-            }, 1500);
+            // Fade to reveal paused frame after 1.5 s.
+            setTimeout(function () { _showOverlay(0); }, 1500);
         });
 
-        // ─────────────────────────────────────────────────────────────────────
-        // CAF PLAYING — mirror onto real audio + video elements
-        // ─────────────────────────────────────────────────────────────────────
+        // ── CAF PLAYING ────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
             console.log('[receiver] PLAYING');
-            _clearPauseTimer();
-
-            // Re-enforce CAF element mute (CAF can reset it on PLAYING).
+            // Re-enforce mute on ghost element (CAF resets muted on PLAYING).
             var cafEl = document.getElementById('caf-el');
             if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
-
-            var audio = document.getElementById('flac-audio');
-            var video = document.getElementById('hls-bg');
-            if (audio && audio.paused) audio.play().catch(function (e) {
-                console.warn('[receiver] audio.play() rejected:', e);
+            var p = document.getElementById('player');
+            if (p && p.paused) p.play().catch(function (e) {
+                console.warn('[receiver] player.play() rejected:', e);
             });
-            if (video && video.paused) video.play().catch(function (e) {
-                console.warn('[receiver] video.play() rejected:', e);
-            });
-
-            _showOverlay(0);
             _postAck('PLAYING');
         });
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Queue next / prev — forward to MusicBee via custom channel
-        // ─────────────────────────────────────────────────────────────────────
+        // ── Queue next / prev ──────────────────────────────────────────────────
         playerManager.addEventListener(
             cast.framework.events.EventType.REQUEST_QUEUE_UPDATE,
             function (event) {
@@ -213,17 +143,13 @@
             }
         );
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Sender disconnected
-        // ─────────────────────────────────────────────────────────────────────
+        // ── Sender disconnected ────────────────────────────────────────────────
         context.addEventListener(
             cast.framework.system.EventType.SENDER_DISCONNECTED,
             function () { context.stop(); }
         );
 
-        // ─────────────────────────────────────────────────────────────────────
-        // CAF options + start
-        // ─────────────────────────────────────────────────────────────────────
+        // ── CAF options + start ────────────────────────────────────────────────
         var options = new cast.framework.CastReceiverOptions();
         options.customNamespaces = {};
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
@@ -240,312 +166,177 @@
 
         context.start(options);
 
-        // ═════════════════════════════════════════════════════════════════════
-        // ogg_flac pipeline
+        // ══════════════════════════════════════════════════════════════════════
+        // fmp4_muxed pipeline
         //
         // Architecture:
-        //   <audio id="flac-audio"> — hls.js + MSE + Chrome native FLAC decoder
-        //                              Master clock: audio.currentTime
-        //   <video id="hls-bg">     — hls.js + MSE + H.264 hardware decoder
-        //                              Slave: video.playbackRate steered by sync loop
+        //   Single <video id="player"> — hls.js + MSE SourceBuffer
+        //   codec: video/mp4; codecs="avc1.640029, flac"
         //
-        // Wall-clock sync:
-        //   Both HLS manifests embed EXT-X-PROGRAM-DATE-TIME stamped by FFmpeg
-        //   from the same server wall clock.  The receiver extracts a PDT anchor
-        //   from each stream's FRAG_BUFFERED event and uses it as a shared
-        //   reference without any polling or custom headers.
+        //   A/V sync is guaranteed by the muxed fMP4 container.  Both tracks share
+        //   the same PTS timeline from a single FFmpeg muxer, so synchronisation is
+        //   mathematically exact — no sync loop, no rate steering, no hard seeks.
         //
-        //   audioWallMs = _audioAnchorPdtMs + (audio.currentTime - _audioAnchorHlsStart) × 1000
-        //   videoWallMs = _videoAnchorPdtMs + (video.currentTime - _videoAnchorHlsStart) × 1000
-        //   drift       = audioWallMs − videoWallMs   (ms; > 0 means video is behind)
-        // ═════════════════════════════════════════════════════════════════════
+        //   Chromecast v2 (Chrome 90 / armv7l) confirms hardware support via:
+        //     MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"') = true
+        // ══════════════════════════════════════════════════════════════════════
 
         function _reset() {
-            console.log('[ogg-flac] reset — tearing down pipeline');
-            if (_syncTimer)  { clearInterval(_syncTimer);  _syncTimer  = null; }
-            _clearPauseTimer();
-            if (_audioHls) { try { _audioHls.destroy(); } catch (e) {} _audioHls = null; }
-            if (_videoHls) { try { _videoHls.destroy(); } catch (e) {} _videoHls = null; }
-            var audio = document.getElementById('flac-audio');
-            if (audio) { try { audio.pause(); } catch (e) {} }
-            var video = document.getElementById('hls-bg');
-            if (video) { try { video.pause(); } catch (e) {} video.style.display = 'none'; }
-            _audioAnchorPdtMs    = -1;
-            _audioAnchorHlsStart = 0;
-            _videoAnchorPdtMs    = -1;
-            _videoAnchorHlsStart = 0;
-            _lastSeekAt = 0;
-            _lastRate   = 1.0;
+            console.log('[muxed] reset');
+            if (_benchTimer) { clearInterval(_benchTimer); _benchTimer = null; }
+            if (_hls) { try { _hls.destroy(); } catch (e) {} _hls = null; }
+            var p = document.getElementById('player');
+            if (p) { try { p.pause(); } catch (e) {} }
+            _showOverlay(1);
         }
 
-        function _startOggFlac(baseUrl) {
-            if (!Hls || !Hls.isSupported()) {
-                console.error('[ogg-flac] hls.js not available or MSE not supported');
+        function _startMuxed(baseUrl) {
+            var player = document.getElementById('player');
+            if (!player) { console.error('[muxed] #player element missing'); return; }
+
+            if (!window.Hls || !Hls.isSupported()) {
+                console.error('[muxed] hls.js / MSE not available');
                 return;
             }
 
-            // Probe FLAC codec support.  Log the result for diagnostics even if we
-            // proceed — hls.js will surface a proper error if truly unsupported.
-            var flacOk = !!(window.MediaSource &&
-                MediaSource.isTypeSupported('audio/mp4; codecs=flac'));
-            console.log('[ogg-flac] MediaSource.isTypeSupported("audio/mp4; codecs=flac") = ' + flacOk);
-            if (!flacOk) {
-                console.error('[ogg-flac] FLAC in fMP4 is NOT supported by this Chrome build — ' +
-                    'audio will be silent. Upgrade firmware or use a different streaming mode.');
-            }
+            // Log muxed codec support for diagnostics.
+            var muxOk = !!(window.MediaSource &&
+                MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"'));
+            console.log('[muxed] video/mp4; codecs="avc1.640029, flac" supported=' + muxOk);
 
-            _showOverlay(1); // keep black until sync stabilises
+            _showOverlay(1);
 
             fetch(baseUrl + 'api/settings')
                 .then(function (r) { return r.ok ? r.json() : null; })
                 .catch(function () { return null; })
                 .then(function (cfg) {
-                    _startAudioHls(baseUrl, cfg);
-                    _startVideoHls(baseUrl, cfg);
+                    var liveSyncCount = (cfg && cfg.hlsLiveSyncSegments  > 0) ? cfg.hlsLiveSyncSegments  : 3;
+                    var liveMaxCount  = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
+
+                    _hls = new Hls({
+                        lowLatencyMode:              false,
+                        liveSyncDurationCount:       liveSyncCount,
+                        liveMaxLatencyDurationCount: liveMaxCount,
+                        maxBufferLength:             25,
+                        backBufferLength:            20,
+                        enableWorker:                false,  // reduce thread count on CC v2
+                        abrEnabled:                  false,
+                        startLevel:                  0,
+                        manifestLoadingMaxRetry:     12,
+                        manifestLoadingRetryDelay:   1000,
+                        manifestLoadingMaxRetryTimeout: 12000,
+                    });
+
+                    _hls.on(Hls.Events.MANIFEST_LOADING, function (e, d) {
+                        console.log('[muxed] MANIFEST_LOADING url=' + d.url);
+                    });
+                    _hls.on(Hls.Events.MANIFEST_LOADED, function (e, d) {
+                        console.log('[muxed] MANIFEST_LOADED levels=' + d.levels.length);
+                    });
+                    _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
+                        console.log('[muxed] LEVEL_LOADED fragments=' + d.details.fragments.length +
+                            ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration);
+                    });
+                    _hls.on(Hls.Events.FRAG_LOADING, function (e, d) {
+                        console.log('[muxed] FRAG_LOADING sn=' + d.frag.sn +
+                            ' url=' + d.frag.url.split('/').pop());
+                    });
+
+                    _hls.on(Hls.Events.MANIFEST_PARSED, function (e, d) {
+                        console.log('[muxed] MANIFEST_PARSED levels=' + d.levels.length);
+                        var pos = _hls.liveSyncPosition;
+                        if (pos != null) { player.currentTime = pos; }
+                        player.play().catch(function (err) {
+                            console.warn('[muxed] play() rejected:', err);
+                        });
+                        // Fade overlay out after 3 s — enough time for A/V decode buffers to fill.
+                        setTimeout(function () { _showOverlay(0); }, 3000);
+                        _startBenchmark(player);
+                    });
+
+                    _hls.on(Hls.Events.FRAG_BUFFERED, function (e, d) {
+                        console.log('[muxed] FRAG_BUFFERED sn=' + d.frag.sn +
+                            ' dur=' + (d.frag.duration ? d.frag.duration.toFixed(2) : '?') + 's');
+                    });
+
+                    _hls.on(Hls.Events.BUFFER_STALLED, function () {
+                        console.warn('[muxed] BUFFER_STALLED');
+                    });
+
+                    _hls.on(Hls.Events.ERROR, function (e, d) {
+                        var lvl = d.fatal ? 'error' : 'warn';
+                        console[lvl]('[muxed] ERROR fatal=' + d.fatal +
+                            ' type=' + d.type + ' details=' + d.details +
+                            (d.response ? ' status=' + d.response.code : ''));
+                        if (!d.fatal) return;
+                        if (_hls) { try { _hls.destroy(); } catch (err) {} _hls = null; }
+                        console.error('[muxed] Fatal error — retrying in 3 s');
+                        setTimeout(function () {
+                            if (_baseUrl) _startMuxed(_baseUrl);
+                        }, 3000);
+                    });
+
+                    var src = baseUrl + 'cast/muxed/stream.m3u8';
+                    console.log('[muxed] loading ' + src);
+                    _hls.loadSource(src);
+                    _hls.attachMedia(player);
                 });
         }
 
-        function _makeHlsCfg(cfg) {
-            return {
-                lowLatencyMode:              false,
-                liveSyncDurationCount:       (cfg && cfg.hlsLiveSyncSegments  > 0) ? cfg.hlsLiveSyncSegments  : 3,
-                liveMaxLatencyDurationCount: (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6,
-                maxBufferLength:             25,
-                backBufferLength:            20,
-                enableWorker:                false,  // reduce thread count on CC V2
-                abrEnabled:                  false,
-                startLevel:                  0,
-                manifestLoadingMaxRetry:     12,
-                manifestLoadingRetryDelay:   1000,
-                manifestLoadingMaxRetryTimeout: 12000,
-            };
-        }
-
-        // ── Audio pipeline ────────────────────────────────────────────────────
-        function _startAudioHls(baseUrl, cfg) {
-            var audio = document.getElementById('flac-audio');
-            if (!audio) { console.error('[ogg-flac] #flac-audio element missing'); return; }
-
-            _audioHls = new Hls(_makeHlsCfg(cfg));
-
-            // Diagnostic instrumentation
-            _audioHls.on(Hls.Events.MANIFEST_LOADING,  function (e, d) { console.log('[audio-hls] MANIFEST_LOADING url=' + d.url); });
-            _audioHls.on(Hls.Events.MANIFEST_LOADED,   function (e, d) { console.log('[audio-hls] MANIFEST_LOADED levels=' + d.levels.length); });
-            _audioHls.on(Hls.Events.LEVEL_LOADED,      function (e, d) { console.log('[audio-hls] LEVEL_LOADED frags=' + d.details.fragments.length + ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration); });
-            _audioHls.on(Hls.Events.FRAG_LOADING,      function (e, d) { console.log('[audio-hls] FRAG_LOADING sn=' + d.frag.sn + ' url=' + d.frag.url.split('/').pop()); });
-
-            _audioHls.on(Hls.Events.MANIFEST_PARSED, function (e, d) {
-                console.log('[audio-hls] MANIFEST_PARSED levels=' + d.levels.length);
-                audio.play().catch(function (err) {
-                    console.warn('[audio-hls] play() rejected:', err);
-                });
-                // Suppress sync corrections for 8 s while HLS pipeline stabilises.
-                _graceUntil = Date.now() + 8000;
-            });
-
-            // Capture PDT anchor on every buffered fragment.
-            // This is the sole mechanism for translating audio.currentTime → wall clock.
-            _audioHls.on(Hls.Events.FRAG_BUFFERED, function (e, d) {
-                var pdt = d.frag && d.frag.programDateTime;
-                if (pdt) {
-                    _audioAnchorPdtMs    = pdt.getTime();
-                    _audioAnchorHlsStart = d.frag.start;
-                }
-            });
-
-            _audioHls.on(Hls.Events.ERROR, function (e, d) {
-                if (!d.fatal) {
-                    console.warn('[audio-hls] non-fatal error type=' + d.type + ' details=' + d.details);
-                    return;
-                }
-                console.error('[audio-hls] FATAL error type=' + d.type + ' details=' + d.details + ' — retrying in 3 s');
-                if (_audioHls) { try { _audioHls.destroy(); } catch (err) {} _audioHls = null; }
-                setTimeout(function () {
-                    if (_baseUrl && _mode === 'ogg_flac') _startAudioHls(_baseUrl, cfg);
-                }, 3000);
-            });
-
-            _audioHls.loadSource(baseUrl + 'cast/split_audio/stream.m3u8');
-            _audioHls.attachMedia(audio);
-            console.log('[audio-hls] loading ' + baseUrl + 'cast/split_audio/stream.m3u8');
-        }
-
-        // ── Video pipeline ────────────────────────────────────────────────────
-        function _startVideoHls(baseUrl, cfg) {
-            var video = document.getElementById('hls-bg');
-            if (!video) { console.warn('[ogg-flac] #hls-bg element missing — video disabled'); return; }
-
-            _videoHls = new Hls(_makeHlsCfg(cfg));
-
-            _videoHls.on(Hls.Events.MANIFEST_PARSED, function (e, d) {
-                console.log('[video-hls] MANIFEST_PARSED levels=' + d.levels.length);
-                video.muted = true;
-                video.style.display = 'block';
-                var pos = _videoHls.liveSyncPosition;
-                if (pos != null) { video.currentTime = pos; }
-                video.play().catch(function (err) {
-                    console.warn('[video-hls] play() rejected:', err);
-                });
-                _startSyncLoop();
-            });
-
-            // Capture PDT anchor on every buffered fragment.
-            _videoHls.on(Hls.Events.FRAG_BUFFERED, function (e, d) {
-                var pdt = d.frag && d.frag.programDateTime;
-                if (pdt) {
-                    _videoAnchorPdtMs    = pdt.getTime();
-                    _videoAnchorHlsStart = d.frag.start;
-                }
-            });
-
-            _videoHls.on(Hls.Events.ERROR, function (e, d) {
-                if (!d.fatal) {
-                    console.warn('[video-hls] non-fatal error type=' + d.type + ' details=' + d.details);
-                    return;
-                }
-                console.error('[video-hls] FATAL error type=' + d.type + ' details=' + d.details + ' — retrying in 3 s');
-                if (_videoHls) { try { _videoHls.destroy(); } catch (err) {} _videoHls = null; }
-                if (_syncTimer) { clearInterval(_syncTimer); _syncTimer = null; }
-                setTimeout(function () {
-                    if (_baseUrl && _mode === 'ogg_flac') _startVideoHls(_baseUrl, cfg);
-                }, 3000);
-            });
-
-            _videoHls.loadSource(baseUrl + 'cast/split_video/stream.m3u8');
-            _videoHls.attachMedia(video);
-            console.log('[video-hls] loading ' + baseUrl + 'cast/split_video/stream.m3u8');
-        }
-
-        // ═════════════════════════════════════════════════════════════════════
-        // A/V sync loop
+        // ── Benchmark: decode quality metrics logged every 5 s ─────────────────
         //
-        // Runs every SYNC_TICK_MS (100 ms).  Audio is the master clock; the
-        // video element's playbackRate is adjusted to keep its wall-clock
-        // position aligned with the audio wall-clock position.
+        // Pass criteria (logged as PASS/WARN):
+        //   droppedVideoFrames / totalVideoFrames < 0.5%   — hardware decode holding
+        //   bufferedAhead >= 4 s                           — buffer not draining
         //
-        // Three correction regimes:
-        //   |drift| > SEEK_THRESHOLD (400 ms) → hard-seek video to target time
-        //   |drift| < DEAD_ZONE      (40 ms)  → reset rate to 1.0, no correction
-        //   otherwise                         → proportional rate trim ±10%
-        // ═════════════════════════════════════════════════════════════════════
-        function _startSyncLoop() {
-            if (_syncTimer) clearInterval(_syncTimer);
-
-            _syncTimer = setInterval(function () {
-                var now = Date.now();
-
-                // Grace period: let HLS buffers fill and stabilise.
-                if (now < _graceUntil) return;
-
-                // Wait for at least one PDT anchor from both streams.
-                if (_audioAnchorPdtMs < 0 || _videoAnchorPdtMs < 0) {
-                    if (!_startSyncLoop._warned) {
-                        _startSyncLoop._warned = true;
-                        console.warn('[sync] waiting for PDT anchors' +
-                            ' (audio=' + _audioAnchorPdtMs +
-                            ' video=' + _videoAnchorPdtMs + ')');
+        function _startBenchmark(player) {
+            if (_benchTimer) clearInterval(_benchTimer);
+            _benchTimer = setInterval(function () {
+                try {
+                    var q = player.getVideoPlaybackQuality
+                        ? player.getVideoPlaybackQuality() : null;
+                    var total   = q ? q.totalVideoFrames   : 0;
+                    var dropped = q ? q.droppedVideoFrames : 0;
+                    var bufferedAhead = 0;
+                    if (player.buffered && player.buffered.length > 0) {
+                        for (var i = 0; i < player.buffered.length; i++) {
+                            if (player.buffered.start(i) <= player.currentTime &&
+                                player.buffered.end(i)   >= player.currentTime) {
+                                bufferedAhead = player.buffered.end(i) - player.currentTime;
+                                break;
+                            }
+                        }
                     }
-                    return;
+                    var dropRate = total > 0 ? (dropped / total) : 0;
+                    var pass     = dropRate < 0.005 && bufferedAhead >= 4;
+                    console.log('[bench] ' + (pass ? 'PASS' : 'WARN') +
+                        ' dropped=' + dropped + '/' + total +
+                        ' dropRate=' + (dropRate * 100).toFixed(2) + '%' +
+                        ' bufferedAhead=' + bufferedAhead.toFixed(1) + 's' +
+                        ' readyState=' + player.readyState +
+                        ' currentTime=' + player.currentTime.toFixed(2));
+                    _postTelemetry({
+                        type: 'bench',
+                        droppedFrames: dropped,
+                        totalFrames:   total,
+                        dropRate:      dropRate,
+                        bufferedAhead: bufferedAhead,
+                        readyState:    player.readyState,
+                        pass:          pass,
+                    });
+                } catch (e) {
+                    console.warn('[bench] getVideoPlaybackQuality error:', e);
                 }
-                _startSyncLoop._warned = false;
-
-                var audio = document.getElementById('flac-audio');
-                var video = document.getElementById('hls-bg');
-                if (!audio || !video) return;
-                if (audio.paused || video.paused) return;
-                if (audio.currentTime <= 0) return;
-
-                // ── Wall-clock positions ──────────────────────────────────────
-                var audioWallMs = _audioAnchorPdtMs +
-                    (audio.currentTime - _audioAnchorHlsStart) * 1000;
-                var videoWallMs = _videoAnchorPdtMs +
-                    (video.currentTime - _videoAnchorHlsStart) * 1000;
-
-                // drift > 0 : video is behind audio → speed up video
-                // drift < 0 : video is ahead of audio → slow down video
-                var drift = audioWallMs - videoWallMs;
-
-                // Discard anomalous readings (startup transients, stale anchors, NaN).
-                if (!isFinite(drift) || Math.abs(drift) > 30000) {
-                    console.warn('[sync] anomalous drift=' + drift.toFixed(0) +
-                        'ms — audioWall=' + audioWallMs.toFixed(0) +
-                        ' videoWall=' + videoWallMs.toFixed(0) + ' — skipping');
-                    return;
-                }
-
-                // ── Hard-seek ─────────────────────────────────────────────────
-                if (Math.abs(drift) > SEEK_THRESHOLD && (now - _lastSeekAt) > SEEK_COOLDOWN) {
-                    // Compute the video HLS timeline position that aligns with audio wall time.
-                    var targetHlsTime = _videoAnchorHlsStart +
-                        (audioWallMs - _videoAnchorPdtMs) / 1000;
-
-                    // Clamp to the buffered range to avoid seeking outside the buffer.
-                    if (video.buffered.length > 0) {
-                        var bufStart = video.buffered.start(0) + 0.1;
-                        var bufEnd   = video.buffered.end(video.buffered.length - 1) - 0.1;
-                        targetHlsTime = Math.max(bufStart, Math.min(bufEnd, targetHlsTime));
-                    }
-
-                    if (targetHlsTime > 0) {
-                        video.currentTime = targetHlsTime;
-                        video.playbackRate = 1.0;
-                        _lastSeekAt = now;
-                        _lastRate   = 1.0;
-                        // Invalidate the video anchor so the next FRAG_BUFFERED event
-                        // after the seek establishes a fresh, post-seek anchor.
-                        _videoAnchorPdtMs = -1;
-                        console.log('[sync] hard-seek: drift=' + drift.toFixed(0) +
-                            'ms → vidT=' + targetHlsTime.toFixed(3) +
-                            ' audT=' + audio.currentTime.toFixed(2));
-                        _postTelemetry({ type: 'flac_seek',
-                            driftMs: Math.round(drift), targetTime: targetHlsTime,
-                            audioWallMs: Math.round(audioWallMs),
-                            videoWallMs: Math.round(videoWallMs) });
-                    }
-                    return;
-                }
-
-                // ── Dead zone ─────────────────────────────────────────────────
-                if (Math.abs(drift) < DEAD_ZONE) {
-                    if (video.playbackRate !== 1.0) {
-                        video.playbackRate = 1.0;
-                        _lastRate = 1.0;
-                        console.log('[sync] dead zone → rate=1.0 drift=' + drift.toFixed(0) + 'ms');
-                    }
-                    return;
-                }
-
-                // ── Rate trim ─────────────────────────────────────────────────
-                var rate = 1.0 + Math.max(-MAX_RATE_DELTA,
-                    Math.min(MAX_RATE_DELTA, (drift / 1000) * RATE_GAIN));
-                video.playbackRate = rate;
-
-                // Suppress log spam: only log when rate changes by ≥ 0.3%.
-                if (Math.abs(Math.round(rate * 1000) - Math.round(_lastRate * 1000)) >= 3) {
-                    console.log('[sync] drift=' + drift.toFixed(0) +
-                        'ms rate=' + rate.toFixed(3) +
-                        ' audT=' + audio.currentTime.toFixed(2) +
-                        ' vidT=' + video.currentTime.toFixed(2));
-                    _lastRate = rate;
-                }
-            }, SYNC_TICK_MS);
+            }, 5000);
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Utility: overlay opacity
-        // ─────────────────────────────────────────────────────────────────────
+        // ── Overlay ────────────────────────────────────────────────────────────
         function _showOverlay(opacity) {
             var el = document.getElementById('overlay');
             if (el) el.style.opacity = String(opacity);
         }
 
-        function _clearPauseTimer() {
-            if (_pauseTimer) { clearTimeout(_pauseTimer); _pauseTimer = null; }
-        }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // Server communication helpers
-        // ─────────────────────────────────────────────────────────────────────
+        // ── Server communication ────────────────────────────────────────────────
         function _postAck(state) {
             if (!_baseUrl) return;
             fetch(_baseUrl + 'cast/ack', {
@@ -565,9 +356,7 @@
             } catch (e) {}
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Remote logging — all console.* calls POST to /cast/log when enabled
-        // ─────────────────────────────────────────────────────────────────────
+        // ── Remote logging ─────────────────────────────────────────────────────
         function _postRemoteLog(entry) {
             if (!_remoteLogEnabled || !_baseUrl) return;
             try {
@@ -602,7 +391,8 @@
             };
             window.addEventListener('unhandledrejection', function (e) {
                 var r = e.reason;
-                _sendRemoteLog('error', ['[unhandledrejection] ' + (r && r.message ? r.message : String(r))]);
+                _sendRemoteLog('error', ['[unhandledrejection] ' +
+                    (r && r.message ? r.message : String(r))]);
             });
         })();
 
@@ -612,15 +402,14 @@
                     .then(function (r) { return r.ok ? r.json() : null; })
                     .then(function (cfg) {
                         _remoteLogEnabled = !!(cfg && cfg.enableReceiverLog);
-                        console.log('[receiver] remote log ' + (_remoteLogEnabled ? 'enabled' : 'disabled'));
+                        console.log('[receiver] remote log ' +
+                            (_remoteLogEnabled ? 'enabled' : 'disabled'));
                     })
                     .catch(function () { _remoteLogEnabled = false; });
             } catch (e) { _remoteLogEnabled = false; }
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // CAF diagnostics — key lifecycle events forwarded to remote log
-        // ─────────────────────────────────────────────────────────────────────
+        // ── CAF diagnostics ────────────────────────────────────────────────────
         (function _wireCafDiagnostics() {
             var EV = cast.framework.events.EventType;
             [
@@ -630,24 +419,24 @@
             ].forEach(function (evType) {
                 playerManager.addEventListener(evType, function (event) {
                     var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); } catch (e) { detail = String(event); }
+                    try { detail = JSON.stringify(event).substring(0, 200); }
+                    catch (e) { detail = String(event); }
                     console.log('[caf-diag] ' + evType + ' ' + detail);
                 });
             });
 
-            // TIME_UPDATE: log every 5 s to confirm CAF element is progressing
+            // TIME_UPDATE: log every 5 s so CAF + player progress is visible in remote log.
             playerManager.addEventListener(EV.TIME_UPDATE, function () {
                 var now = Date.now();
-                if (!_wireCafDiagnostics._lastTU || now - _wireCafDiagnostics._lastTU > 5000) {
+                if (!_wireCafDiagnostics._lastTU ||
+                    now - _wireCafDiagnostics._lastTU > 5000) {
                     _wireCafDiagnostics._lastTU = now;
-                    var caf = document.getElementById('caf-el');
-                    var aud = document.getElementById('flac-audio');
-                    console.log('[caf-diag] TIME_UPDATE cafT=' +
-                        (caf ? caf.currentTime.toFixed(2) : 'n/a') +
-                        ' audT=' + (aud ? aud.currentTime.toFixed(2) : 'n/a') +
-                        ' audPaused=' + (aud ? aud.paused : '?') +
-                        ' audioAnchor=' + _audioAnchorPdtMs +
-                        ' videoAnchor=' + _videoAnchorPdtMs);
+                    var cafEl = document.getElementById('caf-el');
+                    var p     = document.getElementById('player');
+                    console.log('[caf-diag] TIME_UPDATE' +
+                        ' cafT='    + (cafEl ? cafEl.currentTime.toFixed(2) : 'n/a') +
+                        ' playerT=' + (p ? p.currentTime.toFixed(2) : 'n/a') +
+                        ' paused='  + (p ? p.paused : '?'));
                 }
             });
 
@@ -656,1001 +445,14 @@
              SYS.SYSTEM_VOLUME_CHANGED, SYS.ERROR].forEach(function (sysEvType) {
                 context.addEventListener(sysEvType, function (event) {
                     var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); } catch (e) { detail = String(event); }
+                    try { detail = JSON.stringify(event).substring(0, 200); }
+                    catch (e) { detail = String(event); }
                     console.log('[caf-sys] ' + sysEvType + ' ' + detail);
                 });
             });
         })();
 
     })(); // end IIFE
-    </script>
-</body>
-</html>
-        const CHANNEL = 'urn:x-cast:com.google.cast.media';
-        const context = cast.framework.CastReceiverContext.getInstance();
-        const playerManager = context.getPlayerManager();
-
-        playerManager.setSupportedMediaCommands(
-            cast.framework.messages.Command.ALL_BASIC_MEDIA |
-            cast.framework.messages.Command.PAUSE |
-            cast.framework.messages.Command.QUEUE_NEXT |
-            cast.framework.messages.Command.QUEUE_PREV
-        );
-
-        playerManager.setMessageInterceptor(
-            cast.framework.messages.MessageType.PRELOAD,
-            request => request
-        );
-            
-        playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, request => {
-            const baseUrl = (request.media && request.media.customData && request.media.customData.MediaBaseUrl) || '';
-            console.log('[receiver] LOAD interceptor: baseUrl=' + baseUrl);
-            if (baseUrl) {
-                _castBaseUrl      = baseUrl;
-                _hlsStreamingMode = (request.media && request.media.customData && request.media.customData.HlsStreamingMode) || '';
-                _fetchRemoteLogSetting(baseUrl);
-
-                // In pcm_stream mode audio comes from the Web Audio API — silence the CAF
-                // media element IMMEDIATELY (before any async work) so the WAV stream that
-                // CAF loads into receiverVideoElement never reaches the speakers.
-                // IMPORTANT: only set .muted, never .volume — on Chromecast, setting
-                // element.volume propagates to the CAF system volume and silences ALL audio
-                // output including Web Audio API.
-                var caf = document.getElementById('receiverVideoElement');
-                if (caf) {
-                    caf.muted = (_hlsStreamingMode === 'pcm_stream');
-                }
-
-                // Invalidate the sync epoch so the loop does not use a stale value
-                // from the previous track while waiting for the next /cast/audio-clock poll.
-                _epochWallMs    = -1;
-                _videoStartDate = null;
-                _resetPcmStream(); // tear down any previous AudioWorklet + Worker
-                try {
-                    if (!_splitVideoHls) {
-                        _showAudioSyncOverlay();
-                        resetBgVideo();
-                        _dispatchStream(baseUrl);
-                    } else {
-                        console.log('[receiver] LOAD: HLS already running — skipping reset');
-                    }
-                } catch (e) {
-                    console.error('[receiver] _dispatchStream threw (non-fatal):', e && e.message ? e.message : String(e));
-                }
-                _startCalibrationWatch();
-            }
-            return request;
-        });
-
-        var _pauseRevealTimer = null;
-        var _loadSyncActive = false;       // true while the initial load overlay covers the HLS video
-        var _audioSyncOverlayTimer = null; // timer to lift the load overlay
-
-        // On PAUSE: fade to black immediately so the stale HLS buffer drain is hidden.
-        playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
-            var overlay = document.getElementById('pause-overlay');
-            if (_audioSyncOverlayTimer) { clearTimeout(_audioSyncOverlayTimer); _audioSyncOverlayTimer = null; }
-            _loadSyncActive = false;
-            if (overlay) overlay.style.opacity = '1';
-            if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
-
-            // Pause the HLS video so it doesn't drift during the audio pause.
-            if (_splitVideoHls) {
-                var bg = document.getElementById('hls-bg');
-                if (bg) try { bg.pause(); } catch (e) {}
-            }
-            // Suspend Web Audio playback (pcm_stream mode).
-            if (_audioCtx && _audioCtx.state === 'running') {
-                _audioCtx.suspend().catch(function () {});
-            }
-
-            _pauseRevealTimer = setTimeout(function () {
-                _pauseRevealTimer = null;
-                if (overlay) overlay.style.opacity = '0';
-            }, 1500);
-                        
-            if (_castBaseUrl) {
-                fetch(_castBaseUrl + 'cast/ack', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ state: 'PAUSED' })
-                }).catch(function () {});
-            }
-        });
-                
-        playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
-            var bg      = document.getElementById('hls-bg');
-            var overlay = document.getElementById('pause-overlay');
-            if (_pauseRevealTimer) { clearTimeout(_pauseRevealTimer); _pauseRevealTimer = null; }
-            if (bg && _splitVideoHls) {
-                // Do NOT hard-seek to liveSyncPosition here — that would jump the video
-                // forward by the full HLS latency on every resume, causing a large drift
-                // spike that the sync loop then has to fight against.
-                // Instead: just unpause and let the sync loop correct any drift
-                // with a hard-seek to the audio-aligned position within one tick.
-                if (bg.paused) bg.play().catch(function (e) { console.warn('[hls-bg] resume play() rejected:', e); });
-            }
-            // Resume Web Audio playback (pcm_stream mode).
-            if (_audioCtx && _audioCtx.state === 'suspended') {
-                _audioCtx.resume().catch(function () {});
-            }
-            // Re-enforce mute on CAF element — CAF may reset it when it fires PLAYING.
-            // Only set .muted — never .volume (see LOAD interceptor comment).
-            if (_hlsStreamingMode === 'pcm_stream') {
-                var cafEl = document.getElementById('receiverVideoElement');
-                if (cafEl) { cafEl.muted = true; }
-            }
-            if (overlay && !_loadSyncActive) overlay.style.opacity = '0';
-            
-            if (_castBaseUrl) {
-                fetch(_castBaseUrl + 'cast/ack', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ state: 'PLAYING' })
-                }).catch(function () {});
-            }
-        });
-
-        playerManager.addEventListener(cast.framework.events.EventType.REQUEST_QUEUE_UPDATE, function (event) {
-            var next = event.requestData && event.requestData.jump == 1;
-            context.sendCustomMessage(CHANNEL, undefined, {
-                type: next ? 'NEXT' : 'PREVIOUS',
-                message: next ? 'NEXT' : 'PREVIOUS'
-            });
-        });
-
-        context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, function () {
-            context.stop();
-        });
-
-        var options = new cast.framework.CastReceiverOptions();
-        options.customNamespaces = {};
-        options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
-        options.disableIdleTimeout = false;
-        options.maxInactivity = 3600;
-        options.mediaElement = document.getElementById('receiverVideoElement');
-
-        window.onerror = function (msg, src, line, col, err) {
-            console.error('[CRASH] Uncaught error:', msg, 'at', src, line + ':' + col, err);
-        };
-        window.addEventListener('unhandledrejection', function (e) {
-            console.error('[CRASH] Unhandled promise rejection:', e.reason);
-        });
-
-        context.start(options);
-                
-        var _remoteLogEnabled = false;
-
-        function _postRemoteLog(entry) {
-            if (!_remoteLogEnabled || !_castBaseUrl) return;
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', _castBaseUrl + 'cast/log', true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.send(JSON.stringify(entry));
-            } catch(e) { /* never let remote logging break the app */ }
-        }
-
-        function _sendRemoteLog(level, args) {
-            if (!_remoteLogEnabled) return;
-            var msg;
-            try {
-                msg = Array.prototype.map.call(args, function(a) {
-                    if (a == null) return String(a);
-                    try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
-                    catch(e) { return '[unserializable]'; }
-                }).join(' ');
-            } catch(e) { msg = '[log serialization error]'; }
-            _postRemoteLog({ level: level, message: msg, ts: new Date().toISOString() });
-        }
-
-        (function() {
-            ['log', 'info', 'warn', 'error'].forEach(function(m) {
-                var _orig = console[m].bind(console);
-                console[m] = function() { _orig.apply(console, arguments); _sendRemoteLog(m, arguments); };
-            });
-            window.onerror = function(msg, src, line) {
-                _sendRemoteLog('error', ['[uncaught] ' + msg + ' (' + src + ':' + line + ')']);
-                return false;
-            };
-            window.addEventListener('unhandledrejection', function(e) {
-                var r = e.reason;
-                _sendRemoteLog('error', ['[unhandledrejection] ' + (r && r.message ? r.message : String(r))]);
-            });
-        })();
-
-        function _fetchRemoteLogSetting(baseUrl) {
-            try {
-                fetch(baseUrl + 'api/settings')
-                    .then(function(r) { return r.ok ? r.json() : null; })
-                    .then(function(cfg) {
-                        _remoteLogEnabled = !!(cfg && cfg.enableReceiverLog);
-                        console.log('[receiver] remote log ' + (_remoteLogEnabled ? 'enabled' : 'disabled'));
-                    })
-                    .catch(function() { _remoteLogEnabled = false; });
-            } catch(e) { _remoteLogEnabled = false; }
-        }
-
-        // ── CAF player state diagnostics ────────────────────────────────────────
-        // Subscribe to every significant CAF event so we can trace the full lifecycle
-        // in the remote log without needing a physical monitor attached.
-        (function _wireCafDiagnostics() {
-            var EV = cast.framework.events.EventType;
-            var interesting = [
-                EV.MEDIA_STATUS, EV.PLAYER_LOAD_COMPLETE, EV.PLAYER_LOAD_FAILED,
-                EV.PLAY, EV.PAUSE, EV.PLAYING, EV.ENDED, EV.BUFFERING,
-                EV.TIME_UPDATE, EV.BITRATE_CHANGED, EV.SEGMENT_DOWNLOADED,
-                EV.ERROR, EV.MEDIA_FINISHED, EV.REQUEST_LOAD
-            ];
-            interesting.forEach(function (evType) {
-                playerManager.addEventListener(evType, function (event) {
-                    // TIME_UPDATE fires very frequently — only log every 5 s
-                    if (evType === EV.TIME_UPDATE) {
-                        var now = Date.now();
-                        if (!_wireCafDiagnostics._lastTimeUpdate || now - _wireCafDiagnostics._lastTimeUpdate > 5000) {
-                            _wireCafDiagnostics._lastTimeUpdate = now;
-                            var caf = document.getElementById('receiverVideoElement');
-                            console.log('[caf-diag] TIME_UPDATE currentTime=' +
-                                (caf ? caf.currentTime.toFixed(2) : 'n/a') +
-                                ' muted=' + (caf ? caf.muted : '?') +
-                                ' volume=' + (caf ? caf.volume : '?') +
-                                ' readyState=' + (caf ? caf.readyState : '?') +
-                                ' paused=' + (caf ? caf.paused : '?'));
-                        }
-                        return;
-                    }
-                    var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); } catch(e) { detail = String(event); }
-                    console.log('[caf-diag] ' + evType + ' ' + detail);
-                });
-            });
-
-            // Also log CAF context-level events
-            var SYS = cast.framework.system.EventType;
-            [SYS.READY, SYS.SENDER_CONNECTED, SYS.SENDER_DISCONNECTED,
-             SYS.SYSTEM_VOLUME_CHANGED, SYS.ERROR].forEach(function (sysEvType) {
-                context.addEventListener(sysEvType, function (event) {
-                    var detail = '';
-                    try { detail = JSON.stringify(event).substring(0, 200); } catch(e) { detail = String(event); }
-                    console.log('[caf-sys] ' + sysEvType + ' ' + detail);
-                });
-            });
-        })();
-
-        var _hlsStarted    = false;
-        var _splitVideoHls = null;
-        var _syncTimer     = null;   // A/V sync loop interval handle
-        var _castBaseUrl   = '';     // set on LOAD from customData.MediaBaseUrl
-        var _hlsStreamingMode = '';  // set on LOAD from customData.HlsStreamingMode
-        var _calibPollTimer = null;
-        var _sawCalibrationMode = false;
-
-        // Module-level sync state — must be reset on every LOAD so the sync loop
-        // does not use a stale epoch from the previous track/session.
-        var _epochWallMs      = -1;  // server UTC ms when CAF connected (caf.currentTime=0)
-        var _videoStartDate   = null; // cached result of video.getStartDate()
-        var _videoStartDateAt = 0;    // wall time when _videoStartDate was last refreshed
-
-        // pcm_stream state — AudioWorklet + Web Worker audio pipeline.
-        var _audioCtx           = null;    // AudioContext
-        var _workletNode        = null;    // AudioWorkletNode (pcm-sink)
-        var _pcmWorker          = null;    // Web Worker (pcm-fetch-worker.js)
-        var _pcmStartWallMs     = -1;      // X-PCM-Start-Wall-Ms header value
-        var _pcmAudioMs         = 0;       // audioTimeMs from last worklet clock message
-        var _pcmRingFill        = 0;       // ringFill (samples) from last worklet clock message
-        var _pcmSampleRate      = 48000;   // X-PCM-SampleRate header value
-        var _pcmSamplesBuffered = 0;       // total Float32 samples delivered to worklet
-        var _pcmPrerollSent     = false;   // true after 'start' sent to worklet
-
-        function _postSplitTelemetry(data) {
-            if (!_castBaseUrl) return;
-            try {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', _castBaseUrl + 'cast/telemetry', true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.send(JSON.stringify(data));
-            } catch(e) { /* never let telemetry break the stream */ }
-        }
-                
-        function _showAudioSyncOverlay() {
-            var overlay = document.getElementById('pause-overlay');
-            if (!overlay) return;
-            if (_audioSyncOverlayTimer) { clearTimeout(_audioSyncOverlayTimer); _audioSyncOverlayTimer = null; }
-            _loadSyncActive = true;
-            overlay.style.opacity = '1';
-            fetch(_castBaseUrl + 'cast/state')
-                .then(function (r) { return r.json(); })
-                .then(function (s) {
-                    var delayMs = s.calibrationMode ? 3000 : 14000;
-                    _audioSyncOverlayTimer = setTimeout(function () {
-                        _audioSyncOverlayTimer = null;
-                        _loadSyncActive = false;
-                        overlay.style.opacity = '0';
-                    }, delayMs);
-                })
-                .catch(function () {
-                    _audioSyncOverlayTimer = setTimeout(function () {
-                        _audioSyncOverlayTimer = null;
-                        _loadSyncActive = false;
-                        overlay.style.opacity = '0';
-                    }, 14000);
-                });
-        }
-                
-        function resetBgVideo() {
-            var video = document.getElementById('hls-bg');
-            if (_splitVideoHls) {
-                try { _splitVideoHls.destroy(); } catch (e) {}
-                _splitVideoHls = null;
-            }
-            _hlsStarted = false;
-            if (_syncTimer) { clearInterval(_syncTimer); _syncTimer = null; }
-            if (video) { try { video.pause(); } catch (e) {} video.style.display = 'none'; }
-            console.log('[receiver] bg video reset — buffers dropped');
-        }
-                
-        function _startCalibrationWatch() {
-            if (_calibPollTimer) { clearTimeout(_calibPollTimer); }
-            _calibPollTimer = setTimeout(_calibPoll, 1000);
-        }
-
-        function _calibPoll() {
-            _calibPollTimer = null;
-            if (!_castBaseUrl) return;
-            fetch(_castBaseUrl + 'cast/state')
-                .then(function (r) { return r.json(); })
-                .then(function (s) {
-                    if (s.calibrationMode) {
-                        if (!_sawCalibrationMode) {
-                            _sawCalibrationMode = true;
-                            setTimeout(function () {
-                                var bg = document.getElementById('hls-bg');
-                                if (bg && _splitVideoHls && _splitVideoHls.liveSyncPosition) {
-                                    bg.currentTime = _splitVideoHls.liveSyncPosition;
-                                    console.log('[receiver] calibration start — video seeked to live edge ' + _splitVideoHls.liveSyncPosition.toFixed(2));
-                                }
-                            }, 3000);
-                        }
-                        _calibPollTimer = setTimeout(_calibPoll, 1000);
-                    } else if (_sawCalibrationMode) {
-                        _sawCalibrationMode = false;
-                        console.log('[receiver] calibration ended — seeking to live edge');
-                        setTimeout(function () {
-                            var bg = document.getElementById('hls-bg');
-                            if (bg && _splitVideoHls && _splitVideoHls.liveSyncPosition) {
-                                bg.currentTime = _splitVideoHls.liveSyncPosition;
-                            }
-                        }, 3000);
-                    }
-                })
-                .catch(function () {
-                    if (_sawCalibrationMode) {
-                        _calibPollTimer = setTimeout(_calibPoll, 2000);
-                    }
-                });
-        }
-                
-        function startCafWavSync(baseUrl) {
-            if (_hlsStarted || !baseUrl) return;
-            var video = document.getElementById('hls-bg');
-            if (!video) return;
-            if (typeof Hls === 'undefined' || !Hls.isSupported()) {
-                console.error('[caf-wav-sync] hls.js not available or MSE not supported');
-                return;
-            }
-
-            _hlsStarted = true;
-
-            var caf = document.getElementById('receiverVideoElement');
-            if (caf) caf.muted = false;
-
-            fetch(baseUrl + 'api/settings')
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .catch(function () { return null; })
-                .then(function (cfg) {
-                    var liveSyncDurationCount       = (cfg && cfg.hlsLiveSyncSegments > 0)   ? cfg.hlsLiveSyncSegments   : 3;
-                    var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
-                    
-                    var maxBufferLength  = 25;
-                    var backBufferLength = 20;
-
-                    _splitVideoHls = new Hls({
-                        lowLatencyMode: false,
-                        liveSyncDurationCount: liveSyncDurationCount,
-                        liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
-                        maxBufferLength: maxBufferLength,
-                        backBufferLength: backBufferLength,                        
-                        enableWorker: false,
-                        abrEnabled: false,
-                        startLevel: 0,
-                        manifestLoadingMaxRetry: 12,
-                        manifestLoadingRetryDelay: 1000,
-                        manifestLoadingMaxRetryTimeout: 12000,
-                    });
-
-                    _splitVideoHls.loadSource(baseUrl + 'cast/split_video/stream.m3u8');
-                    _splitVideoHls.attachMedia(video);
-
-                    _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
-                        video.muted = true;
-                        video.style.display = 'block';
-                        var pos = _splitVideoHls.liveSyncPosition;
-                        if (pos != null) { video.currentTime = pos; }
-                        video.play().catch(function (e) { console.warn('[caf-wav-sync] video play() rejected:', e); });
-                        console.log('[caf-wav-sync] video manifest parsed — starting sync loop');
-                        _cafWavSyncVideoSync();
-                    });
-
-                    _splitVideoHls.on(Hls.Events.ERROR, function (evt, data) {
-                        if (!data.fatal) return;
-                        console.error('[caf-wav-sync] video fatal HLS error:', data.type, data.details);
-                        if (_splitVideoHls) { try { _splitVideoHls.destroy(); } catch (e) {} _splitVideoHls = null; }
-                        if (_syncTimer) { clearInterval(_syncTimer); _syncTimer = null; }
-                        _hlsStarted = false;
-                        setTimeout(function () { startCafWavSync(baseUrl); }, 3000);
-                    });
-                });
-        }
-
-        function _cafWavSyncVideoSync() {
-            if (_syncTimer) clearInterval(_syncTimer);
-            var SYNC_TICK_MS   = 100;    // sync evaluation interval (ms)
-            var CLOCK_POLL_MS  = 500;    // audio-clock poll interval (ms)
-            var SEEK_THRESHOLD = 400;    // ms: hard-seek when |drift| exceeds this
-            var DEAD_ZONE      = 40;     // ms: no correction within ±40 ms
-            var RATE_GAIN      = 0.5;    // proportional gain (drift_s → rate delta)
-            var MAX_RATE_DELTA = 0.10;   // ±10 % max rate adjustment
-            var SEEK_COOLDOWN  = 2000;   // ms: suppress seeks for this long after a seek
-            var MAX_RTT_MS     = 300;    // discard poll responses with RTT > this
-
-            var _lastLoggedRate   = 1.0;
-            var _graceUntil       = Date.now() + 8000; // ignore first 8 s while HLS latches
-            // _epochWallMs, _videoStartDate, _videoStartDateAt are module-level so the LOAD
-            // interceptor can reset them on every track change without restarting the sync loop.
-            var _lastClockPollAt  = 0;
-            var _clockPollActive  = false;
-            var _lastHardSeekAt   = 0;
-
-            function _pollAudioClock() {
-                if (!_castBaseUrl || _clockPollActive) return;
-                _clockPollActive = true;
-                var t0 = Date.now();
-                fetch(_castBaseUrl + 'cast/audio-clock', { cache: 'no-store' })
-                    .then(function (r) { return r.ok ? r.json() : null; })
-                    .then(function (d) {
-                        if (!d) return;
-                        var rtt = Date.now() - t0;
-                        if (rtt > MAX_RTT_MS) {
-                            console.warn('[caf-wav-sync] clock poll RTT=' + rtt + 'ms > MAX — discarding');
-                            return;
-                        }
-                        // epochWallMs: -1 until CAF has connected to the audio stream.
-                        if (typeof d.epochWallMs === 'number' && d.epochWallMs >= 0) {
-                            _epochWallMs = d.epochWallMs;
-                        }
-                    })
-                    .catch(function () {})
-                    .finally(function () { _clockPollActive = false; });
-            }
-         
-            function _getVideoStartDate(video) {
-                var now = Date.now();
-                if (_videoStartDate && (now - _videoStartDateAt) < 10000) return _videoStartDate;
-                if (typeof video.getStartDate === 'function') {
-                    var d = video.getStartDate();
-                    if (d && !isNaN(d.getTime()) && d.getTime() > 0) {
-                        _videoStartDate = d;
-                        _videoStartDateAt = now;
-                    }
-                }
-                return _videoStartDate;
-            }
-
-            _syncTimer = setInterval(function () {
-                var now = Date.now();
-
-                // Refresh audio-clock at the configured rate.
-                if (now - _lastClockPollAt >= CLOCK_POLL_MS) {
-                    _lastClockPollAt = now;
-                    _pollAudioClock();
-                }
-
-                if (!_splitVideoHls) return;
-                var video = document.getElementById('hls-bg');
-                if (!video || video.paused) return;
-                if (now < _graceUntil) return;
-                if (_epochWallMs < 0) return; // CAF has not connected yet
-
-                var caf = document.getElementById('receiverVideoElement');
-                if (!caf || caf.currentTime <= 0) return;
-
-                // ── Wall-clock position of what audio is playing right now ──
-                // epochWallMs is the server UTC time when caf.currentTime was 0.
-                var audioWallMs = _epochWallMs + caf.currentTime * 1000;
-
-                // ── Wall-clock position of what video is showing right now ──
-                // getStartDate() returns the Date for currentTime = 0 from EXT-X-PROGRAM-DATE-TIME.
-                var startDate = _getVideoStartDate(video);
-                if (!startDate) {
-                    // PDT not available yet — emit a one-time warning and skip this tick.
-                    if (!_cafWavSyncVideoSync._pdtWarned) {
-                        _cafWavSyncVideoSync._pdtWarned = true;
-                        console.warn('[caf-wav-sync] EXT-X-PROGRAM-DATE-TIME not yet available — waiting for manifest PDT');
-                    }
-                    return;
-                }
-
-                var videoWallMs = startDate.getTime() + video.currentTime * 1000;
-
-                // drift > 0: audio is ahead of video → video needs to play faster to catch up
-                // drift < 0: video is ahead of audio → video needs to slow down
-                var drift = audioWallMs - videoWallMs;  // in ms
-
-                // Sanity: discard wild readings (startup transients, stale epoch, NaN)
-                if (!isFinite(drift) || Math.abs(drift) > 30000) {
-                    console.warn('[caf-wav-sync] anomalous drift=' + drift.toFixed(0) + 'ms — audioWall=' + audioWallMs + ' videoWall=' + videoWallMs + ' — skipping');
-                    return;
-                }
-
-                // ── Hard-seek: large drift, outside cooldown ──
-                if (Math.abs(drift) > SEEK_THRESHOLD && (now - _lastHardSeekAt) > SEEK_COOLDOWN) {
-                    // targetVideoTime: move video so its PDT wall time matches the audio wall time.
-                    var targetVideoTime = (audioWallMs - startDate.getTime()) / 1000;
-                    // Clamp to buffered range
-                    if (video.buffered.length > 0) {
-                        var bufStart = video.buffered.start(0) + 0.1;
-                        var bufEnd   = video.buffered.end(video.buffered.length - 1) - 0.1;
-                        targetVideoTime = Math.max(bufStart, Math.min(bufEnd, targetVideoTime));
-                    }
-                    if (targetVideoTime > 0) {
-                        video.currentTime = targetVideoTime;
-                        video.playbackRate = 1.0;
-                        _lastHardSeekAt = now;
-                        _lastLoggedRate = 1.0;
-                        _videoStartDate = null; // force PDT re-read after seek
-                        console.log('[caf-wav-sync] hard-seek: drift=' + drift.toFixed(0) + 'ms → seekTo=' + targetVideoTime.toFixed(3) + ' cafT=' + caf.currentTime.toFixed(2));
-                        _postSplitTelemetry({ type: 'caf_seek', driftMs: Math.round(drift), targetTime: targetVideoTime, audioWallMs: Math.round(audioWallMs), videoWallMs: Math.round(videoWallMs) });
-                    }
-                    return;
-                }
-
-                // ── Dead zone: no correction ──
-                if (Math.abs(drift) < DEAD_ZONE) {
-                    if (video.playbackRate !== 1.0) {
-                        video.playbackRate = 1.0;
-                        console.log('[caf-wav-sync] sync: dead zone — rate=1.0 drift=' + drift.toFixed(0) + 'ms');
-                        _lastLoggedRate = 1.0;
-                    }
-                    return;
-                }
-
-                // ── Rate trim: proportional, capped at ±MAX_RATE_DELTA ──
-                var rate = 1.0 + Math.max(-MAX_RATE_DELTA, Math.min(MAX_RATE_DELTA, (drift / 1000) * RATE_GAIN));
-                video.playbackRate = rate;
-                var roundedRate = Math.round(rate * 1000);
-                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 3) {
-                    console.log('[caf-wav-sync] sync: drift=' + drift.toFixed(0) + 'ms rate=' + rate.toFixed(3) + ' cafT=' + caf.currentTime.toFixed(2) + ' vidT=' + video.currentTime.toFixed(2));
-                    _lastLoggedRate = rate;
-                }
-            }, SYNC_TICK_MS);
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════════
-        // pcm_stream pipeline — AudioWorklet + Web Worker for near-bit-perfect audio
-        // + wall-clock A/V synchronisation against HLS video EXT-X-PROGRAM-DATE-TIME.
-        // ═══════════════════════════════════════════════════════════════════════════
-
-        // Tear down any live pcm_stream components (called on every LOAD / teardown).
-        function _resetPcmStream() {
-            console.log('[pcm-stream] _resetPcmStream — tearing down pipeline');
-            if (_pcmWorker)   { try { _pcmWorker.terminate();    } catch (e) {} _pcmWorker   = null; }
-            if (_workletNode) { try { _workletNode.disconnect(); } catch (e) {} _workletNode = null; }
-            if (_audioCtx)    { try { _audioCtx.close();         } catch (e) {} _audioCtx    = null; }
-            _pcmStartWallMs     = -1;
-            _pcmAudioMs         = 0;
-            _pcmRingFill        = 0;
-            _pcmSamplesBuffered = 0;
-            _pcmPrerollSent     = false;
-            console.log('[pcm-stream] _resetPcmStream — done');
-        }
-
-        // Reads api/settings to detect the active streaming mode and dispatches to the
-        // appropriate pipeline start function.  Both paths are kept so settings changes
-        // take effect on the next LOAD without redeploying the receiver.
-        function _dispatchStream(baseUrl) {
-            fetch(baseUrl + 'api/settings')
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .catch(function () { return null; })
-                .then(function (cfg) {
-                    var mode = (cfg && cfg.hlsStreamingMode) || '';
-                    console.log('[receiver] streaming mode: ' + (mode || '(unknown)'));
-                    if (mode === 'pcm_stream') {
-                        startPcmStream(baseUrl, cfg);
-                    } else {
-                        // caf_wav_sync and all legacy modes — existing path.
-                        // startCafWavSync does its own settings fetch internally.
-                        startCafWavSync(baseUrl);
-                    }
-                });
-        }
-
-        // ── startPcmStream ────────────────────────────────────────────────────────
-        // Mutes the CAF media element (audio comes from Web Audio API), starts the
-        // HLS video pipeline, then starts the AudioWorklet + PCM fetch worker.
-        function startPcmStream(baseUrl, cfg) {
-            if (_hlsStarted || !baseUrl) return;
-            _hlsStarted = true;
-
-            console.log('[pcm-stream] startPcmStream — baseUrl=' + baseUrl);
-
-            // Audio comes from the Web Audio API — keep CAF element muted.
-            var caf = document.getElementById('receiverVideoElement');
-            if (caf) caf.muted = true;
-            console.log('[pcm-stream] CAF element muted=' + (caf ? caf.muted : 'no-element') + ' volume=' + (caf ? caf.volume : '?'));
-
-            var video = document.getElementById('hls-bg');
-            if (!video || typeof Hls === 'undefined' || !Hls.isSupported()) {
-                console.error('[pcm-stream] hls.js not available or video element missing — Hls defined=' + (typeof Hls !== 'undefined') + ' isSupported=' + (typeof Hls !== 'undefined' && Hls.isSupported()));
-                return;
-            }
-
-            var liveSyncDurationCount       = (cfg && cfg.hlsLiveSyncSegments  > 0) ? cfg.hlsLiveSyncSegments  : 3;
-            var liveMaxLatencyDurationCount = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
-
-            _splitVideoHls = new Hls({
-                lowLatencyMode:              false,
-                liveSyncDurationCount:       liveSyncDurationCount,
-                liveMaxLatencyDurationCount: liveMaxLatencyDurationCount,
-                maxBufferLength:             25,
-                backBufferLength:            20,
-                enableWorker:                false,
-                abrEnabled:                  false,
-                startLevel:                  0,
-                manifestLoadingMaxRetry:     12,
-                manifestLoadingRetryDelay:   1000,
-                manifestLoadingMaxRetryTimeout: 12000,
-            });
-
-            _splitVideoHls.loadSource(baseUrl + 'cast/split_video/stream.m3u8');
-            _splitVideoHls.attachMedia(video);
-            console.log('[pcm-stream] HLS loading source: ' + baseUrl + 'cast/split_video/stream.m3u8');
-
-            // ── Comprehensive hls.js event instrumentation ──
-            _splitVideoHls.on(Hls.Events.MANIFEST_LOADING,  function (e, d) { console.log('[hls-diag] MANIFEST_LOADING url=' + d.url); });
-            _splitVideoHls.on(Hls.Events.MANIFEST_LOADED,   function (e, d) { console.log('[hls-diag] MANIFEST_LOADED levels=' + d.levels.length); });
-            _splitVideoHls.on(Hls.Events.MANIFEST_PARSED,   function (e, d) { console.log('[hls-diag] MANIFEST_PARSED levels=' + d.levels.length + ' firstLevel=' + d.firstLevel); });
-            _splitVideoHls.on(Hls.Events.LEVEL_LOADED,      function (e, d) { console.log('[hls-diag] LEVEL_LOADED fragments=' + d.details.fragments.length + ' live=' + d.details.live + ' targetDuration=' + d.details.targetduration); });
-            _splitVideoHls.on(Hls.Events.FRAG_LOADING,      function (e, d) { console.log('[hls-diag] FRAG_LOADING sn=' + d.frag.sn + ' url=' + d.frag.url.split('/').pop()); });
-            _splitVideoHls.on(Hls.Events.FRAG_LOADED,       function (e, d) { console.log('[hls-diag] FRAG_LOADED sn=' + d.frag.sn + ' bytes=' + (d.networkDetails ? d.networkDetails.response : '?')); });
-            _splitVideoHls.on(Hls.Events.FRAG_BUFFERED,     function (e, d) { console.log('[hls-diag] FRAG_BUFFERED sn=' + d.frag.sn + ' id=' + d.frag.level); });
-            _splitVideoHls.on(Hls.Events.BUFFER_APPENDED,   function () { /* very frequent — omit */ });
-            _splitVideoHls.on(Hls.Events.BUFFER_EOS,        function () { console.log('[hls-diag] BUFFER_EOS'); });
-            _splitVideoHls.on(Hls.Events.BUFFER_STALLED,    function () { console.log('[hls-diag] BUFFER_STALLED'); });
-            _splitVideoHls.on(Hls.Events.BUFFER_FLUSHED,    function () { console.log('[hls-diag] BUFFER_FLUSHED'); });
-            _splitVideoHls.on(Hls.Events.ERROR,              function (evt, data) {
-                var lvl = data.fatal ? 'error' : 'warn';
-                console[lvl]('[hls-diag] ERROR fatal=' + data.fatal + ' type=' + data.type + ' details=' + data.details + (data.response ? ' status=' + data.response.code : ''));
-            });
-
-            _splitVideoHls.on(Hls.Events.MANIFEST_PARSED, function () {
-                video.muted = true;
-                video.style.display = 'block';
-                var pos = _splitVideoHls.liveSyncPosition;
-                console.log('[pcm-stream] HLS manifest parsed liveSyncPos=' + pos);
-                if (pos != null) { video.currentTime = pos; }
-                video.play().catch(function (e) { console.warn('[pcm-stream] video play() rejected:', e); });
-                console.log('[pcm-stream] HLS manifest parsed — starting AudioWorklet pipeline');
-                _startPcmAudioWorklet(baseUrl);
-                _pcmSyncVideoSync();
-            });
-
-            _splitVideoHls.on(Hls.Events.ERROR, function (evt, data) {
-                if (!data.fatal) return;
-                console.error('[pcm-stream] fatal HLS error — destroying and retrying in 3 s: type=' + data.type + ' details=' + data.details);
-                if (_splitVideoHls) { try { _splitVideoHls.destroy(); } catch (e) {} _splitVideoHls = null; }
-                if (_syncTimer) { clearInterval(_syncTimer); _syncTimer = null; }
-                _hlsStarted = false;
-                setTimeout(function () { startPcmStream(baseUrl, cfg); }, 3000);
-            });
-        }
-
-        // ── _startPcmAudioWorklet ─────────────────────────────────────────────────
-        // Creates AudioContext → loads pcm-worklet.js → creates PcmSinkProcessor node
-        // → starts pcm-fetch-worker.js → opens /cast/pcmlive stream.
-        function _startPcmAudioWorklet(baseUrl) {
-            try {
-                _audioCtx = new AudioContext({ sampleRate: _pcmSampleRate });
-                console.log('[pcm-stream] AudioContext created state=' + _audioCtx.state + ' sampleRate=' + _audioCtx.sampleRate);
-
-                // Chrome creates AudioContext in 'suspended' state unless a user gesture
-                // has occurred. On Chromecast there is no gesture, and the CAF PLAYING event
-                // (which calls _audioCtx.resume()) fires before this function is even called.
-                // Resume unconditionally here so the context is running before any audio arrives.
-                _audioCtx.resume().then(function () {
-                    console.log('[pcm-stream] AudioContext.resume() resolved — state=' + _audioCtx.state);
-                }).catch(function (e) {
-                    console.warn('[pcm-stream] AudioContext.resume() failed:', e);
-                });
-
-                _audioCtx.audioWorklet.addModule('./pcm-worklet.js')
-                    .then(function () {
-                        console.log('[pcm-stream] pcm-worklet.js loaded — AudioContext state=' + _audioCtx.state);
-                        _workletNode = new AudioWorkletNode(_audioCtx, 'pcm-sink');
-                        _workletNode.connect(_audioCtx.destination);
-                        console.log('[pcm-stream] PcmSinkProcessor node connected to destination');
-
-                        _workletNode.port.onmessage = function (e) {
-                            var msg = e.data;
-                            if (msg.type === 'clock') {
-                                _pcmAudioMs  = msg.audioTimeMs;
-                                _pcmRingFill = msg.ringFill;
-                                // Log first clock tick as confirmation audio pipeline is alive
-                                if (!_startPcmAudioWorklet._firstClockLogged) {
-                                    _startPcmAudioWorklet._firstClockLogged = true;
-                                    console.log('[pcm-stream] FIRST WORKLET CLOCK: audioTimeMs=' + msg.audioTimeMs +
-                                        ' samplesPlayed=' + msg.samplesPlayed +
-                                        ' ringFill=' + msg.ringFill +
-                                        ' ringCapacity=' + msg.ringCapacity +
-                                        ' AudioCtx.state=' + (_audioCtx ? _audioCtx.state : 'null'));
-                                }
-                            } else if (msg.type === 'underrun') {
-                                console.warn('[pcm-stream] worklet underrun ringFill=' + msg.ringFill + ' — re-arming pre-roll');
-                                _pcmPrerollSent     = false;
-                                _pcmSamplesBuffered = 0;
-                                if (_workletNode) _workletNode.port.postMessage({ type: 'reset' });
-                            }
-                        };
-
-                        // Start the Web Worker that fetches and parses the framed PCM stream.
-                        _pcmWorker = new Worker('./pcm-fetch-worker.js');
-                        console.log('[pcm-stream] pcm-fetch-worker.js Worker created');
-                        var _workerPcmFrames = 0;
-                        _pcmWorker.onmessage = function (e) {
-                            var msg = e.data;
-                            if (msg.type === 'pcm') {
-                                _workerPcmFrames++;
-                                // Log first frame + every 500th to confirm worker is parsing
-                                if (_workerPcmFrames === 1 || _workerPcmFrames % 500 === 0) {
-                                    console.log('[pcm-stream] worker pcm frame #' + _workerPcmFrames +
-                                        ' audioTimeMs=' + msg.audioTimeMs +
-                                        ' samples=' + msg.left.length +
-                                        ' buffered=' + _pcmSamplesBuffered +
-                                        ' prerollSent=' + _pcmPrerollSent);
-                                }
-                                if (_workletNode) {
-                                    _workletNode.port.postMessage(
-                                        { type: 'pcm', left: msg.left, right: msg.right, audioTimeMs: msg.audioTimeMs },
-                                        [msg.left.buffer, msg.right.buffer]
-                                    );
-                                }
-                                _pcmSamplesBuffered += msg.left.length;
-                                if (!_pcmPrerollSent && _pcmSamplesBuffered >= 48000) {
-                                    _pcmPrerollSent = true;
-                                    if (_workletNode) _workletNode.port.postMessage({ type: 'start' });
-                                    console.log('[pcm-stream] pre-roll complete (' + _pcmSamplesBuffered + ' samples) — sending start to worklet. AudioCtx.state=' + (_audioCtx ? _audioCtx.state : 'null'));
-                                }
-                            } else if (msg.type === 'syncLost') {
-                                console.warn('[pcm-stream] frame sync lost — scanning for magic');
-                            }
-                        };
-                        _pcmWorker.onerror = function (e) {
-                            console.error('[pcm-stream] Worker error: ' + e.message + ' at ' + e.filename + ':' + e.lineno);
-                        };
-
-                        _startPcmFetch(baseUrl);
-                        console.log('[pcm-stream] AudioWorklet + Worker ready');
-
-                        // ── Periodic status heartbeat ────────────────────────────────
-                        // Logs the full pipeline state every 10 s so we can confirm
-                        // data is flowing even if no other events fire.
-                        setInterval(function () {
-                            if (!_audioCtx) return;
-                            var currentPcmMs = _pcmAudioMs - (_pcmRingFill * 1000 / _pcmSampleRate);
-                            console.log('[pcm-stream] HEARTBEAT' +
-                                ' ctxState=' + _audioCtx.state +
-                                ' buffered=' + _pcmSamplesBuffered +
-                                ' prerollSent=' + _pcmPrerollSent +
-                                ' audioTimeMs=' + _pcmAudioMs +
-                                ' ringFill=' + _pcmRingFill +
-                                ' currentPcmMs=' + currentPcmMs.toFixed(0) +
-                                ' startWallMs=' + _pcmStartWallMs);
-                        }, 10000);
-                    })
-                    .catch(function (err) {
-                        console.error('[pcm-stream] audioWorklet.addModule failed:', err);
-                    });
-            } catch (err) {
-                console.error('[pcm-stream] AudioContext/Worklet setup failed:', err);
-            }
-        }
-
-        // ── _startPcmFetch ────────────────────────────────────────────────────────
-        // Opens a streaming GET to /cast/pcmlive, reads the start wall-clock from the
-        // response header, and pumps raw byte chunks to the Web Worker for parsing.
-        function _startPcmFetch(baseUrl) {
-            if (!_pcmWorker) return;
-            console.log('[pcm-stream] _startPcmFetch — opening ' + baseUrl + 'cast/pcmlive');
-            var _fetchChunks = 0;
-            var _fetchBytes  = 0;
-            fetch(baseUrl + 'cast/pcmlive', { cache: 'no-store' })
-                .then(function (resp) {
-                    console.log('[pcm-stream] /cast/pcmlive response status=' + resp.status +
-                        ' X-PCM-Start-Wall-Ms=' + resp.headers.get('X-PCM-Start-Wall-Ms') +
-                        ' X-PCM-SampleRate='    + resp.headers.get('X-PCM-SampleRate') +
-                        ' Content-Type='        + resp.headers.get('Content-Type'));
-                    if (!resp.ok) {
-                        console.error('[pcm-stream] /cast/pcmlive HTTP ' + resp.status + ' — retrying in 3 s');
-                        setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
-                        return;
-                    }
-
-                    // X-PCM-Start-Wall-Ms: server UTC ms when AudioClockTee audioTimeMs = 0.
-                    // Used as the fixed anchor: audioWallMs = startWallMs + currentPcmMs.
-                    var startHdr = resp.headers.get('X-PCM-Start-Wall-Ms');
-                    if (startHdr) {
-                        var parsed = parseInt(startHdr, 10);
-                        if (!isNaN(parsed) && parsed > 0) {
-                            _pcmStartWallMs = parsed;
-                            console.log('[pcm-stream] startWallMs=' + _pcmStartWallMs);
-                        }
-                    }
-                    var srHdr = resp.headers.get('X-PCM-SampleRate');
-                    if (srHdr) { var sr = parseInt(srHdr, 10); if (sr > 0) _pcmSampleRate = sr; }
-
-                    if (!resp.body) {
-                        console.error('[pcm-stream] response has no body — retrying');
-                        setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
-                        return;
-                    }
-
-                    var reader = resp.body.getReader();
-                    function pump() {
-                        reader.read().then(function (result) {
-                            if (result.done) {
-                                console.log('[pcm-stream] stream ended after ' + _fetchChunks + ' chunks / ' + _fetchBytes + ' bytes — reconnecting in 2 s');
-                                if (_pcmWorker) _pcmWorker.postMessage({ type: 'reset' });
-                                setTimeout(function () { _startPcmFetch(baseUrl); }, 2000);
-                                return;
-                            }
-                            _fetchChunks++;
-                            _fetchBytes += result.value.length;
-                            // Log first chunk and every 200th to confirm bytes are flowing
-                            if (_fetchChunks === 1 || _fetchChunks % 200 === 0) {
-                                console.log('[pcm-stream] fetch chunk #' + _fetchChunks +
-                                    ' bytes=' + result.value.length +
-                                    ' total=' + _fetchBytes +
-                                    ' workerAlive=' + (!!_pcmWorker));
-                            }
-                            if (_pcmWorker) {
-                                _pcmWorker.postMessage({ type: 'chunk', data: result.value }, [result.value.buffer]);
-                            }
-                            pump();
-                        }).catch(function (err) {
-                            if (_pcmWorker) {
-                                console.warn('[pcm-stream] fetch read error:', err, '— retrying in 3 s');
-                                setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
-                            }
-                        });
-                    }
-                    pump();
-                })
-                .catch(function (err) {
-                    console.error('[pcm-stream] fetch error:', err, '— retrying in 3 s');
-                    setTimeout(function () { _startPcmFetch(baseUrl); }, 3000);
-                });
-        }
-
-        // ── _pcmSyncVideoSync ─────────────────────────────────────────────────────
-        //
-        // A/V sync loop for pcm_stream mode.
-        //
-        // The AudioWorklet posts 'clock' messages every 1024 samples (~21 ms at 48 kHz).
-        // Each message carries:
-        //   audioTimeMs — content timestamp of the last frame written to the ring
-        //   ringFill    — samples currently buffered ahead of the hardware playhead
-        //
-        // The DAC is currently playing content at approximately:
-        //   currentPcmMs ≈ audioTimeMs − ringFill × 1000 / sampleRate
-        //   audioWallMs  = pcmStartWallMs + currentPcmMs
-        //
-        // Video wall time comes directly from EXT-X-PROGRAM-DATE-TIME (PDT), avoiding
-        // the liveSyncPosition sawtooth that broke the previous caf_wav_sync design:
-        //   videoWallMs  = video.getStartDate().getTime() + video.currentTime × 1000
-        //
-        // drift = audioWallMs − videoWallMs
-        //   > 0 : audio is ahead → video must catch up (rate > 1, or hard-seek forward)
-        //   < 0 : video is ahead → video must slow down (rate < 1, or hard-seek back)
-        //
-        function _pcmSyncVideoSync() {
-            if (_syncTimer) clearInterval(_syncTimer);
-
-            var SYNC_TICK_MS   = 100;   // evaluation interval
-            var SEEK_THRESHOLD = 400;   // ms: hard-seek when |drift| exceeds this
-            var DEAD_ZONE      = 40;    // ms: no correction within ±40 ms
-            var RATE_GAIN      = 0.5;   // proportional gain (drift_s → rate delta)
-            var MAX_RATE_DELTA = 0.10;  // ±10 % max playback rate adjustment
-            var SEEK_COOLDOWN  = 2000;  // ms: suppress consecutive seeks
-
-            var _lastLoggedRate = 1.0;
-            var _graceUntil     = Date.now() + 5000; // 5 s for HLS latch + pre-roll
-            var _lastHardSeekAt = 0;
-
-            _syncTimer = setInterval(function () {
-                var now = Date.now();
-                if (now < _graceUntil)      return;
-                if (!_splitVideoHls)        return;
-                if (!_pcmPrerollSent)       return; // worklet not yet playing
-                if (_pcmStartWallMs < 0)    return; // header not received yet
-                if (_pcmAudioMs === 0 && _pcmRingFill === 0) return; // no worklet clock yet
-
-                var video = document.getElementById('hls-bg');
-                if (!video || video.paused)  return;
-
-                // ── Audio wall clock ──────────────────────────────────────────────
-                // currentPcmMs: content time currently at the DAC output.
-                // audioTimeMs is the content timestamp of the last chunk pushed to the
-                // ring write head; subtracting ringFill gives the read head content time.
-                var currentPcmMs = _pcmAudioMs - (_pcmRingFill * 1000 / _pcmSampleRate);
-                var audioWallMs  = _pcmStartWallMs + Math.max(0, currentPcmMs);
-
-                // ── Video wall clock ──────────────────────────────────────────────
-                var startDate = _getVideoStartDate(video);
-                if (!startDate) {
-                    if (!_pcmSyncVideoSync._pdtWarned) {
-                        _pcmSyncVideoSync._pdtWarned = true;
-                        console.warn('[pcm-stream] EXT-X-PROGRAM-DATE-TIME not yet in manifest — waiting');
-                    }
-                    return;
-                }
-                var videoWallMs = startDate.getTime() + video.currentTime * 1000;
-
-                var drift = audioWallMs - videoWallMs; // ms; > 0 = video behind audio
-
-                if (!isFinite(drift) || Math.abs(drift) > 30000) {
-                    console.warn('[pcm-stream] anomalous drift=' + drift.toFixed(0) + 'ms (pcmAudio=' + _pcmAudioMs + ' ringFill=' + _pcmRingFill + ') — skipping');
-                    return;
-                }
-
-                // ── Hard-seek ─────────────────────────────────────────────────────
-                if (Math.abs(drift) > SEEK_THRESHOLD && (now - _lastHardSeekAt) > SEEK_COOLDOWN) {
-                    var targetVideoTime = (audioWallMs - startDate.getTime()) / 1000;
-                    if (video.buffered.length > 0) {
-                        var bufStart = video.buffered.start(0) + 0.1;
-                        var bufEnd   = video.buffered.end(video.buffered.length - 1) - 0.1;
-                        targetVideoTime = Math.max(bufStart, Math.min(bufEnd, targetVideoTime));
-                    }
-                    if (targetVideoTime > 0) {
-                        video.currentTime = targetVideoTime;
-                        video.playbackRate = 1.0;
-                        _lastHardSeekAt = now;
-                        _lastLoggedRate = 1.0;
-                        _videoStartDate = null; // force PDT re-read after seek
-                        console.log('[pcm-stream] hard-seek: drift=' + drift.toFixed(0) + 'ms curPcm=' + currentPcmMs.toFixed(0) + 'ms → seekTo=' + targetVideoTime.toFixed(3));
-                        _postSplitTelemetry({ type: 'pcm_seek', driftMs: Math.round(drift), targetTime: targetVideoTime, audioWallMs: Math.round(audioWallMs), videoWallMs: Math.round(videoWallMs), currentPcmMs: Math.round(currentPcmMs) });
-                    }
-                    return;
-                }
-
-                // ── Dead zone ─────────────────────────────────────────────────────
-                if (Math.abs(drift) < DEAD_ZONE) {
-                    if (video.playbackRate !== 1.0) {
-                        video.playbackRate = 1.0;
-                        console.log('[pcm-stream] sync: dead zone — rate=1.0 drift=' + drift.toFixed(0) + 'ms');
-                        _lastLoggedRate = 1.0;
-                    }
-                    return;
-                }
-
-                // ── Rate trim ─────────────────────────────────────────────────────
-                var rate = 1.0 + Math.max(-MAX_RATE_DELTA, Math.min(MAX_RATE_DELTA, (drift / 1000) * RATE_GAIN));
-                video.playbackRate = rate;
-                var roundedRate = Math.round(rate * 1000);
-                if (Math.abs(roundedRate - Math.round(_lastLoggedRate * 1000)) >= 3) {
-                    console.log('[pcm-stream] sync: drift=' + drift.toFixed(0) + 'ms rate=' + rate.toFixed(3) + ' curPcm=' + currentPcmMs.toFixed(0) + 'ms vidT=' + video.currentTime.toFixed(2));
-                    _lastLoggedRate = rate;
-                }
-            }, SYNC_TICK_MS);
-        }
     </script>
 </body>
 </html>
