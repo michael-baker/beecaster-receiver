@@ -224,7 +224,7 @@
                         maxMaxBufferLength:          60,
                         maxBufferSize:               60 * 1024 * 1024,
                         backBufferLength:            0,
-                        enableWorker:                true,
+                        enableWorker:                false,  // avoid worker↔main handoff stalls on CC v2 ARM
                         abrEnabled:                  false,
                         startLevel:                  0,
                         debug:                       false,
