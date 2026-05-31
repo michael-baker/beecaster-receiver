@@ -418,11 +418,10 @@
                 // PLL will slow video until audio catches up
                 player.currentTime = bufStart;
             } else {
-                    // Audio is past buffered video — start at end, PLL will adjust
-                    player.currentTime = bufEnd - 0.5;
-                }
-                console.log('[cws] Video buffer: ' + bufStart.toFixed(3) + 's - ' + bufEnd.toFixed(3) + 's (' + ((bufEnd - bufStart) * 1000).toFixed(0) + 'ms)');
+                // Audio is past buffered video — start at end, PLL will adjust
+                player.currentTime = bufEnd - 0.5;
             }
+            console.log('[cws] Video buffer: ' + bufStart.toFixed(3) + 's - ' + bufEnd.toFixed(3) + 's (' + ((bufEnd - bufStart) * 1000).toFixed(0) + 'ms)');
 
             player.play().catch(function () {});
             console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) + 's, audioMs=' + audioMs.toFixed(0) +
