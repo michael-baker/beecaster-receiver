@@ -4,37 +4,22 @@
     <meta charset="utf-8">
     <title>BeeCaster Receiver</title>
     <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <!-- hls.js: Chromecast does not support HLS via canPlayType; MSE (hls.js) is required -->
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
-    <!--
-        fmp4_muxed mode: single FFmpeg process muxes H.264 video + FLAC audio into
-        fragmented MP4 (fMP4) HLS segments served in-memory from HlsSegmentStore.
-        hls.js drives a single <video id="player"> element via MSE SourceBuffer.
-        A/V sync is guaranteed by the shared PTS timeline in the muxed container —
-        no sync loop, no rate steering, no hard seeks.
-        Confirmed on Chromecast v2 (Chrome 90 / armv7l):
-          MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"') = true
-    -->
     <style>
         *, *::before, *::after { box-sizing: border-box; }
         body { overflow: hidden; margin: 0; padding: 0; background: #000; }
-
-        /* Black overlay — full-screen, shown during load and pause */
         #overlay {
             position: absolute; inset: 0;
             background: #000; opacity: 1;
             transition: opacity 0.4s ease;
             pointer-events: none; z-index: 10;
         }
-
-        /* CAF protocol vehicle — invisible, muted, only here so CAF has a
-           valid media element to report state and accept commands.        */
+        /* CAF protocol vehicle — in caf_wav_sync it produces audio output.
+           Invisible but NOT muted. */
         #caf-el {
             position: absolute; width: 1px; height: 1px;
             opacity: 0; pointer-events: none;
         }
-
-        /* Muxed player — full-screen, produces both audio and video output. */
+        /* Video player — muted, visual output only. Manual MSE drives it. */
         #player {
             position: absolute; inset: 0;
             width: 100%; height: 100%;
@@ -43,13 +28,8 @@
     </style>
 </head>
 <body>
-    <!-- CAF protocol vehicle: loaded with /live WAV by CAF, muted at JS level.
-         CAF needs a media element to track play/pause state and send commands. -->
     <video id="caf-el" class="castMediaElement"></video>
-    <!-- Muxed player: hls.js drives this element with the H.264+FLAC fMP4 stream.
-         NOT muted — this element produces the actual audio and video output.    -->
-    <video id="player" playsinline></video>
-    <!-- Overlay: black during load and pause -->
+    <video id="player" playsinline muted></video>
     <div id="overlay"></div>
 
     <script>
@@ -74,10 +54,21 @@
         );
 
         // ── Module state ───────────────────────────────────────────────────────
-        var _baseUrl      = '';
-        var _hls          = null;   // single hls.js instance for muxed fMP4 stream
-        window.__hls = function () { return _hls; };  // expose for console debugging
-        var _stallTimer   = null;   // stall recovery timeout
+        var _baseUrl     = '';
+        var _mode        = '';
+        var _syncTimer   = null;  // PLL sync interval
+        var _pollTimer   = null;  // m3u8 poll interval
+        var _ms          = null;  // MediaSource for manual MSE
+        var _sb          = null;  // SourceBuffer
+        var _appendQueue = [];    // segments waiting to be appended
+        var _appending   = false;
+        var _loadedSegs  = {};    // sn → true
+        var _initLoaded  = false;
+        var _epochMs     = -1;    // AudioClockTee position when CAF connected
+        var _epochWallMs = -1;    // UTC wall ms at same instant
+        var _serverRtt   = 0;    // round-trip time estimate to server
+        var _cafPlaying  = false;
+        var _videoReady  = false;
 
         // ── LOAD interceptor ────────────────────────────────────────────────────
         playerManager.setMessageInterceptor(
@@ -85,17 +76,20 @@
             function (request) {
                 var custom = request.media && request.media.customData;
                 _baseUrl = (custom && custom.MediaBaseUrl) || '';
-                var mode = (custom && custom.HlsStreamingMode) || '';
-
-                var cafEl = document.getElementById('caf-el');
-                if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
+                _mode = (custom && custom.HlsStreamingMode) || '';
 
                 _reset();
 
-                if (mode === 'fmp4_muxed') {
+                if (_mode === 'caf_wav_sync') {
+                    // CAF will load the WAV URL (contentId) onto #caf-el automatically.
+                    // We just need to start the video-only MSE pipeline.
+                    _startCafWavSync(_baseUrl);
+                } else if (_mode === 'fmp4_muxed') {
+                    // Legacy muxed mode — silence CAF, use hls.js for A+V
+                    _silenceCaf();
                     _startMuxed(_baseUrl);
                 } else {
-                    console.error('[receiver] Unsupported mode "' + mode + '" — expected fmp4_muxed');
+                    console.error('[receiver] Unsupported mode: ' + _mode);
                     _showOverlay(1);
                 }
 
@@ -108,16 +102,23 @@
             _showOverlay(1);
             var p = document.getElementById('player');
             if (p && !p.paused) p.pause();
+            _cafPlaying = false;
             _postAck('PAUSED');
             setTimeout(function () { _showOverlay(0); }, 1500);
         });
 
         // ── CAF PLAYING ────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
-            var cafEl = document.getElementById('caf-el');
-            if (cafEl) { cafEl.muted = true; cafEl.volume = 0; }
-            var p = document.getElementById('player');
-            if (p && p.paused) p.play().catch(function () {});
+            _cafPlaying = true;
+            if (_mode === 'caf_wav_sync') {
+                // CAF now owns audio — do NOT silence it
+                var p = document.getElementById('player');
+                if (p && p.paused) p.play().catch(function () {});
+            } else {
+                _silenceCaf();
+                var p2 = document.getElementById('player');
+                if (p2 && p2.paused) p2.play().catch(function () {});
+            }
             _postAck('PLAYING');
         });
 
@@ -146,67 +147,365 @@
         options.disableIdleTimeout = false;
         options.maxInactivity = 3600;
         options.mediaElement = document.getElementById('caf-el');
-
         context.start(options);
 
-        // ── Permanently silence #caf-el via Web Audio API ──────────────────────
-        // CAF owns #caf-el and overrides muted/volume on every PLAYING event,
-        // making the /live WAV audible regardless of what JS sets.
-        // createMediaElementSource() permanently re-routes the element's audio
-        // output into the Web Audio graph and away from the speakers.
-        // We deliberately do NOT connect the source node to AudioContext.destination,
-        // so the audio is consumed (keeping the element playing for CAF state) but
-        // produces zero output. CAF state tracking is unaffected.
-        (function _silenceCafElement() {
+        // ══════════════════════════════════════════════════════════════════════
+        // caf_wav_sync mode
+        //
+        // Audio: CAF plays lossless WAV via #caf-el (hardware audio pipeline,
+        //        no MSE, no JavaScript in audio path).
+        // Video: Manual MSE loads video-only H.264 fMP4 segments from
+        //        /cast/split_video/ into #player (muted).
+        // Sync:  PLL (phase-locked loop) continuously adjusts #player.playbackRate
+        //        so video tracks the audio clock. No seeks except >2s drift.
+        //
+        // Epoch model:
+        //   Server exposes /cast/audio-clock → {epochMs, epochWallMs, serverNowMs}
+        //   epochMs = AudioClockTee sample position (ms) when CAF HTTP client connected
+        //   CAF audio position = epochMs + cafEl.currentTime * 1000
+        //   Video PTS ≈ AudioClockTee time since pipeline start
+        //   Sync target: player.currentTime * 1000 ≈ epochMs + cafEl.currentTime * 1000
+        // ══════════════════════════════════════════════════════════════════════
+
+        function _startCafWavSync(baseUrl) {
+            var player = document.getElementById('player');
+            if (!player) { console.error('[cws] #player missing'); return; }
+            player.muted = true;
+
+            _showOverlay(1);
+            console.log('[cws] Starting caf_wav_sync pipeline');
+
+            // Step 1: Wait for audio clock epoch (CAF has connected to /cast/caf-audio)
+            _waitForEpoch(baseUrl, function () {
+                console.log('[cws] Epoch acquired: epochMs=' + _epochMs + ' epochWallMs=' + _epochWallMs);
+                // Step 2: Set up manual MSE for video
+                _initVideoMSE(player, baseUrl);
+            });
+        }
+
+        // Poll /cast/audio-clock until epochMs >= 0 (CAF has connected to WAV stream)
+        function _waitForEpoch(baseUrl, cb) {
+            var attempts = 0;
+            var maxAttempts = 60; // 30 seconds
+            (function poll() {
+                var t0 = Date.now();
+                fetch(baseUrl + 'cast/audio-clock')
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) {
+                        _serverRtt = Date.now() - t0;
+                        if (d.epochMs >= 0) {
+                            _epochMs     = d.epochMs;
+                            _epochWallMs = d.epochWallMs;
+                            cb();
+                        } else {
+                            attempts++;
+                            if (attempts < maxAttempts) setTimeout(poll, 500);
+                            else console.error('[cws] Timed out waiting for audio epoch');
+                        }
+                    })
+                    .catch(function () {
+                        attempts++;
+                        if (attempts < maxAttempts) setTimeout(poll, 1000);
+                    });
+            })();
+        }
+
+        // Set up MediaSource + SourceBuffer for video-only fMP4
+        function _initVideoMSE(player, baseUrl) {
+            // Determine codec — use baseline that matches what FFmpeg produces
+            var codec = 'video/mp4; codecs="avc1.640029"';
+            if (!MediaSource.isTypeSupported(codec)) {
+                codec = 'video/mp4; codecs="avc1.42E01E"';
+            }
+            console.log('[cws] MSE codec: ' + codec);
+
+            _ms = new MediaSource();
+            player.src = URL.createObjectURL(_ms);
+
+            _ms.addEventListener('sourceopen', function () {
+                console.log('[cws] MediaSource opened');
+                try {
+                    _sb = _ms.addSourceBuffer(codec);
+                } catch (e) {
+                    console.error('[cws] addSourceBuffer failed:', e);
+                    return;
+                }
+
+                _sb.mode = 'segments';
+                _sb.addEventListener('updateend', _drainAppendQueue);
+                _sb.addEventListener('error', function (e) {
+                    console.error('[cws] SourceBuffer error:', e);
+                });
+
+                // Load init segment, then start polling m3u8
+                _loadInitSegment(baseUrl, function () {
+                    _initLoaded = true;
+                    console.log('[cws] init.mp4 loaded');
+                    _pollManifest(baseUrl);
+                    // Start PLL sync loop once first segment is buffered
+                });
+            });
+        }
+
+        function _loadInitSegment(baseUrl, cb) {
+            fetch(baseUrl + 'cast/split_video/init.mp4')
+                .then(function (r) {
+                    if (!r.ok) throw new Error('init.mp4 HTTP ' + r.status);
+                    return r.arrayBuffer();
+                })
+                .then(function (buf) {
+                    _queueAppend(new Uint8Array(buf), cb);
+                })
+                .catch(function (e) {
+                    console.error('[cws] init.mp4 fetch failed:', e);
+                    // Retry after 2s
+                    setTimeout(function () { _loadInitSegment(baseUrl, cb); }, 2000);
+                });
+        }
+
+        // Parse m3u8, fetch new segments, schedule next poll
+        function _pollManifest(baseUrl) {
+            var manifestUrl = baseUrl + 'cast/split_video/stream.m3u8';
+            fetch(manifestUrl)
+                .then(function (r) {
+                    if (!r.ok) throw new Error('m3u8 HTTP ' + r.status);
+                    return r.text();
+                })
+                .then(function (text) {
+                    var parsed = _parseM3u8(text);
+                    var newFrags = [];
+                    for (var i = 0; i < parsed.segments.length; i++) {
+                        var seg = parsed.segments[i];
+                        if (!_loadedSegs[seg.sn]) {
+                            newFrags.push(seg);
+                            _loadedSegs[seg.sn] = true;
+                        }
+                    }
+                    if (newFrags.length > 0) {
+                        _fetchSegments(baseUrl, newFrags, 0);
+                    }
+                    // Schedule next poll: target duration / 2 (HLS spec recommendation)
+                    var pollMs = Math.max(1000, (parsed.targetDuration || 4) * 500);
+                    _pollTimer = setTimeout(function () { _pollManifest(baseUrl); }, pollMs);
+                })
+                .catch(function (e) {
+                    console.warn('[cws] m3u8 fetch failed:', e);
+                    _pollTimer = setTimeout(function () { _pollManifest(baseUrl); }, 2000);
+                });
+        }
+
+        // Fetch segments sequentially (preserve decode order)
+        function _fetchSegments(baseUrl, segs, idx) {
+            if (idx >= segs.length) return;
+            var seg = segs[idx];
+            fetch(baseUrl + 'cast/split_video/' + seg.uri)
+                .then(function (r) {
+                    if (!r.ok) throw new Error(seg.uri + ' HTTP ' + r.status);
+                    return r.arrayBuffer();
+                })
+                .then(function (buf) {
+                    _queueAppend(new Uint8Array(buf), function () {
+                        // After first segment is buffered, start playback + PLL
+                        if (!_videoReady) {
+                            _videoReady = true;
+                            _startVideoPlayback();
+                        }
+                        // Fetch next segment
+                        _fetchSegments(baseUrl, segs, idx + 1);
+                    });
+                })
+                .catch(function (e) {
+                    console.warn('[cws] segment fetch failed:', e);
+                    // Skip and continue
+                    _fetchSegments(baseUrl, segs, idx + 1);
+                });
+        }
+
+        // SourceBuffer append queue — ensures only one appendBuffer at a time
+        function _queueAppend(data, cb) {
+            _appendQueue.push({ data: data, cb: cb });
+            _drainAppendQueue();
+        }
+
+        function _drainAppendQueue() {
+            if (_appending || !_sb || _appendQueue.length === 0) return;
+            if (_sb.updating) return;
+            _appending = true;
+            var item = _appendQueue.shift();
+            try {
+                _sb.appendBuffer(item.data);
+            } catch (e) {
+                console.error('[cws] appendBuffer error:', e);
+                _appending = false;
+                if (item.cb) item.cb();
+                _drainAppendQueue();
+                return;
+            }
+            // updateend will fire → _drainAppendQueue called again
+            var onEnd = function () {
+                _sb.removeEventListener('updateend', onEnd);
+                _appending = false;
+                if (item.cb) item.cb();
+                _drainAppendQueue();
+            };
+            _sb.addEventListener('updateend', onEnd);
+        }
+
+        // Start video playback + PLL sync loop
+        function _startVideoPlayback() {
+            var player = document.getElementById('player');
+            var cafEl  = document.getElementById('caf-el');
+            if (!player || !cafEl) return;
+
+            // Seek video to match current audio position
+            var audioMs = _getAudioClockMs(cafEl);
+            var targetSec = audioMs / 1000;
+
+            // Check if target is within buffered range
+            var buf = player.buffered;
+            if (buf.length > 0 && targetSec >= buf.start(0) && targetSec <= buf.end(buf.length - 1)) {
+                player.currentTime = targetSec;
+            } else if (buf.length > 0) {
+                // Audio position not yet in video buffer — start at buffer start
+                player.currentTime = buf.start(0);
+            }
+
+            player.play().catch(function () {});
+            console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) + 's, audioMs=' + audioMs);
+
+            _showOverlay(0);
+
+            // ── PLL sync loop ──────────────────────────────────────────────
+            // Runs every 250ms. Adjusts playbackRate to converge video toward
+            // audio position. Never seeks unless drift exceeds 2 seconds.
+            //
+            // This is a simple proportional controller:
+            //   error = videoMs - audioMs  (positive = video ahead)
+            //   rate  = 1.0 - Kp * error
+            //   Kp    = 0.002 → 100ms error gives rate 0.8, converges in ~0.5s
+            //
+            // The rate is clamped to [0.5, 1.5] to prevent bizarre behavior.
+            // At 30fps, ±50% rate change is visually acceptable for cast screen.
+            var KP = 0.002;
+            var HARD_SEEK_THRESHOLD_MS = 2000;
+            var MIN_RATE = 0.5;
+            var MAX_RATE = 1.5;
+
+            if (_syncTimer) clearInterval(_syncTimer);
+            _syncTimer = setInterval(function () {
+                if (!_cafPlaying) return;
+                if (player.paused || player.readyState < 2) return;
+
+                var audioMs  = _getAudioClockMs(cafEl);
+                var videoMs  = player.currentTime * 1000;
+                var errorMs  = videoMs - audioMs;
+
+                // Hard seek for large drift (startup, track change, buffer gap)
+                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS) {
+                    var seekTarget = audioMs / 1000;
+                    var b = player.buffered;
+                    if (b.length > 0 && seekTarget >= b.start(0) && seekTarget <= b.end(b.length - 1)) {
+                        player.currentTime = seekTarget;
+                        player.playbackRate = 1.0;
+                        console.log('[cws] Hard seek: error=' + errorMs.toFixed(0) + 'ms → t=' + seekTarget.toFixed(3));
+                    }
+                    return;
+                }
+
+                // PLL rate adjustment
+                var rate = 1.0 - KP * errorMs;
+                rate = Math.max(MIN_RATE, Math.min(MAX_RATE, rate));
+                player.playbackRate = rate;
+            }, 250);
+
+            // Periodically refresh epoch from server (handles drift in wall clocks)
+            setInterval(function () {
+                if (!_baseUrl) return;
+                var t0 = Date.now();
+                fetch(_baseUrl + 'cast/audio-clock')
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) {
+                        _serverRtt = Date.now() - t0;
+                        if (d.epochMs >= 0) {
+                            _epochMs     = d.epochMs;
+                            _epochWallMs = d.epochWallMs;
+                        }
+                    })
+                    .catch(function () {});
+            }, 10000);
+        }
+
+        // Compute current audio clock position in ms
+        // audioClockMs = epochMs + cafEl.currentTime * 1000
+        function _getAudioClockMs(cafEl) {
+            return _epochMs + cafEl.currentTime * 1000;
+        }
+
+        // Minimal m3u8 parser — extracts segment URIs, sequence numbers, target duration
+        function _parseM3u8(text) {
+            var lines = text.split('\n');
+            var segments = [];
+            var mediaSeq = 0;
+            var targetDuration = 4;
+            var sn = 0;
+
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i].trim();
+                if (line.indexOf('#EXT-X-MEDIA-SEQUENCE:') === 0) {
+                    mediaSeq = parseInt(line.split(':')[1], 10) || 0;
+                    sn = mediaSeq;
+                } else if (line.indexOf('#EXT-X-TARGETDURATION:') === 0) {
+                    targetDuration = parseInt(line.split(':')[1], 10) || 4;
+                } else if (line.indexOf('#EXTINF:') === 0) {
+                    // Next non-comment line is the segment URI
+                    for (var j = i + 1; j < lines.length; j++) {
+                        var nextLine = lines[j].trim();
+                        if (nextLine && nextLine.charAt(0) !== '#') {
+                            segments.push({ sn: sn, uri: nextLine });
+                            sn++;
+                            i = j;
+                            break;
+                        }
+                    }
+                }
+            }
+            return { segments: segments, mediaSeq: mediaSeq, targetDuration: targetDuration };
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Silence CAF element (for fmp4_muxed mode only)
+        // ══════════════════════════════════════════════════════════════════════
+        function _silenceCaf() {
             var cafEl = document.getElementById('caf-el');
-            if (!cafEl) return;
+            if (!cafEl || cafEl._silenced) return;
+            cafEl._silenced = true;
             try {
                 var silenceCtx = new (window.AudioContext || window.webkitAudioContext)();
-                var src = silenceCtx.createMediaElementSource(cafEl);
+                silenceCtx.createMediaElementSource(cafEl);
+                // NOT connected to destination → silence
             } catch (e) {
                 cafEl.addEventListener('volumechange', function () {
-                    if (cafEl.volume !== 0) { cafEl.volume = 0; }
+                    if (cafEl.volume !== 0) cafEl.volume = 0;
                 });
                 cafEl.volume = 0;
             }
-        })();
-
-        // ══════════════════════════════════════════════════════════════════════
-        // fmp4_muxed pipeline
-        //
-        // Architecture:
-        //   Single <video id="player"> — hls.js + MSE SourceBuffer
-        //   codec: video/mp4; codecs="avc1.640029, flac"
-        //
-        //   A/V sync is guaranteed by the muxed fMP4 container.  Both tracks share
-        //   the same PTS timeline from a single FFmpeg muxer, so synchronisation is
-        //   mathematically exact — no sync loop, no rate steering, no hard seeks.
-        //
-        //   Chromecast v2 (Chrome 90 / armv7l) confirms hardware support via:
-        //     MediaSource.isTypeSupported('video/mp4; codecs="avc1.640029, flac"') = true
-        // ══════════════════════════════════════════════════════════════════════
-
-        function _reset() {
-            if (_stallTimer) { clearTimeout(_stallTimer); _stallTimer = null; }
-            if (_hls) { try { _hls.destroy(); } catch (e) {} _hls = null; }
-            var p = document.getElementById('player');
-            if (p) {
-                try { p.pause(); } catch (e) {}
-                p.removeAttribute('src');
-                try { p.load(); } catch (e) {}  // flush stale MSE state
-            }
-            _showOverlay(1);
         }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // fmp4_muxed mode (legacy — kept for fallback)
+        // ══════════════════════════════════════════════════════════════════════
+        var _hls = null;
+        window.__hls = function () { return _hls; };
 
         function _startMuxed(baseUrl) {
             var player = document.getElementById('player');
-            if (!player) { console.error('[muxed] #player element missing'); return; }
-
+            if (!player) { console.error('[muxed] #player missing'); return; }
             if (!window.Hls || !Hls.isSupported()) {
                 console.error('[muxed] hls.js / MSE not available');
                 return;
             }
 
+            player.muted = false;  // muxed mode: player produces audio
             _showOverlay(1);
 
             fetch(baseUrl + 'api/settings')
@@ -223,71 +522,43 @@
                         maxBufferLength:             30,
                         maxMaxBufferLength:          60,
                         maxBufferSize:               60 * 1024 * 1024,
-                        backBufferLength:            Infinity,  // NEVER remove back buffer — remove() stalls audio on CC v2
+                        backBufferLength:            Infinity,
                         enableWorker:                false,
                         abrEnabled:                  false,
                         startLevel:                  0,
-                        debug:                       true,  // DIAGNOSTIC: see segment transition details
-                        progressive:                 false,  // download full segment before appendBuffer — avoids hundreds of small appends that stall CC v2
+                        debug:                       false,
+                        progressive:                 false,
                         manifestLoadingMaxRetry:     12,
                         manifestLoadingRetryDelay:   1000,
                         manifestLoadingMaxRetryTimeout: 12000,
                     });
 
-                    // Defer play() until enough fragments are buffered.
                     var _playStarted = false;
                     var _fragsBuffered = 0;
                     function _tryStartPlayback() {
                         if (_playStarted) return;
                         _playStarted = true;
                         var pos = _hls.liveSyncPosition;
-                        if (pos != null) { player.currentTime = pos; }
+                        if (pos != null) player.currentTime = pos;
                         player.play().catch(function () {});
-                        var _onPlaying = function () {
-                            player.removeEventListener('playing', _onPlaying);
+                        player.addEventListener('playing', function onP() {
+                            player.removeEventListener('playing', onP);
                             setTimeout(function () { _showOverlay(0); }, 500);
-                        };
-                        player.addEventListener('playing', _onPlaying);
-                        setTimeout(function () {
-                            player.removeEventListener('playing', _onPlaying);
-                            _showOverlay(0);
-                        }, 6000);
+                        });
+                        setTimeout(function () { _showOverlay(0); }, 6000);
                     }
 
                     _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
-                        if (!_playStarted && d.details.fragments.length >= 3) {
-                            _tryStartPlayback();
-                        }
+                        if (!_playStarted && d.details.fragments.length >= 3) _tryStartPlayback();
                     });
-
                     _hls.on(Hls.Events.FRAG_BUFFERED, function () {
                         _fragsBuffered++;
-                        if (_stallTimer) { clearTimeout(_stallTimer); _stallTimer = null; }
-                        if (!_playStarted && _fragsBuffered >= 3) {
-                            _tryStartPlayback();
-                        }
+                        if (!_playStarted && _fragsBuffered >= 3) _tryStartPlayback();
                     });
-
-                    _hls.on(Hls.Events.BUFFER_STALLED, function () {
-                        if (_stallTimer) clearTimeout(_stallTimer);
-                        _stallTimer = setTimeout(function () {
-                            _stallTimer = null;
-                            if (!_hls) return;
-                            var p = document.getElementById('player');
-                            if (!p || p.readyState >= 3) return;
-                            var syncPos = _hls.liveSyncPosition;
-                            if (syncPos != null && syncPos > p.currentTime + 2) {
-                                p.currentTime = syncPos;
-                            }
-                        }, 5000);
-                    });
-
                     _hls.on(Hls.Events.ERROR, function (e, d) {
                         if (!d.fatal) return;
                         if (_hls) { try { _hls.destroy(); } catch (err) {} _hls = null; }
-                        setTimeout(function () {
-                            if (_baseUrl) _startMuxed(_baseUrl);
-                        }, 3000);
+                        setTimeout(function () { if (_baseUrl) _startMuxed(_baseUrl); }, 3000);
                     });
 
                     _hls.loadSource(baseUrl + 'cast/muxed/stream.m3u8');
@@ -295,13 +566,33 @@
                 });
         }
 
-        // ── Overlay ────────────────────────────────────────────────────────────
+        // ── Common helpers ──────────────────────────────────────────────────────
+
+        function _reset() {
+            if (_syncTimer)  { clearInterval(_syncTimer); _syncTimer = null; }
+            if (_pollTimer)  { clearTimeout(_pollTimer); _pollTimer = null; }
+            if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
+            if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
+            _ms = null; _sb = null;
+            _appendQueue = []; _appending = false;
+            _loadedSegs = {}; _initLoaded = false;
+            _epochMs = -1; _epochWallMs = -1;
+            _videoReady = false; _cafPlaying = false;
+            var p = document.getElementById('player');
+            if (p) {
+                try { p.pause(); } catch (e) {}
+                p.removeAttribute('src');
+                try { p.load(); } catch (e) {}
+                p.playbackRate = 1.0;
+            }
+            _showOverlay(1);
+        }
+
         function _showOverlay(opacity) {
             var el = document.getElementById('overlay');
             if (el) el.style.opacity = String(opacity);
         }
 
-        // ── Server communication ────────────────────────────────────────────────
         function _postAck(state) {
             if (!_baseUrl) return;
             fetch(_baseUrl + 'cast/ack', {
@@ -311,7 +602,7 @@
             }).catch(function () {});
         }
 
-    })(); // end IIFE
+    })();
     </script>
 </body>
 </html>
