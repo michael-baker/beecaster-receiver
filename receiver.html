@@ -76,6 +76,7 @@
         // ── Module state ───────────────────────────────────────────────────────
         var _baseUrl      = '';
         var _hls          = null;   // single hls.js instance for muxed fMP4 stream
+        window.__hls = function () { return _hls; };  // expose for console debugging
         var _stallTimer   = null;   // stall recovery timeout
 
         // ── LOAD interceptor ────────────────────────────────────────────────────
