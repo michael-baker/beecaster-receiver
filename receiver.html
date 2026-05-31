@@ -64,6 +64,7 @@
         var _appending   = false;
         var _loadedSegs  = {};    // sn → true
         var _initLoaded  = false;
+        var _segsBuffered = 0;    // count of segments appended to SourceBuffer
         var _epochMs     = -1;    // AudioClockTee position when CAF connected
         var _epochWallMs = -1;    // UTC wall ms at same instant
         var _serverRtt   = 0;    // round-trip time estimate to server
@@ -305,8 +306,10 @@
                 })
                 .then(function (buf) {
                     _queueAppend(new Uint8Array(buf), function () {
-                        // After first segment is buffered, start playback + PLL
-                        if (!_videoReady) {
+                        _segsBuffered++;
+                        console.log('[cws] Segment ' + seg.sn + ' buffered (' + _segsBuffered + ' total)');
+                        // Wait for preroll (3 segments ≈ 12s) before starting playback
+                        if (!_videoReady && _segsBuffered >= 3) {
                             _videoReady = true;
                             _startVideoPlayback();
                         }
@@ -357,21 +360,63 @@
             var cafEl  = document.getElementById('caf-el');
             if (!player || !cafEl) return;
 
-            // Seek video to match current audio position
+            // Wait until CAF audio is actually playing before starting sync.
+            // CAF may still be buffering the WAV stream.
+            if (!_cafPlaying || cafEl.readyState < 2) {
+                console.log('[cws] Waiting for CAF audio to start playing...');
+                var waitCaf = setInterval(function () {
+                    if (_cafPlaying && cafEl.readyState >= 2) {
+                        clearInterval(waitCaf);
+                        _startVideoPlayback();
+                    }
+                }, 250);
+                return;
+            }
+
+            // Refresh epoch right before starting sync
+            var t0 = Date.now();
+            fetch(_baseUrl + 'cast/audio-clock')
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    _serverRtt = Date.now() - t0;
+                    if (d.epochMs >= 0) {
+                        _epochMs     = d.epochMs;
+                        _epochWallMs = d.epochWallMs;
+                    }
+                    _beginSyncedPlayback(player, cafEl);
+                })
+                .catch(function () {
+                    // Use existing epoch
+                    _beginSyncedPlayback(player, cafEl);
+                });
+        }
+
+        function _beginSyncedPlayback(player, cafEl) {
+            // Compute where audio is RIGHT NOW
             var audioMs = _getAudioClockMs(cafEl);
             var targetSec = audioMs / 1000;
 
-            // Check if target is within buffered range
+            // Find the best starting position within the buffered range
             var buf = player.buffered;
-            if (buf.length > 0 && targetSec >= buf.start(0) && targetSec <= buf.end(buf.length - 1)) {
-                player.currentTime = targetSec;
-            } else if (buf.length > 0) {
-                // Audio position not yet in video buffer — start at buffer start
-                player.currentTime = buf.start(0);
+            if (buf.length > 0) {
+                var bufStart = buf.start(0);
+                var bufEnd   = buf.end(buf.length - 1);
+                if (targetSec >= bufStart && targetSec <= bufEnd) {
+                    player.currentTime = targetSec;
+                } else if (targetSec < bufStart) {
+                    // Audio hasn't caught up to buffered video — start at buffer start
+                    // PLL will slow video until audio catches up
+                    player.currentTime = bufStart;
+                } else {
+                    // Audio is past buffered video — start at end, PLL will adjust
+                    player.currentTime = bufEnd - 0.5;
+                }
+                console.log('[cws] Video buffer: ' + bufStart.toFixed(3) + 's - ' + bufEnd.toFixed(3) + 's (' + ((bufEnd - bufStart) * 1000).toFixed(0) + 'ms)');
             }
 
             player.play().catch(function () {});
-            console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) + 's, audioMs=' + audioMs);
+            console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) + 's, audioMs=' + audioMs.toFixed(0) +
+                        ', cafEl.currentTime=' + cafEl.currentTime.toFixed(3) + 's, epochMs=' + _epochMs);
 
             _showOverlay(0);
 
@@ -390,6 +435,7 @@
             var HARD_SEEK_THRESHOLD_MS = 2000;
             var MIN_RATE = 0.5;
             var MAX_RATE = 1.5;
+            var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
             _syncTimer = setInterval(function () {
@@ -408,6 +454,8 @@
                         player.currentTime = seekTarget;
                         player.playbackRate = 1.0;
                         console.log('[cws] Hard seek: error=' + errorMs.toFixed(0) + 'ms → t=' + seekTarget.toFixed(3));
+                    } else {
+                        console.log('[cws] Drift=' + errorMs.toFixed(0) + 'ms but target not in buffer, waiting');
                     }
                     return;
                 }
@@ -416,6 +464,16 @@
                 var rate = 1.0 - KP * errorMs;
                 rate = Math.max(MIN_RATE, Math.min(MAX_RATE, rate));
                 player.playbackRate = rate;
+
+                // Log sync status every 4 seconds (16 ticks at 250ms)
+                _syncLogCounter++;
+                if (_syncLogCounter % 16 === 0) {
+                    var b2 = player.buffered;
+                    var bufAhead = b2.length > 0 ? ((b2.end(b2.length - 1) - player.currentTime) * 1000).toFixed(0) : '?';
+                    console.log('[cws] sync: err=' + errorMs.toFixed(0) + 'ms rate=' + rate.toFixed(4) +
+                                ' vt=' + (videoMs / 1000).toFixed(2) + ' at=' + (audioMs / 1000).toFixed(2) +
+                                ' buf=' + bufAhead + 'ms');
+                }
             }, 250);
 
             // Periodically refresh epoch from server (handles drift in wall clocks)
@@ -575,7 +633,7 @@
             if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
             _ms = null; _sb = null;
             _appendQueue = []; _appending = false;
-            _loadedSegs = {}; _initLoaded = false;
+            _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
             _epochMs = -1; _epochWallMs = -1;
             _videoReady = false; _cafPlaying = false;
             var p = document.getElementById('player');
