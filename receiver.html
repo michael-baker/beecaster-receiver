@@ -686,7 +686,7 @@
                     console.warn('[pcm-stream] AudioContext.resume() failed:', e);
                 });
 
-                _audioCtx.audioWorklet.addModule(baseUrl + 'receiver/pcm-worklet.js')
+                _audioCtx.audioWorklet.addModule('./pcm-worklet.js')
                     .then(function () {
                         _workletNode = new AudioWorkletNode(_audioCtx, 'pcm-sink');
                         _workletNode.connect(_audioCtx.destination);
@@ -710,7 +710,7 @@
                         };
 
                         // Start the Web Worker that fetches and parses the framed PCM stream.
-                        _pcmWorker = new Worker(baseUrl + 'receiver/pcm-fetch-worker.js');
+                        _pcmWorker = new Worker('./pcm-fetch-worker.js');
                         _pcmWorker.onmessage = function (e) {
                             var msg = e.data;
                             if (msg.type === 'pcm') {
