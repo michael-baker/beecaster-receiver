@@ -224,10 +224,10 @@
                         maxMaxBufferLength:          60,
                         maxBufferSize:               60 * 1024 * 1024,
                         backBufferLength:            0,
-                        enableWorker:                false,  // avoid worker↔main handoff stalls on CC v2 ARM
+                        enableWorker:                false,
                         abrEnabled:                  false,
                         startLevel:                  0,
-                        debug:                       false,
+                        debug:                       true,  // DIAGNOSTIC: see segment transition details
                         progressive:                 true,
                         manifestLoadingMaxRetry:     12,
                         manifestLoadingRetryDelay:   1000,
