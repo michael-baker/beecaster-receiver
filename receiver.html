@@ -401,21 +401,21 @@
             var buf = player.buffered;
             var bufEnd = buf.length > 0 ? buf.end(buf.length - 1) : 0;
 
-            if (bufEnd < targetSec + 4) {
-                // Not enough buffer ahead of audio — wait for more segments
+            if (bufEnd <= targetSec) {
+                // Audio has overtaken video buffer — wait for more segments
                 console.log('[cws] Waiting for video buffer to cover audio position: bufEnd=' +
                             bufEnd.toFixed(2) + 's, audioTarget=' + targetSec.toFixed(2) + 's');
                 setTimeout(function () { _beginSyncedPlayback(player, cafEl); }, 500);
                 return;
             }
 
-            // We have buffer past the audio position. Seek video slightly AHEAD of
-            // audio to compensate for decode startup latency (~1-2s on CC v2).
-            // The PLL will gently slow video once it's running.
+            // Buffer extends past audio position — seek video to match audio.
+            // PLL will handle fine alignment from here. New segments arrive at
+            // real-time rate so buffer won't drain.
             var bufStart = buf.start(0);
-            var seekTarget = targetSec + 1.5;  // 1.5s ahead compensates for startup lag
-            if (seekTarget > bufEnd - 2) seekTarget = bufEnd - 2;  // keep 2s safety margin
+            var seekTarget = targetSec;
             if (seekTarget < bufStart) seekTarget = bufStart;
+            if (seekTarget > bufEnd - 0.5) seekTarget = bufEnd - 0.5;
             player.currentTime = seekTarget;
             console.log('[cws] Video buffer: ' + bufStart.toFixed(3) + 's - ' + bufEnd.toFixed(3) + 's (' + ((bufEnd - bufStart) * 1000).toFixed(0) + 'ms)');
 
