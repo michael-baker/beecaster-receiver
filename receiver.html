@@ -67,6 +67,7 @@
         var _segsBuffered = 0;    // count of segments appended to SourceBuffer
         var _epochMs     = -1;    // AudioClockTee position when CAF connected
         var _epochWallMs = -1;    // UTC wall ms at same instant
+        var _videoEpochMs = -1;   // AudioClockTee position represented by video PTS 0
         var _serverRtt   = 0;    // round-trip time estimate to server
         var _cafPlaying  = false;
         var _videoReady  = false;
@@ -161,11 +162,12 @@
         //        so video tracks the audio clock. No seeks except >2s drift.
         //
         // Epoch model:
-        //   Server exposes /cast/audio-clock → {epochMs, epochWallMs, serverNowMs}
-        //   epochMs = AudioClockTee sample position (ms) when CAF HTTP client connected
+        //   Server exposes /cast/audio-clock → {epochMs, epochWallMs, videoEpochMs, serverNowMs}
+        //   epochMs      = AudioClockTee sample position (ms) when CAF HTTP client connected
+        //   videoEpochMs = AudioClockTee sample position (ms) represented by video PTS 0
         //   CAF audio position = epochMs + cafEl.currentTime * 1000
-        //   Video PTS ≈ AudioClockTee time since pipeline start
-        //   Sync target: player.currentTime * 1000 ≈ epochMs + cafEl.currentTime * 1000
+        //   Video position     = videoEpochMs + player.currentTime * 1000
+        //   Sync target: videoNowMs ≈ audioNowMs
         // ══════════════════════════════════════════════════════════════════════
 
         function _startCafWavSync(baseUrl) {
@@ -178,13 +180,13 @@
 
             // Step 1: Wait for audio clock epoch (CAF has connected to /cast/caf-audio)
             _waitForEpoch(baseUrl, function () {
-                console.log('[cws] Epoch acquired: epochMs=' + _epochMs + ' epochWallMs=' + _epochWallMs);
+                console.log('[cws] Epoch acquired: epochMs=' + _epochMs + ' epochWallMs=' + _epochWallMs + ' videoEpochMs=' + _videoEpochMs);
                 // Step 2: Set up manual MSE for video
                 _initVideoMSE(player, baseUrl);
             });
         }
 
-        // Poll /cast/audio-clock until epochMs >= 0 (CAF has connected to WAV stream)
+        // Poll /cast/audio-clock until both the audio and video epochs are available.
         function _waitForEpoch(baseUrl, cb) {
             var attempts = 0;
             var maxAttempts = 60; // 30 seconds
@@ -194,14 +196,15 @@
                     .then(function (r) { return r.json(); })
                     .then(function (d) {
                         _serverRtt = Date.now() - t0;
-                        if (d.epochMs >= 0) {
+                        if (d.epochMs >= 0 && d.videoEpochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
+                            _videoEpochMs = d.videoEpochMs;
                             cb();
                         } else {
                             attempts++;
                             if (attempts < maxAttempts) setTimeout(poll, 500);
-                            else console.error('[cws] Timed out waiting for audio epoch');
+                            else console.error('[cws] Timed out waiting for audio/video epochs');
                         }
                     })
                     .catch(function () {
@@ -382,6 +385,7 @@
                     if (d.epochMs >= 0) {
                         _epochMs     = d.epochMs;
                         _epochWallMs = d.epochWallMs;
+                        if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
                     }
                     _beginSyncedPlayback(player, cafEl);
                 })
@@ -394,7 +398,7 @@
         function _beginSyncedPlayback(player, cafEl) {
             // Compute where audio is RIGHT NOW
             var audioMs = _getAudioClockMs(cafEl);
-            var targetSec = audioMs / 1000;
+            var targetSec = _getVideoTimeSecForAudioMs(audioMs);
 
             // Wait until the video buffer extends past the current audio position.
             // Without this, the PLL starts with zero headroom and immediately stalls.
@@ -421,7 +425,7 @@
 
             player.play().catch(function () {});
             console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) + 's, audioMs=' + audioMs.toFixed(0) +
-                        ', cafEl.currentTime=' + cafEl.currentTime.toFixed(3) + 's, epochMs=' + _epochMs);
+                        ', cafEl.currentTime=' + cafEl.currentTime.toFixed(3) + 's, epochMs=' + _epochMs + ' videoEpochMs=' + _videoEpochMs);
 
             _showOverlay(0);
 
@@ -452,12 +456,12 @@
                 if (player.paused || player.readyState < 2) return;
 
                 var audioMs  = _getAudioClockMs(cafEl);
-                var videoMs  = player.currentTime * 1000;
+                var videoMs  = _getVideoClockMs(player);
                 var errorMs  = videoMs - audioMs;
 
                 // Hard seek for large drift (startup, track change, buffer gap)
                 if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS) {
-                    var seekTarget = audioMs / 1000;
+                    var seekTarget = _getVideoTimeSecForAudioMs(audioMs);
                     var b = player.buffered;
                     if (b.length > 0 && seekTarget >= b.start(0) && seekTarget <= b.end(b.length - 1)) {
                         player.currentTime = seekTarget;
@@ -498,6 +502,7 @@
                         if (d.epochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
+                            if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
                         }
                     })
                     .catch(function () {});
@@ -508,6 +513,18 @@
         // audioClockMs = epochMs + cafEl.currentTime * 1000
         function _getAudioClockMs(cafEl) {
             return _epochMs + cafEl.currentTime * 1000;
+        }
+
+        // Compute current video clock position in ms in the same absolute media-time
+        // coordinate system as the audio clock.
+        function _getVideoClockMs(player) {
+            return _videoEpochMs + player.currentTime * 1000;
+        }
+
+        // Convert an absolute media position into the corresponding video element
+        // currentTime value.
+        function _getVideoTimeSecForAudioMs(audioMs) {
+            return (audioMs - _videoEpochMs) / 1000;
         }
 
         // Minimal m3u8 parser — extracts segment URIs, sequence numbers, target duration
@@ -645,7 +662,7 @@
             _ms = null; _sb = null;
             _appendQueue = []; _appending = false;
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
-            _epochMs = -1; _epochWallMs = -1;
+            _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1;
             _videoReady = false; _cafPlaying = false;
             var p = document.getElementById('player');
             if (p) {
