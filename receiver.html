@@ -509,37 +509,58 @@
             _drainAppendQueue();
         }
 
-        function _trimBufferedVideo(aggressive) {
-            if (_trimming || !_sb || _sb.updating || !_sb.buffered || _sb.buffered.length === 0) return false;
-
-            var player = document.getElementById('player');
-            var currentTime = player ? (player.currentTime || 0) : 0;
-            var firstStart = _sb.buffered.start(0);
-            var lastEnd = _sb.buffered.end(_sb.buffered.length - 1);
-            var maxWindowSec = aggressive ? 16 : _maxBufferedWindowSec;
-            var backBufferKeepSec = aggressive ? 6 : _backBufferKeepSec;
-            var trimEnd = Math.max(
-                currentTime > 0.5 ? currentTime - backBufferKeepSec : 0,
-                lastEnd - maxWindowSec
-            );
-
-            if (!(trimEnd > firstStart + 0.25)) return false;
-
-            _trimming = true;
-            console.log('[cws] Trimming video buffer ' + firstStart.toFixed(2) + 's..' + trimEnd.toFixed(2) + 's');
+        // True only when the SourceBuffer is still attached to an OPEN MediaSource. Reading
+        // _sb.buffered / .updating on a SourceBuffer that has been removed from its parent
+        // MediaSource (e.g. after _reset() ends the stream on calibration-stop / track-change)
+        // throws an InvalidStateError DOMException, so callers must gate on this first.
+        function _sbReady() {
+            if (!_ms || !_sb || _ms.readyState !== 'open') return false;
             try {
-                _sb.remove(firstStart, trimEnd);
+                var list = _ms.sourceBuffers;
+                for (var i = 0; i < list.length; i++) if (list[i] === _sb) return true;
+            } catch (e) {}
+            return false;
+        }
+
+        function _trimBufferedVideo(aggressive) {
+            if (_trimming || !_sbReady()) return false;
+
+            // Capture the SourceBuffer instance so a teardown that swaps/nulls _sb mid-flight
+            // can't make the updateend callback operate on the wrong (or detached) buffer.
+            var sb = _sb;
+            var firstStart, trimEnd;
+            try {
+                if (sb.updating) return false;
+                var buffered = sb.buffered;
+                if (!buffered || buffered.length === 0) return false;
+
+                var player = document.getElementById('player');
+                var currentTime = player ? (player.currentTime || 0) : 0;
+                firstStart = buffered.start(0);
+                var lastEnd = buffered.end(buffered.length - 1);
+                var maxWindowSec = aggressive ? 16 : _maxBufferedWindowSec;
+                var backBufferKeepSec = aggressive ? 6 : _backBufferKeepSec;
+                trimEnd = Math.max(
+                    currentTime > 0.5 ? currentTime - backBufferKeepSec : 0,
+                    lastEnd - maxWindowSec
+                );
+
+                if (!(trimEnd > firstStart + 0.25)) return false;
+
+                _trimming = true;
+                console.log('[cws] Trimming video buffer ' + firstStart.toFixed(2) + 's..' + trimEnd.toFixed(2) + 's');
+                sb.remove(firstStart, trimEnd);
             } catch (e) {
                 _trimming = false;
-                console.warn('[cws] buffer trim failed:', e);
+                console.warn('[cws] buffer trim skipped:', e && e.message);
                 return false;
             }
 
             var onTrimEnd = function () {
-                _sb.removeEventListener('updateend', onTrimEnd);
+                try { sb.removeEventListener('updateend', onTrimEnd); } catch (e) {}
                 _trimming = false;
             };
-            _sb.addEventListener('updateend', onTrimEnd);
+            sb.addEventListener('updateend', onTrimEnd);
             return true;
         }
 
@@ -550,13 +571,14 @@
         }
 
         function _drainAppendQueue() {
-            if (_appending || !_sb || _appendQueue.length === 0) return;
-            if (_sb.updating) return;
+            if (_appending || _appendQueue.length === 0 || !_sbReady()) return;
+            var sb = _sb;
+            try { if (sb.updating) return; } catch (e) { return; }
             if (_trimBufferedVideo(false)) return;
             _appending = true;
             var item = _appendQueue.shift();
             try {
-                _sb.appendBuffer(item.data);
+                sb.appendBuffer(item.data);
             } catch (e) {
                 _appending = false;
                 if (_isQuotaExceededError(e)) {
@@ -564,19 +586,21 @@
                     _appendQueue.unshift(item);
                     if (_trimBufferedVideo(true)) return;
                 }
-                console.error('[cws] appendBuffer error:', e);
+                console.error('[cws] appendBuffer error:', e && e.message);
                 if (item.cb) item.cb(e);
-                _drainAppendQueue();
+                // Only keep draining if the SourceBuffer is still usable (avoid a tight loop
+                // re-throwing on a detached buffer during teardown).
+                if (_sbReady()) _drainAppendQueue();
                 return;
             }
             // updateend will fire → _drainAppendQueue called again
             var onEnd = function () {
-                _sb.removeEventListener('updateend', onEnd);
+                try { sb.removeEventListener('updateend', onEnd); } catch (e) {}
                 _appending = false;
                 if (item.cb) item.cb(null);
                 _drainAppendQueue();
             };
-            _sb.addEventListener('updateend', onEnd);
+            sb.addEventListener('updateend', onEnd);
         }
 
         // Start video playback + PLL sync loop
@@ -894,40 +918,32 @@
                                     if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
                                 }
                                 if (_epochMs < 0) return;
+                                // NOTE: Chromecast decodes video in hardware, so the frame cannot be
+                                // read back through a 2D canvas (getImageData returns all-black). We
+                                // therefore do NOT decode the on-frame marker on the receiver. We
+                                // report clock positions for telemetry; the audio/video CLOCKS are
+                                // aligned by the drift loop (no pixels needed) and the final
+                                // perceptual offset (Cdisp) is set by the manual nudge slider.
                                 var audioMs = _getAudioClockMs(cafEl);
-                                var low24 = _decodeMarkerFromVideo(player);
-                                // Always report (even when the marker isn't found) so the sync
-                                // page can show the human that the mechanics are alive.
+                                var videoMs = _getVideoClockMs(player);
                                 var bufAhead = player.buffered.length > 0
                                     ? Math.round((player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000) : 0;
-                                var report = {
-                                    markerFound: low24 != null,
-                                    markerStatus: _lastMarkerStatus,
-                                    stripLuma: _lastStripLuma,
-                                    videoW: player.videoWidth,
-                                    videoH: player.videoHeight,
-                                    lookingForMarkerMs: Math.round(audioMs),
-                                    audioContentMs: Math.round(audioMs),
-                                    appliedCdispMs: (typeof d.cdispMs === 'number') ? d.cdispMs : 0,
-                                    cafCurrentTimeMs: Math.round(cafEl.currentTime * 1000),
-                                    playerCurrentTimeMs: Math.round(player.currentTime * 1000),
-                                    bufferAheadMs: bufAhead,
-                                    cafPlaying: _cafPlaying,
-                                    videoReadyState: player.readyState
-                                };
-                                if (low24 != null) {
-                                    var MOD = 16777216;
-                                    var vContent = (Math.floor(audioMs / MOD) * MOD) + low24;
-                                    if (vContent - audioMs > MOD / 2) vContent -= MOD;
-                                    else if (audioMs - vContent > MOD / 2) vContent += MOD;
-                                    report.videoContentMs = Math.round(vContent);
-                                    report.markerMs = low24;
-                                    report.machineSkewMs = Math.round(vContent - audioMs); // drives auto-converge
-                                }
                                 fetch(_baseUrl + 'cast/calibration/report', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify(report)
+                                    body: JSON.stringify({
+                                        markerFound: false,
+                                        markerStatus: 'n/a (Chromecast hw-decoded video is not canvas-readable)',
+                                        audioContentMs: Math.round(audioMs),
+                                        videoContentMs: Math.round(videoMs),
+                                        clockSkewMs: Math.round(videoMs - audioMs),
+                                        appliedCdispMs: (typeof d.cdispMs === 'number') ? d.cdispMs : 0,
+                                        cafCurrentTimeMs: Math.round(cafEl.currentTime * 1000),
+                                        playerCurrentTimeMs: Math.round(player.currentTime * 1000),
+                                        bufferAheadMs: bufAhead,
+                                        cafPlaying: _cafPlaying,
+                                        videoReadyState: player.readyState
+                                    })
                                 }).catch(function () {});
                             })
                             .catch(function () {});
