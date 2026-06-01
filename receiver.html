@@ -650,10 +650,13 @@
             if (typeof player.requestVideoFrameCallback === 'function') {
                 console.log('[cws] requestVideoFrameCallback available — using display-accurate video clock');
                 (function rVFCLoop(now, meta) {
-                    _rVFCMediaTimeSec = meta.mediaTime;
-                    _rVFCRenderedCount++;
+                    // Only accept real callbacks (mediaTime > 0), not the synthetic bootstrap.
+                    if (meta && typeof meta.mediaTime === 'number' && meta.mediaTime > 0) {
+                        _rVFCMediaTimeSec = meta.mediaTime;
+                        _rVFCRenderedCount++;
+                    }
                     player.requestVideoFrameCallback(rVFCLoop);
-                })(0, { mediaTime: player.currentTime });
+                })(0, {});
             } else {
                 console.log('[cws] requestVideoFrameCallback not available — falling back to player.currentTime');
             }
@@ -696,6 +699,10 @@
                     var seekTarget = _getVideoTimeSecForAudioMs(audioMs);
                     var b = player.buffered;
                     if (b.length > 0 && seekTarget >= b.start(0) && seekTarget <= b.end(b.length - 1)) {
+                        // Reset rVFC so _getVideoClockMs falls back to player.currentTime
+                        // until the next real frame is presented. Without this, _rVFCMediaTimeSec
+                        // stays at the pre-seek value and the PLL immediately fires another seek.
+                        _rVFCMediaTimeSec = -1;
                         player.currentTime = seekTarget;
                         player.playbackRate = 1.0;
                         console.log('[cws] Hard seek: error=' + errorMs.toFixed(0) + 'ms → t=' + seekTarget.toFixed(3));
