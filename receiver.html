@@ -681,10 +681,10 @@
             // drains the video buffer, so the trim is clamped (tighter when the buffer is
             // low). Large excursions (startup, track change, gap) snap via a hard seek.
             var DEAD_BAND_MS = 80;             // hold rate at 1.0 within this band
-            var KP = 0.0001;                   // 300 ms error → ~3% trim (then clamped)
-            var HARD_SEEK_THRESHOLD_MS = 3000;
-            var MAX_TRIM = 0.03;               // ±3% when the buffer is healthy
-            var MAX_TRIM_SAFE = 0.015;         // ±1.5% when the buffer is low
+            var KP = 0.0002;                   // 200 ms error → ~4% trim (then clamped)
+            var HARD_SEEK_THRESHOLD_MS = 400;  // snap (seek) for anything bigger — fast acquisition
+            var MAX_TRIM = 0.06;               // ±6% when the buffer is healthy
+            var MAX_TRIM_SAFE = 0.03;          // ±3% when the buffer is low
             var BUFFER_LOW_SEC = 4;
             var _syncLogCounter = 0;
 
@@ -872,25 +872,37 @@
                     .then(function (r) { return r.json(); })
                     .then(function (s) {
                         if (!s || !s.calibrationMode) return;
-                        if (!player || !cafEl || _epochMs < 0) return;
-                        var low24 = _decodeMarkerFromVideo(player);
-                        if (low24 == null) return;
-                        var audioMs = _getAudioClockMs(cafEl);
-                        var MOD = 16777216;
-                        // Reconstruct full content ms using the audio clock as the high-bit anchor.
-                        var vContent = (Math.floor(audioMs / MOD) * MOD) + low24;
-                        if (vContent - audioMs > MOD / 2) vContent -= MOD;
-                        else if (audioMs - vContent > MOD / 2) vContent += MOD;
-                        var skew = Math.round(vContent - audioMs);
-                        fetch(_baseUrl + 'cast/calibration/report', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                videoContentMs: Math.round(vContent),
-                                audioContentMs: Math.round(audioMs),
-                                machineSkewMs: skew
+                        if (!player || !cafEl) return;
+                        // Refresh the epoch each cycle so the video tracks the live auto-converge
+                        // bias within ~500ms instead of waiting for the 10s refresh.
+                        fetch(_baseUrl + 'cast/audio-clock')
+                            .then(function (r) { return r.json(); })
+                            .then(function (d) {
+                                if (d.epochMs >= 0) {
+                                    _epochMs = d.epochMs;
+                                    if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
+                                }
+                                if (_epochMs < 0) return;
+                                var low24 = _decodeMarkerFromVideo(player);
+                                if (low24 == null) return;
+                                var audioMs = _getAudioClockMs(cafEl);
+                                var MOD = 16777216;
+                                // Reconstruct full content ms using the audio clock as the high-bit anchor.
+                                var vContent = (Math.floor(audioMs / MOD) * MOD) + low24;
+                                if (vContent - audioMs > MOD / 2) vContent -= MOD;
+                                else if (audioMs - vContent > MOD / 2) vContent += MOD;
+                                var skew = Math.round(vContent - audioMs);
+                                fetch(_baseUrl + 'cast/calibration/report', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        videoContentMs: Math.round(vContent),
+                                        audioContentMs: Math.round(audioMs),
+                                        machineSkewMs: skew
+                                    })
+                                }).catch(function () {});
                             })
-                        }).catch(function () {});
+                            .catch(function () {});
                     })
                     .catch(function () {});
             }, 500);
