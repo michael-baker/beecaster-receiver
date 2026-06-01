@@ -401,7 +401,7 @@
             var buf = player.buffered;
             var bufEnd = buf.length > 0 ? buf.end(buf.length - 1) : 0;
 
-            if (bufEnd < targetSec + 2) {
+            if (bufEnd < targetSec + 4) {
                 // Not enough buffer ahead of audio — wait for more segments
                 console.log('[cws] Waiting for video buffer to cover audio position: bufEnd=' +
                             bufEnd.toFixed(2) + 's, audioTarget=' + targetSec.toFixed(2) + 's');
@@ -409,18 +409,14 @@
                 return;
             }
 
-            // We have buffer past the audio position. Seek video to match audio.
+            // We have buffer past the audio position. Seek video slightly AHEAD of
+            // audio to compensate for decode startup latency (~1-2s on CC v2).
+            // The PLL will gently slow video once it's running.
             var bufStart = buf.start(0);
-            if (targetSec >= bufStart && targetSec <= bufEnd) {
-                player.currentTime = targetSec;
-            } else if (targetSec < bufStart) {
-                // Audio hasn't caught up to buffered video — start at buffer start
-                // PLL will slow video until audio catches up
-                player.currentTime = bufStart;
-            } else {
-                // Audio is past buffered video — start at end, PLL will adjust
-                player.currentTime = bufEnd - 0.5;
-            }
+            var seekTarget = targetSec + 1.5;  // 1.5s ahead compensates for startup lag
+            if (seekTarget > bufEnd - 2) seekTarget = bufEnd - 2;  // keep 2s safety margin
+            if (seekTarget < bufStart) seekTarget = bufStart;
+            player.currentTime = seekTarget;
             console.log('[cws] Video buffer: ' + bufStart.toFixed(3) + 's - ' + bufEnd.toFixed(3) + 's (' + ((bufEnd - bufStart) * 1000).toFixed(0) + 'ms)');
 
             player.play().catch(function () {});
@@ -433,17 +429,21 @@
             // Runs every 250ms. Adjusts playbackRate to converge video toward
             // audio position. Never seeks unless drift exceeds 2 seconds.
             //
-            // This is a simple proportional controller:
-            //   error = videoMs - audioMs  (positive = video ahead)
-            //   rate  = 1.0 - Kp * error
-            //   Kp    = 0.002 → 100ms error gives rate 0.8, converges in ~0.5s
+            // Key constraint: video segments arrive at real-time rate (~4s per 4s).
+            // If playbackRate > 1.0, video buffer drains faster than it fills.
+            // At rate 1.1, buffer drains at 0.4s/segment — manageable.
+            // At rate 1.5, buffer drains at 2.0s/segment — stalls quickly.
             //
-            // The rate is clamped to [0.5, 1.5] to prevent bizarre behavior.
-            // At 30fps, ±50% rate change is visually acceptable for cast screen.
-            var KP = 0.002;
-            var HARD_SEEK_THRESHOLD_MS = 2000;
-            var MIN_RATE = 0.5;
-            var MAX_RATE = 1.5;
+            // Strategy: gentle proportional control with buffer-aware clamping.
+            //   - Kp = 0.0005 → 1000ms error gives rate 1.5 (gentle convergence)
+            //   - MAX_RATE limited to 1.08 when buffer < 6s (protect against stall)
+            //   - Emergency seek only if |error| > 3s (wider threshold to avoid thrashing)
+            var KP = 0.0005;
+            var HARD_SEEK_THRESHOLD_MS = 3000;
+            var MIN_RATE = 0.92;
+            var MAX_RATE = 1.08;
+            var MAX_RATE_SAFE = 1.03;  // when buffer is low
+            var BUFFER_LOW_SEC = 6;
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -469,16 +469,18 @@
                     return;
                 }
 
-                // PLL rate adjustment
+                // PLL rate adjustment (buffer-aware clamping)
                 var rate = 1.0 - KP * errorMs;
-                rate = Math.max(MIN_RATE, Math.min(MAX_RATE, rate));
+                var b2 = player.buffered;
+                var bufAheadSec = b2.length > 0 ? (b2.end(b2.length - 1) - player.currentTime) : 0;
+                var effectiveMax = bufAheadSec < BUFFER_LOW_SEC ? MAX_RATE_SAFE : MAX_RATE;
+                rate = Math.max(MIN_RATE, Math.min(effectiveMax, rate));
                 player.playbackRate = rate;
 
                 // Log sync status every 4 seconds (16 ticks at 250ms)
                 _syncLogCounter++;
                 if (_syncLogCounter % 16 === 0) {
-                    var b2 = player.buffered;
-                    var bufAhead = b2.length > 0 ? ((b2.end(b2.length - 1) - player.currentTime) * 1000).toFixed(0) : '?';
+                    var bufAhead = (bufAheadSec * 1000).toFixed(0);
                     console.log('[cws] sync: err=' + errorMs.toFixed(0) + 'ms rate=' + rate.toFixed(4) +
                                 ' vt=' + (videoMs / 1000).toFixed(2) + ' at=' + (audioMs / 1000).toFixed(2) +
                                 ' buf=' + bufAhead + 'ms');
