@@ -834,40 +834,43 @@
         // draws #player to a 1280×720 offscreen canvas and reads the 33 blocks. Returns the
         // low-24-bit content audio-ms, or null — including on a tainted canvas, in which case
         // calibration degrades gracefully to a pure-human nudge.
+        var _lastMarkerStatus = 'init';   // diagnostic: why the last decode succeeded/failed
+        var _lastStripLuma = -1;          // avg luminance of the sampled strip (0=black)
         function _decodeMarkerFromVideo(player) {
-            if (!player || player.readyState < 2) return null;
-            try {
-                var W = 1280, STRIP = 40;
-                if (!_mkCanvas) {
-                    _mkCanvas = document.createElement('canvas');
-                    _mkCanvas.width = W; _mkCanvas.height = STRIP;
-                    _mkCtx = _mkCanvas.getContext('2d', { willReadFrequently: true });
-                }
-                // Draw ONLY the top marker strip (cheap on weak Chromecast GPUs), scaling the
-                // source full-width to the 1280-wide canvas so the block coords still line up.
-                var vw = player.videoWidth || W, vh = player.videoHeight || 720;
-                _mkCtx.drawImage(player, 0, 0, vw, vh * STRIP / 720, 0, 0, W, STRIP);
-                var stripW = 33 * 32 + 16;
-                var img = _mkCtx.getImageData(0, 0, stripW, STRIP);
-                var d = img.data, sw = img.width, i, dx, dy;
-                var bits = new Array(33);
-                for (i = 0; i < 33; i++) {
-                    var cx = 8 + i * 32 + 16, cy = 8 + 12, sum = 0, n = 0;
-                    for (dx = -4; dx <= 3; dx++) for (dy = -4; dy <= 3; dy++) {
-                        var o = ((cy + dy) * sw + (cx + dx)) * 4;
-                        sum += 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2]; n++;
-                    }
-                    bits[i] = (sum / n) >= 128 ? 1 : 0;
-                }
-                var sent = 0; for (i = 0; i < 8; i++) sent = (sent << 1) | bits[i];
-                if (sent !== 0xA5) return null;
-                var val = 0, ones = 0;
-                for (i = 8; i < 32; i++) { val = (val << 1) | bits[i]; ones += bits[i]; }
-                if (bits[32] !== (ones & 1)) return null;
-                return val; // low 24 bits of content audio-ms
-            } catch (e) {
-                return null; // tainted canvas / read error → human-only nudge fallback
+            if (!player || player.readyState < 2) { _lastMarkerStatus = 'video-not-ready'; return null; }
+            var W = 1280, STRIP = 40, stripW = 33 * 32 + 16;
+            if (!_mkCanvas) {
+                _mkCanvas = document.createElement('canvas');
+                _mkCanvas.width = W; _mkCanvas.height = STRIP;
+                _mkCtx = _mkCanvas.getContext('2d', { willReadFrequently: true });
             }
+            // Draw ONLY the top marker strip (cheap on weak Chromecast GPUs), scaling the
+            // source full-width to the 1280-wide canvas so the block coords still line up.
+            var vw = player.videoWidth || W, vh = player.videoHeight || 720;
+            try { _mkCtx.drawImage(player, 0, 0, vw, vh * STRIP / 720, 0, 0, W, STRIP); }
+            catch (e) { _lastMarkerStatus = 'drawimage-failed'; return null; }
+            var img;
+            try { img = _mkCtx.getImageData(0, 0, stripW, STRIP); }
+            catch (e) { _lastMarkerStatus = 'tainted'; return null; } // cross-origin video → pixel read blocked
+            var d = img.data, sw = img.width, i, dx, dy;
+            var bits = new Array(33), total = 0;
+            for (i = 0; i < 33; i++) {
+                var cx = 8 + i * 32 + 16, cy = 8 + 12, sum = 0, n = 0;
+                for (dx = -4; dx <= 3; dx++) for (dy = -4; dy <= 3; dy++) {
+                    var o = ((cy + dy) * sw + (cx + dx)) * 4;
+                    sum += 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2]; n++;
+                }
+                var blk = sum / n; total += blk;
+                bits[i] = blk >= 128 ? 1 : 0;
+            }
+            _lastStripLuma = Math.round(total / 33);
+            var sent = 0; for (i = 0; i < 8; i++) sent = (sent << 1) | bits[i];
+            if (sent !== 0xA5) { _lastMarkerStatus = 'no-sentinel(0x' + sent.toString(16) + ',luma=' + _lastStripLuma + ')'; return null; }
+            var val = 0, ones = 0;
+            for (i = 8; i < 32; i++) { val = (val << 1) | bits[i]; ones += bits[i]; }
+            if (bits[32] !== (ones & 1)) { _lastMarkerStatus = 'bad-parity'; return null; }
+            _lastMarkerStatus = 'ok';
+            return val; // low 24 bits of content audio-ms
         }
 
         // While the server reports calibrationMode, post the machine-measured A/V skew
@@ -899,6 +902,10 @@
                                     ? Math.round((player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000) : 0;
                                 var report = {
                                     markerFound: low24 != null,
+                                    markerStatus: _lastMarkerStatus,
+                                    stripLuma: _lastStripLuma,
+                                    videoW: player.videoWidth,
+                                    videoH: player.videoHeight,
                                     lookingForMarkerMs: Math.round(audioMs),
                                     audioContentMs: Math.round(audioMs),
                                     appliedCdispMs: (typeof d.cdispMs === 'number') ? d.cdispMs : 0,
