@@ -686,6 +686,8 @@
             var MAX_TRIM = 0.06;               // ±6% when the buffer is healthy
             var MAX_TRIM_SAFE = 0.03;          // ±3% when the buffer is low
             var BUFFER_LOW_SEC = 4;
+            var SEEK_COOLDOWN_MS = 2000;       // never seek more than once per 2s (anti seek-storm)
+            var _lastHardSeekMs = 0;
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -697,8 +699,10 @@
                 var videoMs = _getVideoClockMs(player);
                 var errorMs = videoMs - audioMs - _contentLagMs;  // _contentLagMs == 0
 
-                // Hard seek for large excursions (startup, track change, buffer gap).
-                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS) {
+                // Hard seek for large excursions (startup, track change, buffer gap), but at most
+                // once per cooldown so a persistent error can't trigger a seek-storm (which would
+                // stutter the video to <1fps). Within the cooldown we fall through to gentle trim.
+                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS && (Date.now() - _lastHardSeekMs) > SEEK_COOLDOWN_MS) {
                     var seekTarget = _getVideoTimeSecForAudioMs(audioMs);
                     var b = player.buffered;
                     if (b.length > 0 && seekTarget >= b.start(0) && seekTarget <= b.end(b.length - 1)) {
@@ -707,11 +711,12 @@
                         _rVFCMediaTimeSec = -1;
                         player.currentTime = seekTarget;
                         player.playbackRate = 1.0;
+                        _lastHardSeekMs = Date.now();
                         console.log('[cws] Hard seek: error=' + errorMs.toFixed(0) + 'ms → t=' + seekTarget.toFixed(3));
+                        return;
                     } else {
                         console.log('[cws] Drift=' + errorMs.toFixed(0) + 'ms but target not in buffer, waiting');
                     }
-                    return;
                 }
 
                 var b2 = player.buffered;
@@ -832,15 +837,18 @@
         function _decodeMarkerFromVideo(player) {
             if (!player || player.readyState < 2) return null;
             try {
-                var W = 1280, H = 720;
+                var W = 1280, STRIP = 40;
                 if (!_mkCanvas) {
                     _mkCanvas = document.createElement('canvas');
-                    _mkCanvas.width = W; _mkCanvas.height = H;
+                    _mkCanvas.width = W; _mkCanvas.height = STRIP;
                     _mkCtx = _mkCanvas.getContext('2d', { willReadFrequently: true });
                 }
-                _mkCtx.drawImage(player, 0, 0, W, H);
+                // Draw ONLY the top marker strip (cheap on weak Chromecast GPUs), scaling the
+                // source full-width to the 1280-wide canvas so the block coords still line up.
+                var vw = player.videoWidth || W, vh = player.videoHeight || 720;
+                _mkCtx.drawImage(player, 0, 0, vw, vh * STRIP / 720, 0, 0, W, STRIP);
                 var stripW = 33 * 32 + 16;
-                var img = _mkCtx.getImageData(0, 0, stripW, 40);
+                var img = _mkCtx.getImageData(0, 0, stripW, STRIP);
                 var d = img.data, sw = img.width, i, dx, dy;
                 var bits = new Array(33);
                 for (i = 0; i < 33; i++) {
@@ -883,29 +891,42 @@
                                     if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
                                 }
                                 if (_epochMs < 0) return;
-                                var low24 = _decodeMarkerFromVideo(player);
-                                if (low24 == null) return;
                                 var audioMs = _getAudioClockMs(cafEl);
-                                var MOD = 16777216;
-                                // Reconstruct full content ms using the audio clock as the high-bit anchor.
-                                var vContent = (Math.floor(audioMs / MOD) * MOD) + low24;
-                                if (vContent - audioMs > MOD / 2) vContent -= MOD;
-                                else if (audioMs - vContent > MOD / 2) vContent += MOD;
-                                var skew = Math.round(vContent - audioMs);
+                                var low24 = _decodeMarkerFromVideo(player);
+                                // Always report (even when the marker isn't found) so the sync
+                                // page can show the human that the mechanics are alive.
+                                var bufAhead = player.buffered.length > 0
+                                    ? Math.round((player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000) : 0;
+                                var report = {
+                                    markerFound: low24 != null,
+                                    lookingForMarkerMs: Math.round(audioMs),
+                                    audioContentMs: Math.round(audioMs),
+                                    appliedCdispMs: (typeof d.cdispMs === 'number') ? d.cdispMs : 0,
+                                    cafCurrentTimeMs: Math.round(cafEl.currentTime * 1000),
+                                    playerCurrentTimeMs: Math.round(player.currentTime * 1000),
+                                    bufferAheadMs: bufAhead,
+                                    cafPlaying: _cafPlaying,
+                                    videoReadyState: player.readyState
+                                };
+                                if (low24 != null) {
+                                    var MOD = 16777216;
+                                    var vContent = (Math.floor(audioMs / MOD) * MOD) + low24;
+                                    if (vContent - audioMs > MOD / 2) vContent -= MOD;
+                                    else if (audioMs - vContent > MOD / 2) vContent += MOD;
+                                    report.videoContentMs = Math.round(vContent);
+                                    report.markerMs = low24;
+                                    report.machineSkewMs = Math.round(vContent - audioMs); // drives auto-converge
+                                }
                                 fetch(_baseUrl + 'cast/calibration/report', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({
-                                        videoContentMs: Math.round(vContent),
-                                        audioContentMs: Math.round(audioMs),
-                                        machineSkewMs: skew
-                                    })
+                                    body: JSON.stringify(report)
                                 }).catch(function () {});
                             })
                             .catch(function () {});
                     })
                     .catch(function () {});
-            }, 500);
+            }, 1000);
         }
 
         // Minimal m3u8 parser — extracts segment URIs, sequence numbers, target duration
