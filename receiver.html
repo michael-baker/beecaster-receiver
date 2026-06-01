@@ -74,6 +74,109 @@
         var _videoReady  = false;
         var _maxBufferedWindowSec = 24;
         var _backBufferKeepSec = 10;
+        var _lastManifestInfo = null;
+        var _lastClockInfo = null;
+        var _debugWatchTimer = null;
+
+        function _getBufferedRanges(mediaEl) {
+            if (!mediaEl || !mediaEl.buffered) return [];
+            var ranges = [];
+            for (var i = 0; i < mediaEl.buffered.length; i++) {
+                var start = mediaEl.buffered.start(i);
+                var end = mediaEl.buffered.end(i);
+                ranges.push({ start: start, end: end, duration: end - start });
+            }
+            return ranges;
+        }
+
+        function _snapshotSyncState() {
+            var player = document.getElementById('player');
+            var cafEl = document.getElementById('caf-el');
+            var audioClockMs = null;
+            var videoClockMs = null;
+            var errorMs = null;
+            var targetSec = null;
+            var bufferAheadSec = null;
+
+            if (cafEl && _epochMs >= 0) audioClockMs = _getAudioClockMs(cafEl);
+            if (player && _videoEpochMs >= 0) videoClockMs = _getVideoClockMs(player);
+            if (audioClockMs != null && videoClockMs != null) {
+                errorMs = videoClockMs - audioClockMs;
+                targetSec = _getVideoTimeSecForAudioMs(audioClockMs);
+            }
+            if (player && player.buffered && player.buffered.length > 0) {
+                bufferAheadSec = player.buffered.end(player.buffered.length - 1) - player.currentTime;
+            }
+
+            return {
+                mode: _mode,
+                epochs: {
+                    epochMs: _epochMs,
+                    epochWallMs: _epochWallMs,
+                    videoEpochMs: _videoEpochMs,
+                    serverRttMs: _serverRtt
+                },
+                latestClockPoll: _lastClockInfo,
+                latestManifest: _lastManifestInfo,
+                queue: {
+                    pendingAppends: _appendQueue.length,
+                    appending: _appending,
+                    trimming: _trimming,
+                    loadedSegCount: Object.keys(_loadedSegs).length,
+                    segsBuffered: _segsBuffered,
+                    videoReady: _videoReady,
+                    cafPlaying: _cafPlaying
+                },
+                audio: cafEl ? {
+                    currentTime: cafEl.currentTime,
+                    paused: cafEl.paused,
+                    readyState: cafEl.readyState,
+                    computedClockMs: audioClockMs
+                } : null,
+                video: player ? {
+                    currentTime: player.currentTime,
+                    paused: player.paused,
+                    readyState: player.readyState,
+                    playbackRate: player.playbackRate,
+                    computedClockMs: videoClockMs,
+                    targetTimeSecForAudio: targetSec,
+                    bufferAheadSec: bufferAheadSec,
+                    buffered: _getBufferedRanges(player)
+                } : null,
+                drift: { errorMs: errorMs },
+                nowMs: Date.now()
+            };
+        }
+
+        window.__cws = {
+            state: function () { return _snapshotSyncState(); },
+            log: function () {
+                var s = _snapshotSyncState();
+                console.log('[cws][debug]', s);
+                if (console.table && s.video && s.video.buffered) console.table(s.video.buffered);
+                return s;
+            },
+            watch: function (intervalMs) {
+                var ms = Math.max(250, intervalMs || 1000);
+                if (_debugWatchTimer) clearInterval(_debugWatchTimer);
+                _debugWatchTimer = setInterval(function () {
+                    var s = _snapshotSyncState();
+                    console.log('[cws][watch] err=' + (s.drift.errorMs != null ? s.drift.errorMs.toFixed(0) : 'n/a') +
+                                'ms audio=' + (s.audio && s.audio.computedClockMs != null ? (s.audio.computedClockMs / 1000).toFixed(3) : 'n/a') +
+                                's video=' + (s.video && s.video.computedClockMs != null ? (s.video.computedClockMs / 1000).toFixed(3) : 'n/a') +
+                                's playerT=' + (s.video ? s.video.currentTime.toFixed(3) : 'n/a') +
+                                's rate=' + (s.video ? s.video.playbackRate.toFixed(4) : 'n/a') +
+                                ' bufAhead=' + (s.video && s.video.bufferAheadSec != null ? s.video.bufferAheadSec.toFixed(3) : 'n/a') + 's');
+                }, ms);
+                return ms;
+            },
+            stopWatch: function () {
+                if (_debugWatchTimer) clearInterval(_debugWatchTimer);
+                _debugWatchTimer = null;
+            },
+            player: function () { return document.getElementById('player'); },
+            caf: function () { return document.getElementById('caf-el'); }
+        };
 
         // ── LOAD interceptor ────────────────────────────────────────────────────
         playerManager.setMessageInterceptor(
@@ -199,6 +302,15 @@
                     .then(function (r) { return r.json(); })
                     .then(function (d) {
                         _serverRtt = Date.now() - t0;
+                        _lastClockInfo = {
+                            audioMs: d.audioMs,
+                            epochMs: d.epochMs,
+                            epochWallMs: d.epochWallMs,
+                            videoEpochMs: d.videoEpochMs,
+                            serverNowMs: d.serverNowMs,
+                            receiverNowMs: Date.now(),
+                            receiverRttMs: _serverRtt
+                        };
                         if (d.epochMs >= 0 && d.videoEpochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
@@ -280,6 +392,14 @@
                 })
                 .then(function (text) {
                     var parsed = _parseM3u8(text);
+                    _lastManifestInfo = {
+                        fetchedAtMs: Date.now(),
+                        mediaSeq: parsed.mediaSeq,
+                        targetDuration: parsed.targetDuration,
+                        segmentCount: parsed.segments.length,
+                        firstSegment: parsed.segments.length > 0 ? parsed.segments[0] : null,
+                        lastSegment: parsed.segments.length > 0 ? parsed.segments[parsed.segments.length - 1] : null
+                    };
                     var newFrags = [];
                     for (var i = 0; i < parsed.segments.length; i++) {
                         var seg = parsed.segments[i];
@@ -557,6 +677,15 @@
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
                             if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
+                            _lastClockInfo = {
+                                audioMs: d.audioMs,
+                                epochMs: d.epochMs,
+                                epochWallMs: d.epochWallMs,
+                                videoEpochMs: d.videoEpochMs,
+                                serverNowMs: d.serverNowMs,
+                                receiverNowMs: Date.now(),
+                                receiverRttMs: _serverRtt
+                            };
                         }
                     })
                     .catch(function () {});
@@ -588,6 +717,7 @@
             var mediaSeq = 0;
             var targetDuration = 4;
             var sn = 0;
+            var pendingProgramDateTime = null;
 
             for (var i = 0; i < lines.length; i++) {
                 var line = lines[i].trim();
@@ -596,12 +726,15 @@
                     sn = mediaSeq;
                 } else if (line.indexOf('#EXT-X-TARGETDURATION:') === 0) {
                     targetDuration = parseInt(line.split(':')[1], 10) || 4;
+                } else if (line.indexOf('#EXT-X-PROGRAM-DATE-TIME:') === 0) {
+                    pendingProgramDateTime = Date.parse(line.substring('#EXT-X-PROGRAM-DATE-TIME:'.length));
                 } else if (line.indexOf('#EXTINF:') === 0) {
                     // Next non-comment line is the segment URI
                     for (var j = i + 1; j < lines.length; j++) {
                         var nextLine = lines[j].trim();
                         if (nextLine && nextLine.charAt(0) !== '#') {
-                            segments.push({ sn: sn, uri: nextLine });
+                            segments.push({ sn: sn, uri: nextLine, programDateTimeMs: pendingProgramDateTime });
+                            pendingProgramDateTime = null;
                             sn++;
                             i = j;
                             break;
@@ -718,6 +851,9 @@
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
             _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1;
             _videoReady = false; _cafPlaying = false;
+            _lastManifestInfo = null; _lastClockInfo = null;
+            if (_debugWatchTimer) clearInterval(_debugWatchTimer);
+            _debugWatchTimer = null;
             var p = document.getElementById('player');
             if (p) {
                 try { p.pause(); } catch (e) {}
