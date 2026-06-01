@@ -69,6 +69,10 @@
         var _epochMs     = -1;    // AudioClockTee position when CAF connected
         var _epochWallMs = -1;    // UTC wall ms at same instant
         var _videoEpochMs = -1;   // AudioClockTee position represented by video PTS 0
+        // Content-lag offset (ms): video PTS should run this far AHEAD of audio in
+        // the PLL target so spectrum content rendered into each video frame aligns
+        // with the audio being heard.  Set by server = frameAgeMs + chromcastDisplayMs.
+        var _contentLagMs = 160;  // conservative default until server responds
         var _serverRtt   = 0;    // round-trip time estimate to server
         var _cafPlaying  = false;
         var _videoReady  = false;
@@ -315,6 +319,8 @@
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
                             _videoEpochMs = d.videoEpochMs;
+                            if (typeof d.contentLagMs === 'number' && d.contentLagMs > 0)
+                                _contentLagMs = d.contentLagMs;
                             cb();
                         } else {
                             attempts++;
@@ -412,7 +418,7 @@
                         _fetchSegments(baseUrl, newFrags, 0);
                     }
                     // Schedule next poll: target duration / 2 (HLS spec recommendation)
-                    var pollMs = Math.max(1000, (parsed.targetDuration || 4) * 500);
+                    var pollMs = Math.max(500, (parsed.targetDuration || 1) * 500);
                     _pollTimer = setTimeout(function () { _pollManifest(baseUrl); }, pollMs);
                 })
                 .catch(function (e) {
@@ -439,8 +445,8 @@
                         }
                         _segsBuffered++;
                         console.log('[cws] Segment ' + seg.sn + ' buffered (' + _segsBuffered + ' total)');
-                        // Wait for preroll (3 segments ≈ 12s) before starting playback
-                        if (!_videoReady && _segsBuffered >= 3) {
+                        // Wait for preroll (5 segments ≈ 5s at hls_time=1) before starting playback
+                        if (!_videoReady && _segsBuffered >= 5) {
                             _videoReady = true;
                             _startVideoPlayback();
                         }
@@ -560,6 +566,8 @@
                         _epochMs     = d.epochMs;
                         _epochWallMs = d.epochWallMs;
                         if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
+                        if (typeof d.contentLagMs === 'number' && d.contentLagMs > 0)
+                            _contentLagMs = d.contentLagMs;
                     }
                     _beginSyncedPlayback(player, cafEl);
                 })
@@ -631,7 +639,10 @@
 
                 var audioMs  = _getAudioClockMs(cafEl);
                 var videoMs  = _getVideoClockMs(player);
-                var errorMs  = videoMs - audioMs;
+                // PLL error: positive means video is ahead of its target.
+                // Target is audioMs + _contentLagMs (video should run contentLagMs
+                // ahead so the visual content encoded at that PTS matches heard audio).
+                var errorMs  = videoMs - audioMs - _contentLagMs;
 
                 // Hard seek for large drift (startup, track change, buffer gap)
                 if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS) {
@@ -677,6 +688,8 @@
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
                             if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
+                            if (typeof d.contentLagMs === 'number' && d.contentLagMs > 0)
+                                _contentLagMs = d.contentLagMs;
                             _lastClockInfo = {
                                 audioMs: d.audioMs,
                                 epochMs: d.epochMs,
@@ -690,6 +703,30 @@
                     })
                     .catch(function () {});
             }, 10000);
+
+            // Periodically POST sync telemetry so server can monitor convergence
+            setInterval(function () {
+                if (!_baseUrl || !_cafPlaying) return;
+                try {
+                    var aMs = _getAudioClockMs(cafEl);
+                    var vMs = _getVideoClockMs(player);
+                    var bAhead = player.buffered.length > 0
+                        ? (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000
+                        : 0;
+                    var pllErr = vMs - aMs - _contentLagMs;
+                    fetch(_baseUrl + 'cast/sync-report', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            audioTimeMs: Math.round(aMs),
+                            videoTimeMs: Math.round(vMs),
+                            bufferAheadMs: Math.round(bAhead),
+                            pllErrorMs: Math.round(pllErr),
+                            contentLagMs: _contentLagMs
+                        })
+                    }).catch(function () {});
+                } catch(_) {}
+            }, 5000);
         }
 
         // Compute current audio clock position in ms
@@ -707,7 +744,10 @@
         // Convert an absolute media position into the corresponding video element
         // currentTime value.
         function _getVideoTimeSecForAudioMs(audioMs) {
-            return (audioMs - _videoEpochMs) / 1000;
+            // Video must run contentLagMs AHEAD in media time so that the visual
+            // content encoded into the frame at PTS (audioMs + contentLagMs)
+            // is displayed while the listener hears audioMs.
+            return (audioMs + _contentLagMs - _videoEpochMs) / 1000;
         }
 
         // Minimal m3u8 parser — extracts segment URIs, sequence numbers, target duration
