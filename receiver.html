@@ -62,6 +62,7 @@
         var _sb          = null;  // SourceBuffer
         var _appendQueue = [];    // segments waiting to be appended
         var _appending   = false;
+        var _trimming    = false;
         var _loadedSegs  = {};    // sn → true
         var _initLoaded  = false;
         var _segsBuffered = 0;    // count of segments appended to SourceBuffer
@@ -71,6 +72,8 @@
         var _serverRtt   = 0;    // round-trip time estimate to server
         var _cafPlaying  = false;
         var _videoReady  = false;
+        var _maxBufferedWindowSec = 24;
+        var _backBufferKeepSec = 10;
 
         // ── LOAD interceptor ────────────────────────────────────────────────────
         playerManager.setMessageInterceptor(
@@ -308,7 +311,12 @@
                     return r.arrayBuffer();
                 })
                 .then(function (buf) {
-                    _queueAppend(new Uint8Array(buf), function () {
+                    _queueAppend(new Uint8Array(buf), function (appendErr) {
+                        if (appendErr) {
+                            console.warn('[cws] Segment ' + seg.sn + ' append failed:', appendErr);
+                            _fetchSegments(baseUrl, segs, idx + 1);
+                            return;
+                        }
                         _segsBuffered++;
                         console.log('[cws] Segment ' + seg.sn + ' buffered (' + _segsBuffered + ' total)');
                         // Wait for preroll (3 segments ≈ 12s) before starting playback
@@ -333,17 +341,63 @@
             _drainAppendQueue();
         }
 
+        function _trimBufferedVideo(aggressive) {
+            if (_trimming || !_sb || _sb.updating || !_sb.buffered || _sb.buffered.length === 0) return false;
+
+            var player = document.getElementById('player');
+            var currentTime = player ? (player.currentTime || 0) : 0;
+            var firstStart = _sb.buffered.start(0);
+            var lastEnd = _sb.buffered.end(_sb.buffered.length - 1);
+            var maxWindowSec = aggressive ? 16 : _maxBufferedWindowSec;
+            var backBufferKeepSec = aggressive ? 6 : _backBufferKeepSec;
+            var trimEnd = Math.max(
+                currentTime > 0.5 ? currentTime - backBufferKeepSec : 0,
+                lastEnd - maxWindowSec
+            );
+
+            if (!(trimEnd > firstStart + 0.25)) return false;
+
+            _trimming = true;
+            console.log('[cws] Trimming video buffer ' + firstStart.toFixed(2) + 's..' + trimEnd.toFixed(2) + 's');
+            try {
+                _sb.remove(firstStart, trimEnd);
+            } catch (e) {
+                _trimming = false;
+                console.warn('[cws] buffer trim failed:', e);
+                return false;
+            }
+
+            var onTrimEnd = function () {
+                _sb.removeEventListener('updateend', onTrimEnd);
+                _trimming = false;
+            };
+            _sb.addEventListener('updateend', onTrimEnd);
+            return true;
+        }
+
+        function _isQuotaExceededError(e) {
+            if (!e) return false;
+            return e.name === 'QuotaExceededError' ||
+                (typeof e.message === 'string' && /SourceBuffer is full|quota/i.test(e.message));
+        }
+
         function _drainAppendQueue() {
             if (_appending || !_sb || _appendQueue.length === 0) return;
             if (_sb.updating) return;
+            if (_trimBufferedVideo(false)) return;
             _appending = true;
             var item = _appendQueue.shift();
             try {
                 _sb.appendBuffer(item.data);
             } catch (e) {
-                console.error('[cws] appendBuffer error:', e);
                 _appending = false;
-                if (item.cb) item.cb();
+                if (_isQuotaExceededError(e)) {
+                    console.warn('[cws] appendBuffer hit buffer quota, trimming and retrying:', e);
+                    _appendQueue.unshift(item);
+                    if (_trimBufferedVideo(true)) return;
+                }
+                console.error('[cws] appendBuffer error:', e);
+                if (item.cb) item.cb(e);
                 _drainAppendQueue();
                 return;
             }
@@ -351,7 +405,7 @@
             var onEnd = function () {
                 _sb.removeEventListener('updateend', onEnd);
                 _appending = false;
-                if (item.cb) item.cb();
+                if (item.cb) item.cb(null);
                 _drainAppendQueue();
             };
             _sb.addEventListener('updateend', onEnd);
@@ -660,7 +714,7 @@
             if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
             if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
             _ms = null; _sb = null;
-            _appendQueue = []; _appending = false;
+            _appendQueue = []; _appending = false; _trimming = false;
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
             _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1;
             _videoReady = false; _cafPlaying = false;
