@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r14-clock-helpers-fix';
+        var RECEIVER_VERSION = '2026-06-02-r15-baked-reanchor';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -78,7 +78,11 @@
         // PURE content equality (videoContentMs == audioContentMs). Kept at 0 so the legacy
         // "- _contentLagMs" terms are no-ops; the server no longer sends contentLagMs.
         var _contentLagMs = 0;
-        var _cdispMs     = 0;    // device sync offset (Cdisp) from /cast/audio-clock, applied to the audio clock
+        var _cdispMs     = 0;    // latest Cdisp reported by /cast/audio-clock (raw; baked at anchor)
+        var _cdispBaked  = 0;    // Cdisp BAKED into the video target — set once at anchor, then held
+                                 // constant; only re-baked on a re-anchor (reanchorSeq change).
+        var _lastReanchorSeq = -1; // last reanchorSeq seen; a change = "Save" → one clean re-anchor
+        var _reanchorPending = false; // set by the poll on a reanchorSeq change; the drift loop does one clean seek
         var _serverRtt   = 0;    // round-trip time estimate to server
         var _cafPlaying  = false;
         var _videoReady  = false;
@@ -111,7 +115,7 @@
             if (cafEl && _epochMs >= 0) audioClockMs = _getAudioClockMs(cafEl);
             if (player && _videoEpochMs >= 0) videoClockMs = _getVideoClockMs(player);
             if (audioClockMs != null && videoClockMs != null) {
-                errorMs = videoClockMs - audioClockMs - _contentLagMs;
+                errorMs = videoClockMs - audioClockMs - _cdispBaked;
                 targetSec = _getVideoTimeSecForAudioMs(audioClockMs);
             }
             if (player && player.buffered && player.buffered.length > 0) {
@@ -362,6 +366,9 @@
                             _epochWallMs  = d.epochWallMs;
                             _videoEpochMs = d.videoEpochMs;
                             _cdispMs      = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
+                            // BAKE the offset once at this anchor; the drift loop holds it constant.
+                            _cdispBaked      = _cdispMs;
+                            _lastReanchorSeq = (typeof d.reanchorSeq === 'number') ? d.reanchorSeq : 0;
                             cb();
                         } else {
                             attempt++;
@@ -654,7 +661,7 @@
                 return;
             }
 
-            // Refresh epoch right before starting sync
+            // Refresh epoch right before starting sync — this is the initial anchor, so BAKE Cdisp.
             var t0 = Date.now();
             fetch(_baseUrl + 'cast/audio-clock')
                 .then(function (r) { return r.json(); })
@@ -665,6 +672,8 @@
                         _epochWallMs = d.epochWallMs;
                         if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
                         _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
+                        _cdispBaked      = _cdispMs;
+                        _lastReanchorSeq = (typeof d.reanchorSeq === 'number') ? d.reanchorSeq : 0;
                     }
                     _beginSyncedPlayback(player, cafEl);
                 })
@@ -674,22 +683,21 @@
                 });
         }
 
-        // Clock helpers. Audio clock = CAF position + epoch + the per-device presentation skew
-        // (Cdisp) applied receiver-side. Video clock = video epoch + the on-screen media time
-        // (rVFC when available, else currentTime) — Cdisp is applied only to audio so the two
-        // converge to the calibrated offset.
+        // Clock helpers. Audio clock = PURE CAF content position (epoch + currentTime). The
+        // per-device offset (Cdisp) is NOT applied to the live clock — it's BAKED ONCE into the
+        // video target as _cdispBaked (held constant; only changes on a re-anchor), so the drift
+        // loop never chases a moving offset (which caused the live-seek ping-pong).
         function _getAudioClockMs(cafEl) {
-            return _epochMs + cafEl.currentTime * 1000 + _cdispMs;
+            return _epochMs + cafEl.currentTime * 1000;
         }
         function _getVideoClockMs(player) {
             var t = (_rVFCMediaTimeSec >= 0) ? _rVFCMediaTimeSec : player.currentTime;
             return _videoEpochMs + t * 1000;
         }
-        // Video time (s) that matches a given audio clock ms. Cdisp is applied receiver-side via
-        // the audio clock (_getAudioClockMs adds _cdispMs), so passing a cdisp-shifted audioMs here
-        // shifts the video target by the calibrated offset. Pure content equality otherwise.
+        // Video time (s) whose content matches a given audio clock ms, shifted by the baked offset.
+        // Steady state targets: videoContent == audioContent + _cdispBaked.
         function _getVideoTimeSecForAudioMs(audioMs) {
-            return (audioMs + _contentLagMs - _videoEpochMs) / 1000;
+            return (audioMs + _cdispBaked - _videoEpochMs) / 1000;
         }
 
         function _beginSyncedPlayback(player, cafEl) {
@@ -765,7 +773,6 @@
             var BUFFER_LOW_SEC = 4;
             var SEEK_COOLDOWN_MS = 2000;       // never seek more than once per 2s (anti seek-storm)
             var _lastHardSeekMs = 0;
-            var _lastCdispForSeek = null;      // detect offset (cdisp) changes to snap once
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -775,16 +782,13 @@
 
                 var audioMs = _getAudioClockMs(cafEl);
                 var videoMs = _getVideoClockMs(player);
-                var errorMs = videoMs - audioMs - _contentLagMs;  // _contentLagMs == 0
+                var errorMs = videoMs - audioMs - _cdispBaked;  // target: videoContent == audioContent + Cdisp
 
-                // Snap ONCE whenever the reported offset (epoch) changes — e.g. a manual nudge on
-                // the settings page. This is a discrete event, not a continuous error, so it can't
-                // seek-storm; the gentle rate-trim below then converges the sub-offset residual.
-                // (The epoch poll returns a stable value when nothing is nudged, so no seek fires.)
-                if (_lastCdispForSeek === null) {
-                    _lastCdispForSeek = _cdispMs;
-                } else if (Math.abs(_cdispMs - _lastCdispForSeek) > 40) {
-                    _lastCdispForSeek = _cdispMs;
+                // Re-anchor ONCE when Save bumps reanchorSeq (the audio-clock poll detects it, sets
+                // the new _cdispBaked and _reanchorPending). A single clean seek to the baked target
+                // — deterministic, no continuous chasing. If the target isn't buffered yet, hold at
+                // rate 1.0 and retry next tick (no seek-storm).
+                if (_reanchorPending) {
                     var nt = _getVideoTimeSecForAudioMs(audioMs);
                     var nb = player.buffered;
                     if (nb.length > 0 && nt >= nb.start(0) && nt <= nb.end(nb.length - 1)) {
@@ -792,7 +796,11 @@
                         player.currentTime = nt;
                         player.playbackRate = 1.0;
                         _lastHardSeekMs = Date.now();
-                        console.log('[cws] offset changed → snap to t=' + nt.toFixed(3));
+                        _reanchorPending = false;
+                        console.log('[cws] re-anchor → seek to t=' + nt.toFixed(3) + ' (Cdisp=' + _cdispBaked + 'ms)');
+                    } else {
+                        player.playbackRate = 1.0;
+                        console.log('[cws] re-anchor target not in buffer yet, waiting');
                     }
                     return;
                 }
@@ -839,7 +847,10 @@
             // hardware-decoded video pixels, so measurement is done by the phone companion
             // (camera reads the on-screen barcode, mic reads the FSK audio timecode).
 
-            // Periodically refresh epoch from server (handles drift in wall clocks)
+            // Periodically refresh epoch from server (handles slow wall-clock drift) AND watch for
+            // the re-anchor signal (reanchorSeq bumps when the user Saves a new offset). 2s so a
+            // Save re-aligns promptly. Steady polls update _epochMs/_videoEpochMs but must NOT touch
+            // _cdispBaked — only a reanchorSeq change re-bakes it (one clean seek in the drift loop).
             setInterval(function () {
                 if (!_baseUrl) return;
                 var t0 = Date.now();
@@ -852,6 +863,12 @@
                             _epochWallMs = d.epochWallMs;
                             if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
                             _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
+                            if (typeof d.reanchorSeq === 'number' && d.reanchorSeq !== _lastReanchorSeq) {
+                                _lastReanchorSeq = d.reanchorSeq;
+                                _cdispBaked = _cdispMs;
+                                _reanchorPending = true;
+                                console.log('[cws] re-anchor requested (Cdisp=' + _cdispBaked + 'ms)');
+                            }
                             _lastClockInfo = {
                                 audioMs: d.audioMs,
                                 epochMs: d.epochMs,
@@ -864,7 +881,7 @@
                         }
                     })
                     .catch(function () {});
-            }, 10000);
+            }, 2000);
 
             // Periodically POST sync telemetry so server can monitor convergence
             setInterval(function () {
@@ -1039,6 +1056,7 @@
             _appendQueue = []; _appending = false; _trimming = false;
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
             _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1; _cdispMs = 0;
+            _cdispBaked = 0; _lastReanchorSeq = -1; _reanchorPending = false;
             _videoReady = false; _cafPlaying = false;
             _lastManifestInfo = null; _lastClockInfo = null;
             if (_debugWatchTimer) clearInterval(_debugWatchTimer);
