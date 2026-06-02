@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r15-baked-reanchor';
+        var RECEIVER_VERSION = '2026-06-02-r16-selfheal';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -683,7 +683,8 @@
                     if (d.epochMs >= 0) {
                         _epochMs     = d.epochMs;
                         _epochWallMs = d.epochWallMs;
-                        if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
+                        // _videoEpochMs is NOT taken from the server here — _anchorVideo derives it
+                        // from the live edge (the server value goes stale across wall/sample gaps).
                         _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                         _cdispBaked      = _cdispMs;
                         _lastReanchorSeq = (typeof d.reanchorSeq === 'number') ? d.reanchorSeq : 0;
@@ -880,11 +881,17 @@
             // hardware-decoded video pixels, so measurement is done by the phone companion
             // (camera reads the on-screen barcode, mic reads the FSK audio timecode).
 
-            // Periodically refresh epoch from server (handles slow wall-clock drift) AND watch for
-            // the re-anchor signal (reanchorSeq bumps when the user Saves a new offset). 2s so a
-            // Save re-aligns promptly. Steady polls update _epochMs/_videoEpochMs but must NOT touch
-            // _cdispBaked — only a reanchorSeq change re-bakes it (one clean seek in the drift loop).
-            setInterval(function () {
+            // Periodically refresh the AUDIO epoch from the server (handles slow wall-clock drift /
+            // an audio reconnect) AND watch for the re-anchor signal (reanchorSeq bumps when the
+            // user Saves a new offset). NOTE: the poll must NOT overwrite _videoEpochMs — the
+            // receiver OWNS that after _anchorVideo derives it from the live edge; the server's
+            // value is captured once and goes stale across gaps (wall-paced video vs sample-paced
+            // audio), which is what desynced track changes. It also must NOT touch _cdispBaked —
+            // only a reanchorSeq change re-bakes it (one clean anchor in the drift loop).
+            // Captured in _epochPollTimer so _reset() can clear it (else every track change leaks
+            // another poll that fights over the shared state).
+            if (_epochPollTimer) clearInterval(_epochPollTimer);
+            _epochPollTimer = setInterval(function () {
                 if (!_baseUrl) return;
                 var t0 = Date.now();
                 fetch(_baseUrl + 'cast/audio-clock')
@@ -894,7 +901,6 @@
                         if (d.epochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
-                            if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
                             _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                             if (typeof d.reanchorSeq === 'number' && d.reanchorSeq !== _lastReanchorSeq) {
                                 _lastReanchorSeq = d.reanchorSeq;
@@ -916,8 +922,10 @@
                     .catch(function () {});
             }, 2000);
 
-            // Periodically POST sync telemetry so server can monitor convergence
-            setInterval(function () {
+            // Periodically POST sync telemetry so server can monitor convergence.
+            // Captured in _reportTimer so _reset() can clear it (avoids leaking one per track change).
+            if (_reportTimer) clearInterval(_reportTimer);
+            _reportTimer = setInterval(function () {
                 if (!_baseUrl || !_cafPlaying) return;
                 try {
                     var aMs = _getAudioClockMs(cafEl);
@@ -942,7 +950,13 @@
                             rVFCRenderedCount: _rVFCRenderedCount,
                             rVFCDeltaMs: rVFCActive ? Math.round((player.currentTime - _rVFCMediaTimeSec) * 1000) : null,
                             playerCurrentTime: player.currentTime,
-                            playbackRate: player.playbackRate
+                            playbackRate: player.playbackRate,
+                            // Anchor diagnostics: makes a stalled/disjoint anchor visible server-side
+                            // (e.g. a seek target outside [bufStartSec,bufEndSec] is the freeze signature).
+                            bufStartSec: player.buffered.length > 0 ? +player.buffered.start(0).toFixed(2) : -1,
+                            bufEndSec:   player.buffered.length > 0 ? +player.buffered.end(player.buffered.length - 1).toFixed(2) : -1,
+                            videoEpochMs: Math.round(_videoEpochMs),
+                            epochMs: _epochMs
                         })
                     }).catch(function () {});
                 } catch(_) {}
@@ -1083,6 +1097,9 @@
         function _reset() {
             if (_syncTimer)  { clearInterval(_syncTimer); _syncTimer = null; }
             if (_pollTimer)  { clearTimeout(_pollTimer); _pollTimer = null; }
+            if (_epochPollTimer) { clearInterval(_epochPollTimer); _epochPollTimer = null; }
+            if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
+            _lastSeekMs = 0;
             if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
             if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
             _ms = null; _sb = null;
