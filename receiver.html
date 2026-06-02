@@ -91,6 +91,19 @@
         var _lastManifestInfo = null;
         var _lastClockInfo = null;
         var _debugWatchTimer = null;
+        var _epochPollTimer = null;  // /cast/audio-clock poll (epoch refresh + reanchor signal)
+        var _reportTimer = null;     // sync-report POST interval
+        var _lastSeekMs  = 0;        // last seek/anchor wall time (anti seek-storm), module-level
+
+        // Self-healing anchor geometry (seconds). The receiver NEVER assumes the video target is
+        // reachable, nor that time only moves forward: whenever the cdisp-correct target falls
+        // outside the live buffer (track change / seek / fast-forward / rewind / gap / stale epoch),
+        // it RE-ANCHORS to a guaranteed-in-buffer position and re-derives the epoch instead of
+        // stalling on an impossible seek. The server firehoses A/V continuously; the receiver just
+        // keeps re-latching onto whatever is actually playable.
+        var SEEK_GUARD_SEC = 0.5;    // keep targets this clear of both buffer edges
+        var HEAL_LEAD_SEC  = 4.0;    // on heal, play this far behind the live edge (≈ audio headroom)
+        var REANCHOR_MS    = 4000;   // |error| beyond this ⇒ treat the anchor as stale and heal
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -700,37 +713,59 @@
             return (audioMs + _cdispBaked - _videoEpochMs) / 1000;
         }
 
-        function _beginSyncedPlayback(player, cafEl) {
-            // Compute where audio is RIGHT NOW
-            var audioMs = _getAudioClockMs(cafEl);
-            var targetSec = _getVideoTimeSecForAudioMs(audioMs);
-
-            // Wait until the video buffer extends past the current audio position.
-            // Without this, the PLL starts with zero headroom and immediately stalls.
+        // ── Self-healing video anchor ────────────────────────────────────────────
+        // The single place that positions video against the audio clock. Tolerant of ANY
+        // discontinuity (track change, seek, fast-forward, rewind, buffering gap, or a stale
+        // server epoch): if the cdisp-correct target is reachable it honors it exactly; if not, it
+        // heals to a guaranteed-in-buffer position near the live edge and RE-DERIVES _videoEpochMs
+        // so the held relationship (and the Cdisp trim) stays consistent from there on. It never
+        // seeks outside the buffered range — an out-of-buffer seek is exactly what froze video.
+        function _anchorVideo(player, cafEl, reason) {
             var buf = player.buffered;
-            var bufEnd = buf.length > 0 ? buf.end(buf.length - 1) : 0;
+            if (!buf || buf.length === 0) return false;
+            var bufStart = buf.start(0), bufEnd = buf.end(buf.length - 1);
+            var lo = bufStart + SEEK_GUARD_SEC, hi = bufEnd - SEEK_GUARD_SEC;
+            if (hi < lo) { lo = hi = (bufStart + bufEnd) / 2; }   // buffer thinner than 2×guard
+            var audioMs = _getAudioClockMs(cafEl);
+            var ideal = _getVideoTimeSecForAudioMs(audioMs);      // cdisp-correct, current epoch
+            var target, healed = false;
+            if (ideal >= lo && ideal <= hi) {
+                target = ideal;                                   // reachable → honor Cdisp exactly
+            } else {
+                target = bufEnd - HEAL_LEAD_SEC;                  // unreachable → heal near live edge
+                if (target < lo) target = lo;
+                if (target > hi) target = hi;
+                _videoEpochMs = audioMs + _cdispBaked - target * 1000;   // re-derive so error→0 here
+                healed = true;
+            }
+            _rVFCMediaTimeSec = -1;
+            try { player.currentTime = target; } catch (e) {}
+            player.playbackRate = 1.0;
+            _lastSeekMs = Date.now();
+            console.log('[cws] anchor(' + reason + '): ' + (healed ? 'HEAL ' : '') +
+                        't=' + target.toFixed(3) + ' buf=[' + bufStart.toFixed(2) + ',' + bufEnd.toFixed(2) + ']' +
+                        ' audioMs=' + audioMs.toFixed(0) + ' cdisp=' + _cdispBaked +
+                        (healed ? (' → videoEpochMs=' + Math.round(_videoEpochMs)) : ''));
+            return true;
+        }
 
-            if (bufEnd <= targetSec) {
-                // Audio has overtaken video buffer — wait for more segments
-                console.log('[cws] Waiting for video buffer to cover audio position: bufEnd=' +
-                            bufEnd.toFixed(2) + 's, audioTarget=' + targetSec.toFixed(2) + 's');
-                setTimeout(function () { _beginSyncedPlayback(player, cafEl); }, 500);
+        function _beginSyncedPlayback(player, cafEl) {
+            // Wait only until there is a minimal buffer to anchor against. We do NOT require the
+            // buffer to "extend past the audio position" (the old forward-only assumption that hung
+            // forever when the live edge sat ahead of a stale audio target) — _anchorVideo
+            // self-heals to whatever is actually playable, in either direction.
+            var buf = player.buffered;
+            var bufLenSec = buf.length > 0 ? (buf.end(buf.length - 1) - buf.start(0)) : 0;
+            if (bufLenSec < 2 * SEEK_GUARD_SEC) {
+                setTimeout(function () { _beginSyncedPlayback(player, cafEl); }, 300);
                 return;
             }
 
-            // Buffer extends past audio position — seek video to match audio.
-            // PLL will handle fine alignment from here. New segments arrive at
-            // real-time rate so buffer won't drain.
-            var bufStart = buf.start(0);
-            var seekTarget = targetSec;
-            if (seekTarget < bufStart) seekTarget = bufStart;
-            if (seekTarget > bufEnd - 0.5) seekTarget = bufEnd - 0.5;
-            player.currentTime = seekTarget;
-            console.log('[cws] Video buffer: ' + bufStart.toFixed(3) + 's - ' + bufEnd.toFixed(3) + 's (' + ((bufEnd - bufStart) * 1000).toFixed(0) + 'ms)');
-
+            _anchorVideo(player, cafEl, 'start');
             player.play().catch(function () {});
-            console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) + 's, audioMs=' + audioMs.toFixed(0) +
-                        ', cafEl.currentTime=' + cafEl.currentTime.toFixed(3) + 's, epochMs=' + _epochMs + ' videoEpochMs=' + _videoEpochMs);
+            console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) +
+                        's, epochMs=' + _epochMs + ' videoEpochMs=' + Math.round(_videoEpochMs) +
+                        ' cafT=' + cafEl.currentTime.toFixed(3));
 
             _showOverlay(0);
 
@@ -772,7 +807,6 @@
             var MAX_TRIM_SAFE = 0.03;          // ±3% when the buffer is low
             var BUFFER_LOW_SEC = 4;
             var SEEK_COOLDOWN_MS = 2000;       // never seek more than once per 2s (anti seek-storm)
-            var _lastHardSeekMs = 0;
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -784,46 +818,45 @@
                 var videoMs = _getVideoClockMs(player);
                 var errorMs = videoMs - audioMs - _cdispBaked;  // target: videoContent == audioContent + Cdisp
 
-                // Re-anchor ONCE when Save bumps reanchorSeq (the audio-clock poll detects it, sets
-                // the new _cdispBaked and _reanchorPending). A single clean seek to the baked target
-                // — deterministic, no continuous chasing. If the target isn't buffered yet, hold at
-                // rate 1.0 and retry next tick (no seek-storm).
+                var buf = player.buffered;
+                if (!buf || buf.length === 0) return;
+                var bufStart = buf.start(0), bufEnd = buf.end(buf.length - 1);
+                var ideal = _getVideoTimeSecForAudioMs(audioMs);
+                var reachable = (ideal >= bufStart + SEEK_GUARD_SEC && ideal <= bufEnd - SEEK_GUARD_SEC);
+
+                // A "Save" (reanchorSeq bump) re-bakes Cdisp → one clean anchor that honors it.
                 if (_reanchorPending) {
-                    var nt = _getVideoTimeSecForAudioMs(audioMs);
-                    var nb = player.buffered;
-                    if (nb.length > 0 && nt >= nb.start(0) && nt <= nb.end(nb.length - 1)) {
-                        _rVFCMediaTimeSec = -1;
-                        player.currentTime = nt;
-                        player.playbackRate = 1.0;
-                        _lastHardSeekMs = Date.now();
-                        _reanchorPending = false;
-                        console.log('[cws] re-anchor → seek to t=' + nt.toFixed(3) + ' (Cdisp=' + _cdispBaked + 'ms)');
+                    _reanchorPending = false;
+                    _anchorVideo(player, cafEl, 'cdisp-save');
+                    return;
+                }
+
+                // SELF-HEAL — the defining behaviour. If the cdisp-correct target is NOT inside the
+                // live buffer (track change, seek, fast-forward, rewind, gap, or a stale epoch), OR
+                // the error is wildly beyond any real drift, re-anchor to a playable position and
+                // re-derive the epoch. Works in BOTH directions; never stalls on an out-of-buffer
+                // seek (the old freeze). Rate-limited so it cannot seek-storm.
+                if (!reachable || Math.abs(errorMs) > REANCHOR_MS) {
+                    if (Date.now() - _lastSeekMs > SEEK_COOLDOWN_MS) {
+                        _anchorVideo(player, cafEl, 'self-heal err=' + Math.round(errorMs));
                     } else {
-                        player.playbackRate = 1.0;
-                        console.log('[cws] re-anchor target not in buffer yet, waiting');
+                        player.playbackRate = 1.0;   // hold steady until the cooldown allows a heal
                     }
                     return;
                 }
 
-                // Safety hard-seek for large excursions (startup, track change, big drift),
-                // rate-limited by the cooldown so a persistent error can't seek-storm to <1fps.
-                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS && (Date.now() - _lastHardSeekMs) > SEEK_COOLDOWN_MS) {
-                    var seekTarget = _getVideoTimeSecForAudioMs(audioMs);
-                    var b = player.buffered;
-                    if (b.length > 0 && seekTarget >= b.start(0) && seekTarget <= b.end(b.length - 1)) {
-                        _rVFCMediaTimeSec = -1;
-                        player.currentTime = seekTarget;
-                        player.playbackRate = 1.0;
-                        _lastHardSeekMs = Date.now();
-                        console.log('[cws] Hard seek: error=' + errorMs.toFixed(0) + 'ms → t=' + seekTarget.toFixed(3));
-                        return;
-                    } else {
-                        console.log('[cws] Drift=' + errorMs.toFixed(0) + 'ms but target not in buffer, waiting');
-                    }
+                // Medium drift, target reachable → one clamped in-buffer seek (rate-limited).
+                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS && (Date.now() - _lastSeekMs) > SEEK_COOLDOWN_MS) {
+                    _rVFCMediaTimeSec = -1;
+                    player.currentTime = ideal;
+                    player.playbackRate = 1.0;
+                    _lastSeekMs = Date.now();
+                    console.log('[cws] seek: err=' + errorMs.toFixed(0) + 'ms → t=' + ideal.toFixed(3));
+                    return;
                 }
 
-                var b2 = player.buffered;
-                var bufAheadSec = b2.length > 0 ? (b2.end(b2.length - 1) - player.currentTime) : 0;
+                // Fine alignment → gentle rate trim on the (muted) video only.
+                var bufAheadSec = bufEnd - player.currentTime;
                 var rate;
                 if (Math.abs(errorMs) <= DEAD_BAND_MS) {
                     rate = 1.0;  // within dead band — hold steady, no trim
