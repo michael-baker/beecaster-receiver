@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r9-epochbias';
+        var RECEIVER_VERSION = '2026-06-02-r10-nudgefix';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -745,12 +745,17 @@
             // low). Large excursions (startup, track change, gap) snap via a hard seek.
             var DEAD_BAND_MS = 80;             // hold rate at 1.0 within this band
             var KP = 0.0002;                   // 200 ms error → ~4% trim (then clamped)
-            var HARD_SEEK_THRESHOLD_MS = 400;  // snap (seek) for anything bigger — fast acquisition
+            // Safety-seek threshold is ABOVE MSE seek imprecision (~hundreds of ms) so a seek
+            // can actually drop the error below it — otherwise it re-seeks forever (the <1fps
+            // storm we hit when calibration used a 120ms threshold). Sub-threshold error is
+            // converged by gentle rate-trim, which has no seek/rebuffer cost.
+            var HARD_SEEK_THRESHOLD_MS = 1000;
             var MAX_TRIM = 0.06;               // ±6% when the buffer is healthy
             var MAX_TRIM_SAFE = 0.03;          // ±3% when the buffer is low
             var BUFFER_LOW_SEC = 4;
             var SEEK_COOLDOWN_MS = 2000;       // never seek more than once per 2s (anti seek-storm)
             var _lastHardSeekMs = 0;
+            var _lastEpochForSeek = null;      // detect offset (epoch) changes to snap once
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -762,19 +767,32 @@
                 var videoMs = _getVideoClockMs(player);
                 var errorMs = videoMs - audioMs - _contentLagMs;  // _contentLagMs == 0
 
-                // Hard seek for large excursions (startup, track change, buffer gap), but at most
-                // once per cooldown so a persistent error can't trigger a seek-storm (which would
-                // stutter the video to <1fps). Within the cooldown we fall through to gentle trim.
-                // During calibration, snap aggressively (low threshold, short cooldown) so the
-                // manual nudge shifts the picture promptly instead of crawling via trim.
-                var _seekThresh = _inCalibration ? 120 : HARD_SEEK_THRESHOLD_MS;
-                var _seekCooldown = _inCalibration ? 400 : SEEK_COOLDOWN_MS;
-                if (Math.abs(errorMs) > _seekThresh && (Date.now() - _lastHardSeekMs) > _seekCooldown) {
+                // Snap ONCE whenever the reported offset (epoch) changes — e.g. a manual nudge on
+                // the settings page. This is a discrete event, not a continuous error, so it can't
+                // seek-storm; the gentle rate-trim below then converges the sub-offset residual.
+                // (The epoch poll returns a stable value when nothing is nudged, so no seek fires.)
+                if (_lastEpochForSeek === null) {
+                    _lastEpochForSeek = _epochMs;
+                } else if (Math.abs(_epochMs - _lastEpochForSeek) > 40) {
+                    _lastEpochForSeek = _epochMs;
+                    var nt = _getVideoTimeSecForAudioMs(audioMs);
+                    var nb = player.buffered;
+                    if (nb.length > 0 && nt >= nb.start(0) && nt <= nb.end(nb.length - 1)) {
+                        _rVFCMediaTimeSec = -1;
+                        player.currentTime = nt;
+                        player.playbackRate = 1.0;
+                        _lastHardSeekMs = Date.now();
+                        console.log('[cws] offset changed → snap to t=' + nt.toFixed(3));
+                    }
+                    return;
+                }
+
+                // Safety hard-seek for large excursions (startup, track change, big drift),
+                // rate-limited by the cooldown so a persistent error can't seek-storm to <1fps.
+                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS && (Date.now() - _lastHardSeekMs) > SEEK_COOLDOWN_MS) {
                     var seekTarget = _getVideoTimeSecForAudioMs(audioMs);
                     var b = player.buffered;
                     if (b.length > 0 && seekTarget >= b.start(0) && seekTarget <= b.end(b.length - 1)) {
-                        // Reset rVFC so _getVideoClockMs falls back to player.currentTime until
-                        // the next presented frame; otherwise the stale value re-fires a seek.
                         _rVFCMediaTimeSec = -1;
                         player.currentTime = seekTarget;
                         player.playbackRate = 1.0;
