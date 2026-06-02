@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r10-nudgefix';
+        var RECEIVER_VERSION = '2026-06-02-r11-cdisp-applied-receiver';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -78,6 +78,7 @@
         // PURE content equality (videoContentMs == audioContentMs). Kept at 0 so the legacy
         // "- _contentLagMs" terms are no-ops; the server no longer sends contentLagMs.
         var _contentLagMs = 0;
+        var _cdispMs     = 0;    // device sync offset (Cdisp) from /cast/audio-clock, applied to the audio clock
         var _serverRtt   = 0;    // round-trip time estimate to server
         var _cafPlaying  = false;
         var _videoReady  = false;
@@ -367,8 +368,7 @@
                             _epochMs      = d.epochMs;
                             _epochWallMs  = d.epochWallMs;
                             _videoEpochMs = d.videoEpochMs;
-                            if (typeof d.contentLagMs === 'number' && d.contentLagMs > 0)
-                                _contentLagMs = d.contentLagMs;
+                            _cdispMs      = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                             cb();
                         } else {
                             attempt++;
@@ -671,8 +671,7 @@
                         _epochMs     = d.epochMs;
                         _epochWallMs = d.epochWallMs;
                         if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
-                        if (typeof d.contentLagMs === 'number' && d.contentLagMs > 0)
-                            _contentLagMs = d.contentLagMs;
+                        _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                     }
                     _beginSyncedPlayback(player, cafEl);
                 })
@@ -755,7 +754,7 @@
             var BUFFER_LOW_SEC = 4;
             var SEEK_COOLDOWN_MS = 2000;       // never seek more than once per 2s (anti seek-storm)
             var _lastHardSeekMs = 0;
-            var _lastEpochForSeek = null;      // detect offset (epoch) changes to snap once
+            var _lastCdispForSeek = null;      // detect offset (cdisp) changes to snap once
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -771,10 +770,10 @@
                 // the settings page. This is a discrete event, not a continuous error, so it can't
                 // seek-storm; the gentle rate-trim below then converges the sub-offset residual.
                 // (The epoch poll returns a stable value when nothing is nudged, so no seek fires.)
-                if (_lastEpochForSeek === null) {
-                    _lastEpochForSeek = _epochMs;
-                } else if (Math.abs(_epochMs - _lastEpochForSeek) > 40) {
-                    _lastEpochForSeek = _epochMs;
+                if (_lastCdispForSeek === null) {
+                    _lastCdispForSeek = _cdispMs;
+                } else if (Math.abs(_cdispMs - _lastCdispForSeek) > 40) {
+                    _lastCdispForSeek = _cdispMs;
                     var nt = _getVideoTimeSecForAudioMs(audioMs);
                     var nb = player.buffered;
                     if (nb.length > 0 && nt >= nb.start(0) && nt <= nb.end(nb.length - 1)) {
@@ -845,8 +844,7 @@
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
                             if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
-                            if (typeof d.contentLagMs === 'number' && d.contentLagMs > 0)
-                                _contentLagMs = d.contentLagMs;
+                            _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                             _lastClockInfo = {
                                 audioMs: d.audioMs,
                                 epochMs: d.epochMs,
@@ -1049,10 +1047,13 @@
             return Promise.all(tasks).then(function () { return R; });
         }
 
-        // Compute current audio clock position in ms
-        // audioClockMs = epochMs + cafEl.currentTime * 1000
+        // Compute current audio clock position in ms.
+        // audioClockMs = epochMs + cafEl.currentTime*1000 + cdispMs, where cdispMs is the device
+        // sync offset (applied here, NOT baked into the server epoch, so epochMs stays a clean
+        // >=0 "ready" sentinel even for a large negative offset). Advancing the audio clock by
+        // cdispMs makes the receiver place video cdispMs ahead → the calibrated lead.
         function _getAudioClockMs(cafEl) {
-            return _epochMs + cafEl.currentTime * 1000;
+            return _epochMs + cafEl.currentTime * 1000 + _cdispMs;
         }
 
         // Compute current video clock position in ms in the same absolute media-time
@@ -1136,6 +1137,7 @@
                                 if (d.epochMs >= 0) {
                                     _epochMs = d.epochMs;
                                     if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
+                                    _cdispMs = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                                 }
                                 if (_epochMs < 0) return;
                                 // NOTE: Chromecast decodes video in hardware, so the frame cannot be
@@ -1312,7 +1314,7 @@
             _ms = null; _sb = null;
             _appendQueue = []; _appending = false; _trimming = false;
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
-            _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1;
+            _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1; _cdispMs = 0;
             _videoReady = false; _cafPlaying = false;
             _lastManifestInfo = null; _lastClockInfo = null;
             if (_debugWatchTimer) clearInterval(_debugWatchTimer);
