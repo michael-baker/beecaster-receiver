@@ -1,52 +1,52 @@
 <!DOCTYPE html>
 <!--
-  BeeCaster A/V Sync Companion  (phone, HTTPS / github.io)
-  ============================================================================
-  Measures the TRUE, unambiguous audio/video offset on the Chromecast by
-  reading two ABSOLUTE timecodes that the plugin paints into the calibration
-  streams:
+BeeCaster A/V Sync Companion  (phone, HTTPS / github.io)
+============================================================================
+Measures the TRUE, unambiguous audio/video offset on the Chromecast by
+reading two ABSOLUTE timecodes that the plugin paints into the calibration
+streams:
 
-    * VIDEO timecode  = the on-frame barcode (33-block timecode spec, below) read by
-                        the phone CAMERA.
-    * AUDIO timecode  = an FSK timecode burst read by the phone MICROPHONE.
+* VIDEO timecode  = the on-frame barcode (33-block timecode spec, below) read by
+the phone CAMERA.
+* AUDIO timecode  = an FSK timecode burst read by the phone MICROPHONE.
 
-  Both carry the SAME content-clock ms. A periodic beep can only tell you the
-  fractional-second phase (500ms vs 1500ms vs 30s-out are indistinguishable);
-  an absolute timecode on BOTH senses gives the real offset:
+Both carry the SAME content-clock ms. A periodic beep can only tell you the
+fractional-second phase (500ms vs 1500ms vs 30s-out are indistinguishable);
+an absolute timecode on BOTH senses gives the real offset:
 
-        offset = audioContentMs(heard)  -  videoContentMs(seen)     [at one instant]
+offset = audioContentMs(heard)  -  videoContentMs(seen)     [at one instant]
 
-  >0  => audio is AHEAD of video (you hear content the picture hasn't reached).
-  <0  => audio LAGS video.
+>0  => audio is AHEAD of video (you hear content the picture hasn't reached).
+<0  => audio LAGS video.
 
-  PHASE 1 (this file): measure + DISPLAY the number; user types it into the
-  Settings nudge slider (manual entry). HTTPS phone page cannot POST to the
-  HTTP plugin (mixed content). PHASE 2 adds a self-signed cert on the plugin so
-  the companion can be served same-origin and auto-fill the nudge.
+PHASE 1 (this file): measure + DISPLAY the number; user types it into the
+Settings nudge slider (manual entry). HTTPS phone page cannot POST to the
+HTTP plugin (mixed content). PHASE 2 adds a self-signed cert on the plugin so
+the companion can be served same-origin and auto-fill the nudge.
 
-  SYSTEMATIC BIAS (documented, not a bug): the measurement carries the phone's
-  (cameraPipelineLatency - audioInputLatency). Camera capture/decode usually
-  lags mic input by ~tens-100ms, so the raw reading is biased slightly POSITIVE.
-  A one-time "Phone trim" field (below) lets you subtract a constant; the
-  Settings nudge absorbs the rest. This is still vastly better than a periodic
-  tone because it is ABSOLUTE and unambiguous.
+SYSTEMATIC BIAS (documented, not a bug): the measurement carries the phone's
+(cameraPipelineLatency - audioInputLatency). Camera capture/decode usually
+lags mic input by ~tens-100ms, so the raw reading is biased slightly POSITIVE.
+A one-time "Phone trim" field (below) lets you subtract a constant; the
+Settings nudge absorbs the rest. This is still vastly better than a periodic
+tone because it is ABSOLUTE and unambiguous.
 
-  SELF-TEST: with no plugin running, set mode = "Generator" on a second screen
-  (laptop/tablet); it renders the barcode + plays the FSK from one clock. Point
-  this phone (mode = "Measure") at it: the offset should read ~0 +/- the phone
-  pipeline bias. That validates the whole decode chain before touching the
-  server.
+SELF-TEST: with no plugin running, set mode = "Generator" on a second screen
+(laptop/tablet); it renders the barcode + plays the FSK from one clock. Point
+this phone (mode = "Measure") at it: the offset should read ~0 +/- the phone
+pipeline bias. That validates the whole decode chain before touching the
+server.
 
-  Single file, vanilla JS, no build step. Source of truth lives in the plugin
-  repo at Src\Cast\MB_Chromecast\receiver\companion.html; deploy-to-musicbee.ps1
-  syncs it to ..\beecaster-receiver (github.io).
+Single file, vanilla JS, no build step. Source of truth lives in the plugin
+repo at Src\Cast\MB_Chromecast\receiver\companion.html; deploy-to-musicbee.ps1
+syncs it to ..\beecaster-receiver (github.io).
 -->
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>BeeCaster Sync Companion</title>
-  <style>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+	<title>BeeCaster Sync Companion</title>
+	<style>
     :root {
       --bg: #07021a; --panel: #150b33; --line: rgba(255,255,255,.10);
       --txt: #e7e1f5; --dim: rgba(231,225,245,.55); --accent: #00d4ff;
@@ -119,101 +119,134 @@
   </style>
 </head>
 <body>
-  <h1>BeeCaster Sync Companion</h1>
-  <div class="sub">Reads the on-screen barcode (camera) + audio timecode (mic) to measure the true A/V offset.
-    v1 &middot; <span id="ver"></span></div>
+<h1>BeeCaster Sync Companion</h1>
+<div class="sub">
+	Reads the on-screen barcode (camera) + audio timecode (mic) to measure the true A/V offset.
+	v1 &middot; <span id="ver"></span>
+</div>
 
-  <div class="row">
-    <div class="seg" id="modeSeg">
-      <button data-mode="measure" class="on">Measure</button>
-      <button data-mode="generator">Generator (self-test)</button>
-    </div>
-  </div>
+<div class="row">
+	<div class="seg" id="modeSeg">
+		<button data-mode="measure" class="on">Measure</button>
+		<button data-mode="generator">Generator (self-test)</button>
+	</div>
+</div>
 
-  <!-- ===================== MEASURE MODE ===================== -->
-  <div id="measureUI">
-    <div class="card">
-      <h2>Result</h2>
-      <div><span id="offsetBig">&ndash;&ndash;&ndash;</span><span id="offsetUnit"> ms</span></div>
-      <div id="offsetWord">point the camera at the TV barcode &amp; start the mic</div>
-      <div class="bar" style="margin:9px 0 4px"><i id="lockBar"></i></div>
-      <div class="conf">
-        <span class="pill" id="pVid">video: off</span>
-        <span class="pill" id="pAud">audio: off</span>
-        <span class="pill" id="pConf">confidence: &ndash;</span>
-      </div>
-      <div class="row" style="margin-top:10px">
-        <button class="act primary" id="copyBtn">Copy offset</button>
-        <button class="act" id="resetBtn">Re-measure</button>
-      </div>
-      <div class="hint">Point at the barcode and hold roughly steady &mdash; it locks on its own once the
-        reading is stable. Then type the value into <b>Settings &rarr; Sync nudge</b>. If applying it makes the
-        offset grow instead of shrink, the sign is inverted &mdash; negate it.</div>
-    </div>
+<!-- ===================== MEASURE MODE ===================== -->
+<div id="measureUI">
+	<div class="card">
+		<h2>Result</h2>
+		<div>
+			<span id="offsetBig">&ndash;&ndash;&ndash;</span><span id="offsetUnit"> ms</span>
+		</div>
+		<div id="offsetWord">point the camera at the TV barcode &amp; start the mic</div>
+		<div class="bar" style="margin:9px 0 4px">
+			<i id="lockBar"></i>
+		</div>
+		<div class="conf">
+			<span class="pill" id="pVid">video: off</span>
+			<span class="pill" id="pAud">audio: off</span>
+			<span class="pill" id="pConf">confidence: &ndash;</span>
+		</div>
+		<div class="row" style="margin-top:10px">
+			<button class="act primary" id="copyBtn">Copy offset</button>
+			<button class="act" id="resetBtn">Re-measure</button>
+		</div>
+		<div class="hint">
+			Point at the barcode and hold roughly steady &mdash; it locks on its own once the
+			reading is stable. Then type the value into <b>Settings &rarr; Sync nudge</b>. If applying it makes the
+			offset grow instead of shrink, the sign is inverted &mdash; negate it.
+		</div>
+	</div>
 
-    <div class="card">
-      <h2>Camera &mdash; video timecode (barcode)</h2>
-      <div class="camwrap">
-        <video id="cam" playsinline muted></video>
-        <canvas id="guide"></canvas>
-      </div>
-      <div class="row" style="margin-top:8px">
-        <button class="act primary" id="camBtn">Start camera</button>
-        <button class="act" id="camSwap">Flip cam</button>
-        <label class="fld">scan band
-          <input type="range" id="bandPos" min="2" max="80" value="47">
-        </label>
-      </div>
-      <div class="hint">Aim so the barcode strip (top edge of the cast picture) sits inside the cyan band.
-        Hold steady; fill the frame with the TV.</div>
-    </div>
+	<div class="card">
+		<h2>Camera &mdash; video timecode (barcode)</h2>
+		<div class="camwrap">
+			<video id="cam" playsinline muted></video>
+			<canvas id="guide"></canvas>
+		</div>
+		<div class="row" style="margin-top:8px">
+			<button class="act primary" id="camBtn">Start camera</button>
+			<button class="act" id="camSwap">Flip cam</button>
+			<label class="fld">
+				scan band
+				<input type="range" id="bandPos" min="2" max="80" value="47">
+			</label>
+		</div>
+		<div class="hint">
+			Aim so the barcode strip (top edge of the cast picture) sits inside the cyan band.
+			Hold steady; fill the frame with the TV.
+		</div>
+	</div>
 
-    <div class="card">
-      <h2>Microphone &mdash; audio timecode (FSK)</h2>
-      <div class="row">
-        <button class="act primary" id="micBtn">Start mic</button>
-        <div class="bar" style="flex:1"><i id="syncLed"></i></div>
-      </div>
-      <div class="hint">Turn the TV up. Keep the room quiet. Mic processing (AGC/NS/echo-cancel) is disabled for
-        clean tone detection.</div>
-    </div>
+	<div class="card">
+		<h2>Microphone &mdash; audio timecode (FSK)</h2>
+		<div class="row">
+			<button class="act primary" id="micBtn">Start mic</button>
+			<div class="bar" style="flex:1">
+				<i id="syncLed"></i>
+			</div>
+		</div>
+		<div class="hint">
+			Turn the TV up. Keep the room quiet. Mic processing (AGC/NS/echo-cancel) is disabled for
+			clean tone detection.
+		</div>
+	</div>
 
-    <div class="card">
-      <h2>Live readouts</h2>
-      <div class="grid">
-        <div class="stat"><div class="v" id="rVid">&ndash;</div><div class="l">Video tc (ms)</div></div>
-        <div class="stat"><div class="v" id="rAud">&ndash;</div><div class="l">Audio tc (ms)</div></div>
-        <div class="stat"><div class="v" id="rN">0</div><div class="l">Offset samples</div></div>
-        <div class="stat"><div class="v" id="rSd">&ndash;</div><div class="l">Spread &plusmn;ms</div></div>
-      </div>
-      <label class="fld" style="margin-top:10px">Phone trim (ms)
-        <input type="number" id="trim" value="0" step="5">
-        <span style="font-size:11px">subtracted from result</span>
-      </label>
-    </div>
-  </div>
+	<div class="card">
+		<h2>Live readouts</h2>
+		<div class="grid">
+			<div class="stat">
+				<div class="v" id="rVid">&ndash;</div>
+				<div class="l">Video tc (ms)</div>
+			</div>
+			<div class="stat">
+				<div class="v" id="rAud">&ndash;</div>
+				<div class="l">Audio tc (ms)</div>
+			</div>
+			<div class="stat">
+				<div class="v" id="rN">0</div>
+				<div class="l">Offset samples</div>
+			</div>
+			<div class="stat">
+				<div class="v" id="rSd">&ndash;</div>
+				<div class="l">Spread &plusmn;ms</div>
+			</div>
+		</div>
+		<label class="fld" style="margin-top:10px">
+			Phone trim (ms)
+			<input type="number" id="trim" value="0" step="5">
+			<span style="font-size:11px">subtracted from result</span>
+		</label>
+	</div>
+</div>
 
-  <!-- ===================== GENERATOR MODE ===================== -->
-  <div id="generatorUI" class="hide">
-    <div class="card">
-      <h2>Generator (self-test reference)</h2>
-      <canvas id="genCanvas" width="1056" height="120"></canvas>
-      <div class="row" style="margin-top:10px">
-        <button class="act primary" id="genBtn">Start generator</button>
-        <button class="act" id="genFsBtn">Fullscreen</button>
-        <div class="stat" style="flex:1"><div class="v" id="genMs">&ndash;</div><div class="l">content tc (ms)</div></div>
-      </div>
-      <div class="hint">Renders the barcode and plays the FSK timecode from ONE clock. <b>Start generator</b>,
-        then <b>Fullscreen</b> so it's TV-sized, and point the Measure phone at it &mdash; the offset should
-        read ~0 &plusmn; the phone's camera/mic pipeline bias (that's your Phone-trim value). It's also the
-        exact reference the plugin's server-side FSK emitter matches.</div>
-    </div>
-  </div>
+<!-- ===================== GENERATOR MODE ===================== -->
+<div id="generatorUI" class="hide">
+	<div class="card">
+		<h2>Generator (self-test reference)</h2>
+		<canvas id="genCanvas" width="1056" height="120"></canvas>
+		<div class="row" style="margin-top:10px">
+			<button class="act primary" id="genBtn">Start generator</button>
+			<button class="act" id="genFsBtn">Fullscreen</button>
+			<div class="stat" style="flex:1">
+				<div class="v" id="genMs">&ndash;</div>
+				<div class="l">content tc (ms)</div>
+			</div>
+		</div>
+		<div class="hint">
+			Renders the barcode and plays the FSK timecode from ONE clock. <b>Start generator</b>,
+			then <b>Fullscreen</b> so it's TV-sized, and point the Measure phone at it &mdash; the offset should
+			read ~0 &plusmn; the phone's camera/mic pipeline bias (that's your Phone-trim value). It's also the
+			exact reference the plugin's server-side FSK emitter matches.
+		</div>
+	</div>
+</div>
 
-  <div class="card">
-    <h2>Log <button class="act" id="clrLog" style="float:right;padding:4px 8px;font-size:11px">clear</button></h2>
-    <div id="log"></div>
-  </div>
+<div class="card">
+	<h2>Log <button class="act" id="clrLog" style="float:right;padding:4px 8px;font-size:11px">clear</button></h2>
+	<div id="log"></div>
+</div>
 
 <script>
 'use strict';
