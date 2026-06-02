@@ -36,6 +36,10 @@
     (function () {
         'use strict';
 
+        // Bump on every receiver change so the settings panel can confirm the Chromecast is
+        // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
+        var RECEIVER_VERSION = '2026-06-02-r9-epochbias';
+
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
         var context       = cast.framework.CastReceiverContext.getInstance();
@@ -87,6 +91,7 @@
         var _mkCtx = null;
         var _captureProbeDone = false;  // pixel-capture capability probe runs once
         var _captureProbeResult = null;
+        var _inCalibration = false;     // true while the server reports calibrationMode
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -192,7 +197,8 @@
                 _debugWatchTimer = null;
             },
             player: function () { return document.getElementById('player'); },
-            caf: function () { return document.getElementById('caf-el'); }
+            caf: function () { return document.getElementById('caf-el'); },
+            probe: function () { return _runCaptureProbe(); }
         };
 
         // ── LOAD interceptor ────────────────────────────────────────────────────
@@ -759,7 +765,11 @@
                 // Hard seek for large excursions (startup, track change, buffer gap), but at most
                 // once per cooldown so a persistent error can't trigger a seek-storm (which would
                 // stutter the video to <1fps). Within the cooldown we fall through to gentle trim.
-                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS && (Date.now() - _lastHardSeekMs) > SEEK_COOLDOWN_MS) {
+                // During calibration, snap aggressively (low threshold, short cooldown) so the
+                // manual nudge shifts the picture promptly instead of crawling via trim.
+                var _seekThresh = _inCalibration ? 120 : HARD_SEEK_THRESHOLD_MS;
+                var _seekCooldown = _inCalibration ? 400 : SEEK_COOLDOWN_MS;
+                if (Math.abs(errorMs) > _seekThresh && (Date.now() - _lastHardSeekMs) > _seekCooldown) {
                     var seekTarget = _getVideoTimeSecForAudioMs(audioMs);
                     var b = player.buffered;
                     if (b.length > 0 && seekTarget >= b.start(0) && seekTarget <= b.end(b.length - 1)) {
@@ -800,22 +810,10 @@
             // Start the calibration reporter (clock telemetry while calibrationMode is on).
             _startCalibrationReporter(player, cafEl);
 
-            // One-shot pixel-capture capability probe ~6s into playback (video has content,
-            // no debugger attached). POST the per-technique results so the settings page shows
-            // which read-back method — if any — can actually see the decoded video pixels.
-            setTimeout(function () {
-                if (_captureProbeDone) return; _captureProbeDone = true;
-                try {
-                    _runCaptureProbe().then(function (r) {
-                        _captureProbeResult = r;
-                        console.log('[cws] capture-probe', r);
-                        if (_baseUrl) fetch(_baseUrl + 'cast/calibration/report', {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ captureProbe: r })
-                        }).catch(function () { });
-                    }).catch(function (e) { console.warn('[cws] capture-probe failed', e); });
-                } catch (e) { console.warn('[cws] capture-probe threw', e); }
-            }, 6000);
+            // Pixel-capture probe is NOT auto-run: it proved (on this Chromecast) that no
+            // read-back technique can see hardware-decoded pixels. Left callable for a future
+            // device via window.__cws.probe(); auto-run is disabled so its paused-frame test
+            // doesn't hiccup playback. To re-run on new hardware: __cws.probe() then POST result.
 
             // Periodically refresh epoch from server (handles drift in wall clocks)
             setInterval(function () {
@@ -1109,7 +1107,8 @@
                 fetch(_baseUrl + 'cast/state')
                     .then(function (r) { return r.json(); })
                     .then(function (s) {
-                        if (!s || !s.calibrationMode) return;
+                        _inCalibration = !!(s && s.calibrationMode);
+                        if (!_inCalibration) return;
                         if (!player || !cafEl) return;
                         // Refresh the epoch each cycle so the video tracks the live auto-converge
                         // bias within ~500ms instead of waiting for the 10s refresh.
@@ -1135,6 +1134,7 @@
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({
+                                        rxVersion: RECEIVER_VERSION,
                                         markerFound: false,
                                         markerStatus: 'n/a (Chromecast hw-decoded video is not canvas-readable)',
                                         audioContentMs: Math.round(audioMs),
