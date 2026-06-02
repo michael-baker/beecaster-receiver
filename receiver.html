@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r17-balanced-hold';
+        var RECEIVER_VERSION = '2026-06-02-r18-mse-resilient';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -64,6 +64,11 @@
         var _pollTimer   = null;  // m3u8 poll interval
         var _ms          = null;  // MediaSource for manual MSE
         var _sb          = null;  // SourceBuffer
+        var _mseGen      = 0;     // bumped on every MSE (re)init and _reset(). Async callbacks
+                                  // (sourceopen / init-fetch / SB error / player.onerror) capture the
+                                  // gen and BAIL if superseded — so a re-LOAD (track change / re-cast /
+                                  // calibration) can't have an orphaned old MediaSource crash the new one.
+        var _mseRetryTimer = null;// debounced video-MSE rebuild after a fatal SourceBuffer/element error
         var _appendQueue = [];    // segments waiting to be appended
         var _appending   = false;
         var _trimming    = false;
@@ -424,28 +429,46 @@
             return null;
         }
 
+        // Diagnostic only — must NEVER throw. Reading _sb.buffered/.updating on a SourceBuffer that
+        // has been removed from its (torn-down) MediaSource throws InvalidStateError; that used to
+        // surface as an Uncaught DOMException from the error handlers themselves.
         function _logSbError(tag) {
-            var p = document.getElementById('player');
-            var me = p && p.error ? { code: p.error.code, message: p.error.message } : null;
-            // code 2=NETWORK (mixed-content?), 3=DECODE (codec), 4=SRC_NOT_SUPPORTED (codec)
-            console.error('[cws] ' + tag + ' player.error=' + JSON.stringify(me) +
-                ' msState=' + (_ms && _ms.readyState) +
-                ' sbUpdating=' + (_sb && _sb.updating) +
-                ' buffered=' + (_sb && _sb.buffered.length ? (_sb.buffered.start(0).toFixed(2) + '-' + _sb.buffered.end(_sb.buffered.length - 1).toFixed(2)) : 'empty'));
+            try {
+                var p = document.getElementById('player');
+                var me = p && p.error ? { code: p.error.code, message: p.error.message } : null;
+                // code 2=NETWORK (mixed-content?), 3=DECODE (codec), 4=SRC_NOT_SUPPORTED (codec)
+                var upd = 'n/a', buf = 'n/a';
+                try { upd = String(_sb && _sb.updating); } catch (e1) { upd = 'detached'; }
+                try {
+                    buf = (_sb && _sb.buffered && _sb.buffered.length)
+                        ? (_sb.buffered.start(0).toFixed(2) + '-' + _sb.buffered.end(_sb.buffered.length - 1).toFixed(2))
+                        : 'empty';
+                } catch (e2) { buf = 'detached'; }
+                console.error('[cws] ' + tag + ' player.error=' + JSON.stringify(me) +
+                    ' msState=' + (_ms && _ms.readyState) + ' sbUpdating=' + upd + ' buffered=' + buf);
+            } catch (e) { /* logging must never throw */ }
         }
 
         // Set up MediaSource + SourceBuffer for video-only fMP4. Fetches init first so the
         // SourceBuffer is created with the stream's exact codec.
         function _initVideoMSE(player, baseUrl) {
-            _ms = new MediaSource();
-            player.src = URL.createObjectURL(_ms);
-            player.onerror = function () { _logSbError('video element error.'); };
+            var gen = ++_mseGen;                 // this init owns the pipeline until the next reset/init
+            var ms = new MediaSource();
+            _ms = ms; _sb = null;
+            player.src = URL.createObjectURL(ms);
+            player.onerror = function () {
+                if (gen !== _mseGen) return;     // stale element from a superseded generation
+                _logSbError('video element error.');
+                _scheduleMseReinit(player, baseUrl, gen);
+            };
 
-            _ms.addEventListener('sourceopen', function () {
+            ms.addEventListener('sourceopen', function () {
+                if (gen !== _mseGen || _ms !== ms) return;   // a newer LOAD/reset superseded us
                 console.log('[cws] MediaSource opened');
                 fetch(baseUrl + 'cast/split_video/init.mp4')
                     .then(function (r) { if (!r.ok) throw new Error('init.mp4 HTTP ' + r.status); return r.arrayBuffer(); })
                     .then(function (buf) {
+                        if (gen !== _mseGen || _ms !== ms || ms.readyState !== 'open') return;  // superseded mid-fetch
                         var u8 = new Uint8Array(buf);
                         var codec = _codecFromInit(u8);
                         var fallbacks = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.4d401f"', 'video/mp4; codecs="avc1.42E01E"'];
@@ -454,15 +477,22 @@
                             for (var k = 0; k < fallbacks.length; k++) { if (MediaSource.isTypeSupported(fallbacks[k])) { codec = fallbacks[k]; break; } }
                         }
                         console.log('[cws] MSE codec (from init): ' + codec);
+                        var sb;
                         try {
-                            _sb = _ms.addSourceBuffer(codec);
+                            sb = ms.addSourceBuffer(codec);
                         } catch (e) {
                             console.error('[cws] addSourceBuffer failed:', e, 'codec=' + codec);
+                            _scheduleMseReinit(player, baseUrl, gen);
                             return;
                         }
-                        _sb.mode = 'segments';
-                        _sb.addEventListener('updateend', _drainAppendQueue);
-                        _sb.addEventListener('error', function () { _logSbError('SourceBuffer error.'); });
+                        _sb = sb;
+                        sb.mode = 'segments';
+                        sb.addEventListener('updateend', _drainAppendQueue);
+                        sb.addEventListener('error', function () {
+                            if (gen !== _mseGen) return;
+                            _logSbError('SourceBuffer error.');
+                            _scheduleMseReinit(player, baseUrl, gen);
+                        });
 
                         _queueAppend(u8, function () {
                             _initLoaded = true;
@@ -471,10 +501,31 @@
                         });
                     })
                     .catch(function (e) {
+                        if (gen !== _mseGen) return;
                         console.error('[cws] init.mp4 fetch failed:', e, '— retrying');
-                        setTimeout(function () { _initVideoMSE(player, baseUrl); }, 2000);
+                        _scheduleMseReinit(player, baseUrl, gen);
                     });
             });
+        }
+
+        // Rebuild the video MSE after a fatal SourceBuffer/element error or a failed init — but only
+        // if we're still the current generation (no newer LOAD/reset has taken over) and debounced so
+        // an error can't spin. The audio epoch is preserved; the self-heal re-anchors video on the new
+        // buffer. This is what turns a transient MSE error (a re-LOAD race) from "video dead" into a
+        // ~1 s self-recovery while audio keeps playing.
+        function _scheduleMseReinit(player, baseUrl, gen) {
+            if (gen !== _mseGen || _mseRetryTimer) return;
+            console.warn('[cws] video pipeline error — rebuilding MSE in 1s');
+            _mseRetryTimer = setTimeout(function () {
+                _mseRetryTimer = null;
+                if (gen !== _mseGen) return;             // superseded while waiting
+                try { if (_ms && _ms.readyState === 'open') _ms.endOfStream(); } catch (e) {}
+                _ms = null; _sb = null;
+                _appendQueue = []; _appending = false; _trimming = false;
+                _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0; _videoReady = false;
+                try { player.removeAttribute('src'); player.load(); } catch (e) {}
+                _initVideoMSE(player, baseUrl);
+            }, 1000);
         }
 
         function _loadInitSegment(baseUrl, cb) {
@@ -958,7 +1009,12 @@
                     var bAhead = player.buffered.length > 0
                         ? (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000
                         : 0;
-                    var pllErr = vMs - aMs - _contentLagMs;
+                    // pllErr is the TRUE convergence error = deviation from the target the drift loop
+                    // actually holds (videoContent == audioContent + Cdisp). Subtract _cdispBaked (NOT
+                    // the legacy _contentLagMs=0) so pllErr≈0 means "holding the calibrated offset",
+                    // instead of misleadingly reading ~Cdisp when perfectly converged. The raw A/V
+                    // offset is still derivable as videoTimeMs−audioTimeMs (both reported below).
+                    var pllErr = vMs - aMs - _cdispBaked;
                     var rVFCActive = _rVFCMediaTimeSec >= 0;
                     fetch(_baseUrl + 'cast/sync-report', {
                         method: 'POST',
@@ -968,6 +1024,7 @@
                             videoTimeMs: Math.round(vMs),
                             bufferAheadMs: Math.round(bAhead),
                             pllErrorMs: Math.round(pllErr),
+                            cdispMs: Math.round(_cdispBaked),
                             contentLagMs: _contentLagMs,
                             audioOutputLatencyMs: _audioOutputLatencyMs,
                             rVFCAvailable: typeof player.requestVideoFrameCallback === 'function',
@@ -1126,6 +1183,8 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             _lastSeekMs = 0;
             _audioLastMs = -1; _audioLastWall = 0; _audioHeld = false;
+            _mseGen++;       // invalidate any in-flight MSE init from the previous session
+            if (_mseRetryTimer) { clearTimeout(_mseRetryTimer); _mseRetryTimer = null; }
             if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
             if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
             _ms = null; _sb = null;
