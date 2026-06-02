@@ -377,40 +377,71 @@
             })();
         }
 
-        // Set up MediaSource + SourceBuffer for video-only fMP4
-        function _initVideoMSE(player, baseUrl) {
-            // Determine codec — use baseline that matches what FFmpeg produces
-            var codec = 'video/mp4; codecs="avc1.640029"';
-            if (!MediaSource.isTypeSupported(codec)) {
-                codec = 'video/mp4; codecs="avc1.42E01E"';
+        // Builds the exact RFC6381 codec string from the init segment's avcC box
+        // (configurationVersion, AVCProfileIndication, profile_compatibility, AVCLevelIndication)
+        // so the SourceBuffer codec matches the stream's real profile/level. A hardcoded
+        // avc1.640029 was silently rejected by this device's hardware decoder when the encoder
+        // produced a different level → empty buffer → blank video.
+        function _codecFromInit(u8) {
+            for (var i = 0; i + 8 < u8.length; i++) {
+                if (u8[i] === 0x61 && u8[i + 1] === 0x76 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) { // 'avcC'
+                    var hx = function (b) { return ('0' + b.toString(16)).slice(-2); };
+                    return 'video/mp4; codecs="avc1.' + hx(u8[i + 5]) + hx(u8[i + 6]) + hx(u8[i + 7]) + '"';
+                }
             }
-            console.log('[cws] MSE codec: ' + codec);
+            return null;
+        }
 
+        function _logSbError(tag) {
+            var p = document.getElementById('player');
+            var me = p && p.error ? { code: p.error.code, message: p.error.message } : null;
+            // code 2=NETWORK (mixed-content?), 3=DECODE (codec), 4=SRC_NOT_SUPPORTED (codec)
+            console.error('[cws] ' + tag + ' player.error=' + JSON.stringify(me) +
+                ' msState=' + (_ms && _ms.readyState) +
+                ' sbUpdating=' + (_sb && _sb.updating) +
+                ' buffered=' + (_sb && _sb.buffered.length ? (_sb.buffered.start(0).toFixed(2) + '-' + _sb.buffered.end(_sb.buffered.length - 1).toFixed(2)) : 'empty'));
+        }
+
+        // Set up MediaSource + SourceBuffer for video-only fMP4. Fetches init first so the
+        // SourceBuffer is created with the stream's exact codec.
+        function _initVideoMSE(player, baseUrl) {
             _ms = new MediaSource();
             player.src = URL.createObjectURL(_ms);
+            player.onerror = function () { _logSbError('video element error.'); };
 
             _ms.addEventListener('sourceopen', function () {
                 console.log('[cws] MediaSource opened');
-                try {
-                    _sb = _ms.addSourceBuffer(codec);
-                } catch (e) {
-                    console.error('[cws] addSourceBuffer failed:', e);
-                    return;
-                }
+                fetch(baseUrl + 'cast/split_video/init.mp4')
+                    .then(function (r) { if (!r.ok) throw new Error('init.mp4 HTTP ' + r.status); return r.arrayBuffer(); })
+                    .then(function (buf) {
+                        var u8 = new Uint8Array(buf);
+                        var codec = _codecFromInit(u8);
+                        var fallbacks = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.4d401f"', 'video/mp4; codecs="avc1.42E01E"'];
+                        if (!codec || !MediaSource.isTypeSupported(codec)) {
+                            console.warn('[cws] codec from init (' + codec + ') unsupported; trying fallbacks');
+                            for (var k = 0; k < fallbacks.length; k++) { if (MediaSource.isTypeSupported(fallbacks[k])) { codec = fallbacks[k]; break; } }
+                        }
+                        console.log('[cws] MSE codec (from init): ' + codec);
+                        try {
+                            _sb = _ms.addSourceBuffer(codec);
+                        } catch (e) {
+                            console.error('[cws] addSourceBuffer failed:', e, 'codec=' + codec);
+                            return;
+                        }
+                        _sb.mode = 'segments';
+                        _sb.addEventListener('updateend', _drainAppendQueue);
+                        _sb.addEventListener('error', function () { _logSbError('SourceBuffer error.'); });
 
-                _sb.mode = 'segments';
-                _sb.addEventListener('updateend', _drainAppendQueue);
-                _sb.addEventListener('error', function (e) {
-                    console.error('[cws] SourceBuffer error:', e);
-                });
-
-                // Load init segment, then start polling m3u8
-                _loadInitSegment(baseUrl, function () {
-                    _initLoaded = true;
-                    console.log('[cws] init.mp4 loaded');
-                    _pollManifest(baseUrl);
-                    // Start PLL sync loop once first segment is buffered
-                });
+                        _queueAppend(u8, function () {
+                            _initLoaded = true;
+                            console.log('[cws] init.mp4 appended (' + u8.length + ' bytes)');
+                            _pollManifest(baseUrl);
+                        });
+                    })
+                    .catch(function (e) {
+                        console.error('[cws] init.mp4 fetch failed:', e, '— retrying');
+                        setTimeout(function () { _initVideoMSE(player, baseUrl); }, 2000);
+                    });
             });
         }
 
