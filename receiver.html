@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r16-selfheal';
+        var RECEIVER_VERSION = '2026-06-02-r17-balanced-hold';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -95,15 +95,26 @@
         var _reportTimer = null;     // sync-report POST interval
         var _lastSeekMs  = 0;        // last seek/anchor wall time (anti seek-storm), module-level
 
-        // Self-healing anchor geometry (seconds). The receiver NEVER assumes the video target is
-        // reachable, nor that time only moves forward: whenever the cdisp-correct target falls
-        // outside the live buffer (track change / seek / fast-forward / rewind / gap / stale epoch),
-        // it RE-ANCHORS to a guaranteed-in-buffer position and re-derives the epoch instead of
-        // stalling on an impossible seek. The server firehoses A/V continuously; the receiver just
-        // keeps re-latching onto whatever is actually playable.
-        var SEEK_GUARD_SEC = 0.5;    // keep targets this clear of both buffer edges
-        var HEAL_LEAD_SEC  = 4.0;    // on heal, play this far behind the live edge (≈ audio headroom)
-        var REANCHOR_MS    = 4000;   // |error| beyond this ⇒ treat the anchor as stale and heal
+        // Audio-clock health. The PLL syncs VIDEO to the AUDIO clock, so a frozen audio clock (a CAF
+        // reconnect, a server blip, a buffering stall) must NOT cause video seeking — that just
+        // thrashes against a dead reference (the seek-storm) and, worse, re-derives a garbage epoch
+        // from a frozen audioMs. Instead we HOLD: keep playing at rate 1.0, no seeks, no re-anchor,
+        // until the audio clock advances again — then the normal PLL re-converges on its own
+        // (loss of sync IS recoverable as long as the reference clock is alive).
+        var _audioLastMs   = -1;     // last observed audio-clock ms
+        var _audioLastWall = 0;      // wall ms when the audio clock last advanced
+        var _audioHeld     = false;  // currently holding because audio stalled
+
+        // Sync geometry (seconds / ms). Balance: gentle rate-trim for small drift, ONE clamped
+        // in-buffer seek for medium drift, and a bounded RE-ANCHOR only for a GENUINE discontinuity
+        // (target well outside the buffer — track change / seek / fast-forward) while the audio
+        // clock is healthy. Edge-of-buffer is NOT a discontinuity — it clamps and waits.
+        var SEEK_GUARD_SEC      = 0.5;   // keep targets this clear of both buffer edges
+        var HEAL_LEAD_SEC       = 4.0;   // on re-anchor, play this far behind the live edge
+        var HARD_SEEK_MS        = 1000;  // medium drift → one clamped in-buffer seek
+        var REANCHOR_OUTSIDE_SEC = 1.5;  // re-anchor only if the target is outside the buffer by MORE
+                                         // than this (a real discontinuity, not a buffer-edge nudge)
+        var AUDIO_STALL_MS      = 700;   // audio clock unchanged this long ⇒ HOLD (≈3 sync ticks)
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -799,15 +810,10 @@
             // low). Large excursions (startup, track change, gap) snap via a hard seek.
             var DEAD_BAND_MS = 80;             // hold rate at 1.0 within this band
             var KP = 0.0002;                   // 200 ms error → ~4% trim (then clamped)
-            // Safety-seek threshold is ABOVE MSE seek imprecision (~hundreds of ms) so a seek
-            // can actually drop the error below it — otherwise it re-seeks forever (the <1fps
-            // storm we hit when calibration used a 120ms threshold). Sub-threshold error is
-            // converged by gentle rate-trim, which has no seek/rebuffer cost.
-            var HARD_SEEK_THRESHOLD_MS = 1000;
             var MAX_TRIM = 0.06;               // ±6% when the buffer is healthy
             var MAX_TRIM_SAFE = 0.03;          // ±3% when the buffer is low
             var BUFFER_LOW_SEC = 4;
-            var SEEK_COOLDOWN_MS = 2000;       // never seek more than once per 2s (anti seek-storm)
+            var SEEK_COOLDOWN_MS = 2000;       // never seek/re-anchor more than once per 2s
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -815,7 +821,25 @@
                 if (!_cafPlaying) return;
                 if (player.paused || player.readyState < 2) return;
 
+                var nowWall = Date.now();
                 var audioMs = _getAudioClockMs(cafEl);
+
+                // ── Audio-clock health gate ─────────────────────────────────────────────
+                // The PLL syncs video TO the audio clock. If that clock is frozen, seeking video is
+                // futile and harmful (it thrashes, and re-anchoring would bake a garbage epoch from a
+                // dead clock — the seek-storm + runaway videoEpochMs we hit). So HOLD: keep playing at
+                // 1× (which tracks the segment-arrival rate, keeping the buffer bounded) and stop
+                // chasing until the clock advances. When it resumes, the logic below re-converges.
+                if (_audioLastMs < 0 || audioMs > _audioLastMs + 1) {
+                    _audioLastMs = audioMs;
+                    _audioLastWall = nowWall;
+                    if (_audioHeld) { _audioHeld = false; console.log('[cws] audio clock resumed at ' + (audioMs / 1000).toFixed(2) + 's — resuming sync'); }
+                } else if (nowWall - _audioLastWall > AUDIO_STALL_MS) {
+                    player.playbackRate = 1.0;
+                    if (!_audioHeld) { _audioHeld = true; console.log('[cws] HOLD: audio clock stalled — pausing sync until it resumes'); }
+                    return;
+                }
+
                 var videoMs = _getVideoClockMs(player);
                 var errorMs = videoMs - audioMs - _cdispBaked;  // target: videoContent == audioContent + Cdisp
 
@@ -823,7 +847,7 @@
                 if (!buf || buf.length === 0) return;
                 var bufStart = buf.start(0), bufEnd = buf.end(buf.length - 1);
                 var ideal = _getVideoTimeSecForAudioMs(audioMs);
-                var reachable = (ideal >= bufStart + SEEK_GUARD_SEC && ideal <= bufEnd - SEEK_GUARD_SEC);
+                var canSeek = (nowWall - _lastSeekMs) > SEEK_COOLDOWN_MS;
 
                 // A "Save" (reanchorSeq bump) re-bakes Cdisp → one clean anchor that honors it.
                 if (_reanchorPending) {
@@ -832,27 +856,28 @@
                     return;
                 }
 
-                // SELF-HEAL — the defining behaviour. If the cdisp-correct target is NOT inside the
-                // live buffer (track change, seek, fast-forward, rewind, gap, or a stale epoch), OR
-                // the error is wildly beyond any real drift, re-anchor to a playable position and
-                // re-derive the epoch. Works in BOTH directions; never stalls on an out-of-buffer
-                // seek (the old freeze). Rate-limited so it cannot seek-storm.
-                if (!reachable || Math.abs(errorMs) > REANCHOR_MS) {
-                    if (Date.now() - _lastSeekMs > SEEK_COOLDOWN_MS) {
-                        _anchorVideo(player, cafEl, 'self-heal err=' + Math.round(errorMs));
-                    } else {
-                        player.playbackRate = 1.0;   // hold steady until the cooldown allows a heal
-                    }
+                // RE-ANCHOR only for a GENUINE discontinuity: the target sits outside the live buffer
+                // by a real margin (track change / seek / fast-forward / long gap). The audio clock is
+                // healthy here (gated above), so the re-derived epoch is sound. Edge-of-buffer is NOT a
+                // discontinuity — it falls through to the clamped seek and converges normally.
+                var outsideBy = (ideal < bufStart) ? (bufStart - ideal)
+                              : (ideal > bufEnd)   ? (ideal - bufEnd) : 0;
+                if (outsideBy > REANCHOR_OUTSIDE_SEC && canSeek) {
+                    _anchorVideo(player, cafEl, 'reanchor (off ' + outsideBy.toFixed(1) + 's, err=' + Math.round(errorMs) + ')');
                     return;
                 }
 
-                // Medium drift, target reachable → one clamped in-buffer seek (rate-limited).
-                if (Math.abs(errorMs) > HARD_SEEK_THRESHOLD_MS && (Date.now() - _lastSeekMs) > SEEK_COOLDOWN_MS) {
+                // Medium drift → ONE clamped in-buffer seek (the proven recovery). Clamping keeps the
+                // target inside the buffer, so a near-edge target seeks to the edge instead of failing.
+                if (Math.abs(errorMs) > HARD_SEEK_MS && canSeek) {
+                    var target = ideal;
+                    if (target < bufStart + SEEK_GUARD_SEC) target = bufStart + SEEK_GUARD_SEC;
+                    if (target > bufEnd - SEEK_GUARD_SEC)   target = bufEnd - SEEK_GUARD_SEC;
                     _rVFCMediaTimeSec = -1;
-                    player.currentTime = ideal;
+                    player.currentTime = target;
                     player.playbackRate = 1.0;
-                    _lastSeekMs = Date.now();
-                    console.log('[cws] seek: err=' + errorMs.toFixed(0) + 'ms → t=' + ideal.toFixed(3));
+                    _lastSeekMs = nowWall;
+                    console.log('[cws] seek: err=' + errorMs.toFixed(0) + 'ms → t=' + target.toFixed(3));
                     return;
                 }
 
@@ -1100,6 +1125,7 @@
             if (_epochPollTimer) { clearInterval(_epochPollTimer); _epochPollTimer = null; }
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             _lastSeekMs = 0;
+            _audioLastMs = -1; _audioLastWall = 0; _audioHeld = false;
             if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
             if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
             _ms = null; _sb = null;
