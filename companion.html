@@ -94,6 +94,8 @@
     video { width: 100%; height: 100%; object-fit: cover; display: block; }
     #guide { position: absolute; inset: 0; pointer-events: none; }
     #genCanvas { width: 100%; background:#000; display:block; border-radius: 10px; image-rendering: pixelated; }
+    #genCanvas:fullscreen { width: 100vw; height: 100vh; object-fit: contain; border-radius: 0; background:#000; }
+    #genCanvas:-webkit-full-screen { width: 100vw; height: 100vh; object-fit: contain; border-radius: 0; background:#000; }
 
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .stat { background: rgba(255,255,255,.03); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
@@ -130,7 +132,8 @@
     <div class="card">
       <h2>Result</h2>
       <div><span id="offsetBig">&ndash;&ndash;&ndash;</span><span id="offsetUnit"> ms</span></div>
-      <div id="offsetWord">point camera at the TV barcode &amp; start the mic</div>
+      <div id="offsetWord">point the camera at the TV barcode &amp; start the mic</div>
+      <div class="bar" style="margin:9px 0 4px"><i id="lockBar"></i></div>
       <div class="conf">
         <span class="pill" id="pVid">video: off</span>
         <span class="pill" id="pAud">audio: off</span>
@@ -138,10 +141,11 @@
       </div>
       <div class="row" style="margin-top:10px">
         <button class="act primary" id="copyBtn">Copy offset</button>
-        <button class="act" id="resetBtn">Reset samples</button>
+        <button class="act" id="resetBtn">Re-measure</button>
       </div>
-      <div class="hint">Type the copied value into <b>Settings &rarr; Sync nudge</b> on the plugin. Sign check:
-        a known-good device read about <b>&minus;1200&nbsp;ms</b>; if your sign looks inverted, negate it.</div>
+      <div class="hint">Point at the barcode and hold roughly steady &mdash; it locks on its own once the
+        reading is stable. Then type the value into <b>Settings &rarr; Sync nudge</b>. Sign check: a known-good
+        device read about <b>&minus;1200&nbsp;ms</b>; if your sign looks inverted, negate it.</div>
     </div>
 
     <div class="card">
@@ -193,11 +197,13 @@
       <canvas id="genCanvas" width="1056" height="120"></canvas>
       <div class="row" style="margin-top:10px">
         <button class="act primary" id="genBtn">Start generator</button>
+        <button class="act" id="genFsBtn">Fullscreen</button>
         <div class="stat" style="flex:1"><div class="v" id="genMs">&ndash;</div><div class="l">content tc (ms)</div></div>
       </div>
-      <div class="hint">Renders the barcode and plays the FSK timecode from ONE clock. Open this on a second
-        screen and point the Measure phone at it &mdash; the offset should read ~0 &plusmn; the phone's
-        camera/mic pipeline bias. This is also the exact reference the plugin's server-side FSK emitter must match.</div>
+      <div class="hint">Renders the barcode and plays the FSK timecode from ONE clock. <b>Start generator</b>,
+        then <b>Fullscreen</b> so it's TV-sized, and point the Measure phone at it &mdash; the offset should
+        read ~0 &plusmn; the phone's camera/mic pipeline bias (that's your Phone-trim value). It's also the
+        exact reference the plugin's server-side FSK emitter matches.</div>
     </div>
   </div>
 
@@ -224,7 +230,7 @@
    16-bit value disambiguates any |offset| < 32768 ms. Frequencies sit in the
    2-3 kHz band (robust through TV speakers + phone mics; clear of rumble and
    HF rolloff). ============================================================== */
-var VERSION = '2026-06-02-companion-v2-audioclock';
+var VERSION = '2026-06-02-companion-v3-robust-lock';
 var PROTO = {
   SYNC_FREQ: 800,
   DATA_FREQS: [1500, 1900, 2300, 2700],   // index 0..3 = 2-bit symbol value
@@ -276,53 +282,65 @@ function symbolsToValue(syms){
    Both timecodes advance ~1 ms / ms so the interpolation is a straight line.
    =========================================================================== */
 var EST = {
-  vid: [],          // {t, v}
-  aud: [],          // {t, v}
-  offs: [],         // recent signed offset samples (ms)
-  MAXVID: 240,      // ~8s @30fps
-  WINDOW: 16,       // offset samples to median over
-  lastVidMs: -1, lastVidT: 0,
-  lastAudMs: -1, lastAudT: 0,
+  vid: [],            // {t, v}  v = 24-bit video ms (barcode)
+  aud: [],            // {t, v}  v = 16-bit audio ms (FSK)
+  MAX_AGE_MS: 30000,  // the offset is CONSTANT, so accumulate over the last 30s
+  MAX_N: 1200,
+  lastVidMs: -1, lastAudMs: -1,
 
-  pushVideo: function(phoneMs, v){
-    this.lastVidMs=v; this.lastVidT=phoneMs;
-    this.vid.push({t:phoneMs, v:v});
-    if (this.vid.length>this.MAXVID) this.vid.shift();
+  pushVideo: function(phoneMs, v){ this.lastVidMs=v; this.vid.push({t:phoneMs, v:v}); this._trim(this.vid, phoneMs); },
+  pushAudio: function(phoneMs, v){ this.lastAudMs=v; this.aud.push({t:phoneMs, v:v}); this._trim(this.aud, phoneMs); },
+  _trim: function(arr, now){
+    while (arr.length && (now - arr[0].t > this.MAX_AGE_MS || arr.length > this.MAX_N)) arr.shift();
   },
-  interpVideo: function(phoneMs){
-    var a=this.vid; if (a.length<2) return null;
-    // find bracketing samples
-    var lo=null, hi=null;
-    for (var i=a.length-1;i>=0;i--){
-      if (a[i].t<=phoneMs){ lo=a[i]; hi=a[i+1]||a[i]; break; }
+
+  // Project every sample of a stream to time Tref using its constant 1 ms/ms rate, reduce to the
+  // 16-bit domain, and return a robust centre (median) + MAD. DECOUPLED: video and audio need NOT
+  // be sampled at the same instants, so sparse/wobbly video still yields a stable centre, and
+  // misdecodes are rejected as outliers by the median.
+  _project: function(arr, Tref){
+    var n=arr.length; if (n<1) return null;
+    // anchor to the most recent sample to sidestep the 16-bit wrap, then median the deviations
+    var ref = (((arr[n-1].v + (Tref - arr[n-1].t)) % 65536) + 65536) % 65536;
+    var dev = new Array(n);
+    for (var i=0;i<n;i++){
+      var p = (((arr[i].v + (Tref - arr[i].t)) % 65536) + 65536) % 65536;
+      dev[i] = wrapSigned(p - ref, 16);
     }
-    if (!lo){ lo=a[0]; hi=a[1]; }
-    if (Math.abs(phoneMs-lo.t) > 1200) return null;       // too stale to trust
-    if (hi.t===lo.t) return lo.v;
-    var f=(phoneMs-lo.t)/(hi.t-lo.t);
-    // unwrap the 24-bit video value across the bracket before interpolating
-    var dv = wrapSigned(hi.v - lo.v, 24);
-    return lo.v + dv*f;
+    var s = dev.slice().sort(function(a,b){ return a-b; });
+    var med = s[s.length>>1];
+    var ad = dev.map(function(d){ return Math.abs(d-med); }).sort(function(a,b){ return a-b; });
+    var mad = ad[ad.length>>1];
+    return { center: ((((ref + med) % 65536) + 65536) % 65536), mad: mad, n: n };
   },
-  pushAudio: function(phoneMs, v16){
-    this.lastAudMs=v16; this.lastAudT=phoneMs;
-    this.aud.push({t:phoneMs, v:v16});
-    if (this.aud.length>64) this.aud.shift();
-    var vi = this.interpVideo(phoneMs);
-    if (vi===null) return;
-    var off = wrapSigned(v16 - (vi & 0xFFFF), 16);          // signed 16-bit ms
-    this.offs.push(off);
-    if (this.offs.length>this.WINDOW) this.offs.shift();
+
+  // 16-bit video centre projected to phone-time t — used to gate live decodes against the running
+  // estimate (so a good isolated read during a wobble still counts). Null until enough samples.
+  predictVideo: function(t){
+    if (this.vid.length < 4) return null;
+    var p = this._project(this.vid, t);
+    return p ? p.center : null;
   },
+
+  spanMs: function(){
+    var v=this.vid, a=this.aud;
+    var t0 = Math.min(v.length?v[0].t:Infinity, a.length?a[0].t:Infinity);
+    var t1 = Math.max(v.length?v[v.length-1].t:-Infinity, a.length?a[a.length-1].t:-Infinity);
+    return (isFinite(t0) && isFinite(t1)) ? (t1 - t0) : 0;
+  },
+
   result: function(){
-    if (this.offs.length<3) return null;
-    var med = median(this.offs);
-    // robust spread = median abs deviation -> ~stddev
-    var devs = this.offs.map(function(o){ return Math.abs(o-med); });
-    var mad = median(devs);
-    return { offset: Math.round(med), spread: Math.round(mad*1.4826), n: this.offs.length };
+    if (this.vid.length < 3 || this.aud.length < 3) return null;
+    var Tref = performance.now();
+    var V = this._project(this.vid, Tref), A = this._project(this.aud, Tref);
+    if (!V || !A) return null;
+    var offset = wrapSigned(A.center - V.center, 16);
+    // spread = robust ~stddev of the noisier stream (what limits confidence)
+    var spread = Math.round(Math.max(V.mad, A.mad) * 1.4826);
+    return { offset: Math.round(offset), spread: spread, n: Math.min(V.n, A.n),
+             vN: V.n, aN: A.n, spanMs: this.spanMs() };
   },
-  reset: function(){ this.vid=[]; this.aud=[]; this.offs=[]; this.lastVidMs=-1; this.lastAudMs=-1; }
+  reset: function(){ this.vid=[]; this.aud=[]; this.lastVidMs=-1; this.lastAudMs=-1; }
 };
 // wrap a difference into signed range of `bits` (handles timecode wrap)
 function wrapSigned(d, bits){ var m=1<<bits; d=((d%m)+m)%m; if (d >= m/2) d-=m; return d; }
@@ -337,7 +355,8 @@ var CAM = {
   WORKW:480,                           // downscaled working width
   pushSample:null,                     // set by app
   onStatus:null,
-  _lastRaw:null,                       // last raw decode {ms,t} for the temporal-agreement gate
+  _lastRaw:null,                       // last raw decode {ms,t} for the bootstrap agreement gate
+  _lastGoodCy:-1,                      // row where the barcode last decoded (searched first each frame)
 
   start: async function(){
     try {
@@ -355,68 +374,80 @@ var CAM = {
 
   _loop: function(){
     var self=this, v=$('cam');
-    function frame(_, meta){
+    function frame(nowTs, meta){
       if (!self.running) return;
-      try { self._decodeFrame(v, meta ? meta.mediaTime*1000 : null); } catch(e){}
+      // Timestamp the frame from rVFC capture/display time when available — much less jitter than
+      // performance.now() AFTER our drawImage+decode. All in the performance.now() timebase, so it
+      // matches the audio sample timestamps.
+      var ts = (meta && meta.captureTime) || (meta && meta.expectedDisplayTime) || nowTs || performance.now();
+      try { self._decodeFrame(v, ts); } catch(e){}
       if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(frame);
-      else requestAnimationFrame(function(){ frame(); });
+      else requestAnimationFrame(function(){ frame(performance.now()); });
     }
     if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(frame);
-    else requestAnimationFrame(function(){ frame(); });
+    else requestAnimationFrame(function(){ frame(performance.now()); });
   },
 
-  _decodeFrame: function(v, _mediaMs){
+  _decodeFrame: function(v, frameTs){
     var vw=v.videoWidth, vh=v.videoHeight; if(!vw) return;
     var W=this.WORKW, H=Math.round(W*vh/vw);
     if (this.work.width!==W){ this.work.width=W; this.work.height=H; }
     var g=this.wctx;
     g.drawImage(v, 0, 0, W, H);
-    var phoneMs = performance.now();          // camera-decode timestamp (carries camera pipeline latency)
+    var img = g.getImageData(0, 0, W, H).data;   // one read per frame; rows sampled from this
+    var phoneMs = (typeof frameTs === 'number' && frameTs > 0) ? frameTs : performance.now();
 
-    // Search a vertical band of rows for a valid marker. The barcode is a tall strip;
-    // we sweep row centres across a generous band around the user-chosen position so it
-    // locks on even with loose aim.
-    var bandCenter = Math.round(this.bandFrac*H);
-    var found = null, status='no-marker';
-    for (var dy=-Math.round(H*0.12); dy<=Math.round(H*0.12) && !found; dy+=3){
-      var cy = clamp(bandCenter+dy, 2, H-3);
-      var row = this._readRow(g, W, cy);
-      var dec = this._decodeRow(row, W);
-      if (dec.ms>=0){ found=dec; status='ok'; this._drawGuide(cy, dec.x0, dec.x1, true); }
+    // FULL-FRAME search (no aiming): try near the last good lock first (cheap when steady), then
+    // sweep the whole frame height so wobble moving the barcode anywhere still locks. Early-out.
+    if (this._lastGoodCy < 0) this._lastGoodCy = Math.round(this.bandFrac*H);
+    var seen={}, rows=[];
+    var addRow = function(cy){ cy=clamp(cy,2,H-3); if(!seen[cy]){ seen[cy]=1; rows.push(cy); } };
+    var near=Math.round(H*0.10);
+    for (var d1=0; d1<=near; d1+=3){ addRow(this._lastGoodCy-d1); addRow(this._lastGoodCy+d1); }
+    for (var cy2=2; cy2<H-3; cy2+=7) addRow(cy2);
+    var found=null, foundCy=-1, status='no-marker';
+    for (var r=0; r<rows.length && !found; r++){
+      var dec=this._decodeRow(this._readRow(img, W, H, rows[r]), W);
+      if (dec.ms>=0){ found=dec; foundCy=rows[r]; status='ok'; }
       else if (dec.why) status=dec.why;
     }
-    if (!found) this._drawGuide(bandCenter, 0, 0, false);
 
     if (found){
+      this._lastGoodCy = foundCy;
+      this._drawGuide(foundCy, found.x0, found.x1, true);
       $('rVid').textContent = found.ms;
-      // Temporal gate: only trust a decode when two consecutive frames agree on an
-      // advancing timecode. An isolated false-positive won't repeat consistently, so
-      // it never reaches the estimator (which medians over a window anyway).
+      // Accept if the read agrees with the running video estimate — this lets a good ISOLATED read
+      // during a wobble count (no need for two consecutive frames). Bootstrap (before an estimate
+      // exists) falls back to two-frame agreement. Misdecodes disagree and are rejected.
       var accept=false;
-      if (this._lastRaw && (phoneMs - this._lastRaw.t) < 600){
-        var d=wrapSigned(found.ms - this._lastRaw.ms, 24);
-        if (d > -150 && d < 700) accept=true;
+      var pred = EST.predictVideo(phoneMs);
+      if (pred !== null){
+        if (Math.abs(wrapSigned((found.ms & 0xFFFF) - pred, 16)) < 250) accept=true;
+      } else if (this._lastRaw && (phoneMs - this._lastRaw.t) < 800){
+        var dd=wrapSigned(found.ms - this._lastRaw.ms, 24);
+        if (dd > -200 && dd < 900) accept=true;
       }
       this._lastRaw = { ms:found.ms, t:phoneMs };
       if (accept && this.pushSample) this.pushSample(phoneMs, found.ms);
+    } else {
+      this._drawGuide(this._lastGoodCy, 0, 0, false);
     }
     if (this.onStatus) this.onStatus(found ? 'ok' : status);
   },
 
-  // Average a taller strip of rows around cy -> 1-D luma profile across width. A taller strip
-  // (the barcode is now ~160px on screen) averages out camera noise/blur and locks more reliably.
-  _readRow: function(g, W, cy){
-    var H = g.canvas.height;
+  // Average a tall strip of rows around cy from the shared full-frame buffer -> 1-D luma profile.
+  // A tall strip averages out camera noise/blur and locks more reliably; reading from the shared
+  // buffer avoids a getImageData call per candidate row.
+  _readRow: function(img, W, H, cy){
     var ROWS = 11, half = ROWS >> 1;
     var y0 = cy - half;
     if (y0 < 0) y0 = 0;
     if (y0 + ROWS > H) y0 = H - ROWS;
     if (y0 < 0) { y0 = 0; ROWS = H; }
-    var img = g.getImageData(0, y0, W, ROWS).data;
     var prof = new Float32Array(W);
     for (var x=0;x<W;x++){
       var s=0;
-      for (var r=0;r<ROWS;r++){ var i=(r*W+x)*4; s += 0.299*img[i]+0.587*img[i+1]+0.114*img[i+2]; }
+      for (var r=0;r<ROWS;r++){ var i=((y0+r)*W+x)*4; s += 0.299*img[i]+0.587*img[i+1]+0.114*img[i+2]; }
       prof[x]=s/ROWS;
     }
     return prof;
@@ -807,16 +838,41 @@ function drawBarcode(g, W, H, msFull){
    =========================================================================== */
 (function(){
   var trim=0;
+  // Lock criteria: once the estimate is stable over enough samples spread across enough time,
+  // freeze it so the user can lower the phone and read a steady number instead of a live jitter.
+  var locked=false, lockedVal=null;
+  var LOCK_SPREAD=45, LOCK_N=12, LOCK_SPAN=8000;
+  function word(ms){ return ms>0 ? 'audio AHEAD of video' : (ms<0 ? 'audio LAGS video' : 'in sync'); }
+  function setBar(frac, green){
+    var b=$('lockBar'); if(!b) return;
+    b.style.width=Math.round(clamp(frac,0,1)*100)+'%';
+    b.style.background = green ? 'var(--good)' : 'var(--accent)';
+  }
   function refreshResult(){
     var r=EST.result();
-    if (!r){ $('pConf').textContent='confidence: -'; $('pConf').className='pill'; return; }
-    var shown = r.offset - trim;
-    $('offsetBig').textContent = (shown>0?'+':'') + shown;
-    $('offsetWord').textContent = shown>0 ? 'audio is AHEAD of video' : (shown<0 ? 'audio LAGS video' : 'in sync');
-    $('rN').textContent=r.n; $('rSd').textContent=r.spread;
+    if (!r){ $('pConf').textContent='confidence: -'; $('pConf').className='pill'; setBar(0,false); return; }
+    $('rN').textContent=r.vN+'+'+r.aN; $('rSd').textContent=r.spread;
     var good = r.spread<=25 && r.n>=8, mid = r.spread<=60;
     $('pConf').textContent='confidence: '+(good?'high':(mid?'medium':'low'))+' (±'+r.spread+')';
     $('pConf').className='pill '+(good?'ok':(mid?'mid':'no'));
+
+    if (!locked && r.spread<=LOCK_SPREAD && r.n>=LOCK_N && r.spanMs>=LOCK_SPAN){
+      locked=true; lockedVal=r.offset;
+      log('[lock] offset='+lockedVal+'ms  spread=±'+r.spread+'  n='+r.n);
+    }
+    if (locked){
+      var shown=lockedVal - trim;
+      $('offsetBig').textContent=(shown>0?'+':'')+shown;
+      $('offsetBig').style.color='var(--good)';
+      $('offsetWord').textContent='LOCKED ✓ — '+word(shown)+' — type this into the nudge';
+      setBar(1,true);
+    } else {
+      var sh=r.offset - trim;
+      $('offsetBig').textContent=(sh>0?'+':'')+sh;
+      $('offsetBig').style.color='var(--dim)';                     // grey = not committed yet
+      $('offsetWord').textContent='measuring… hold roughly steady on the barcode';
+      setBar(Math.min(r.n/LOCK_N, r.spanMs/LOCK_SPAN) * (r.spread<=LOCK_SPREAD?1:0.5), false);
+    }
   }
 
   var _vidN=0, _audN=0;                 // cumulative accepted-sample counters (for the diagnostic)
@@ -832,13 +888,12 @@ function drawBarcode(g, W, H, msFull){
   setInterval(function(){
     if (!CAM.running && !MIC.running) return;
     var dv=_vidN-_dbgPrevVid, da=_audN-_dbgPrevAud; _dbgPrevVid=_vidN; _dbgPrevAud=_audN;
-    var o=EST.offs;
-    var mn=Infinity, mx=-Infinity; for (var i=0;i<o.length;i++){ if(o[i]<mn)mn=o[i]; if(o[i]>mx)mx=o[i]; }
-    log('[dbg] vid '+(dv/3).toFixed(1)+'/s aud '+(da/3).toFixed(1)+'/s  offs n='+o.length+
-        ' range['+(o.length?Math.round(mn):'-')+'..'+(o.length?Math.round(mx):'-')+']');
+    var r=EST.result();
+    log('[dbg] vid '+(dv/3).toFixed(1)+'/s aud '+(da/3).toFixed(1)+'/s  vN='+EST.vid.length+' aN='+EST.aud.length+
+        (r ? ('  off='+r.offset+' spread=±'+r.spread+' span='+(r.spanMs/1000).toFixed(0)+'s'+(locked?' LOCKED':'')) : '  (waiting)'));
   }, 3000);
-  window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, offs:EST.offs.slice(),
-    lastVid:EST.lastVidMs, lastAud:EST.lastAudMs, result:EST.result() }; };
+  window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, vid:EST.vid.length, aud:EST.aud.length,
+    lastVid:EST.lastVidMs, lastAud:EST.lastAudMs, locked:locked, lockedVal:lockedVal, result:EST.result() }; };
 
   // mode switch
   $('modeSeg').addEventListener('click', function(e){
@@ -869,18 +924,29 @@ function drawBarcode(g, W, H, msFull){
   // result actions
   $('trim').addEventListener('input', function(){ trim=parseInt(this.value,10)||0; refreshResult(); });
   $('copyBtn').addEventListener('click', function(){
-    var r=EST.result(); if(!r){ log('[copy] no result yet'); return; }
-    var val=String(r.offset-trim);
+    var val;
+    if (locked && lockedVal!==null) val=String(lockedVal - trim);
+    else { var r=EST.result(); if(!r){ log('[copy] no result yet'); return; } val=String(r.offset - trim); }
     if (navigator.clipboard) navigator.clipboard.writeText(val).then(function(){ log('[copy] '+val+' ms -> clipboard'); },
       function(){ log('[copy] failed; value = '+val); });
     else log('[copy] value = '+val);
   });
-  $('resetBtn').addEventListener('click', function(){ EST.reset(); refreshResult(); $('rN').textContent='0'; $('rSd').textContent='-'; log('[est] reset'); });
+  $('resetBtn').addEventListener('click', function(){
+    EST.reset(); locked=false; lockedVal=null; CAM._lastGoodCy=-1; CAM._lastRaw=null;
+    $('offsetBig').textContent='–––'; $('offsetBig').style.color=''; $('offsetWord').textContent='measuring…';
+    $('rN').textContent='0'; $('rSd').textContent='-'; setBar(0,false); log('[est] re-measure');
+  });
 
   // generator
   $('genBtn').addEventListener('click', function(){
     if (GEN.running){ GEN.stop(); this.textContent='Start generator'; }
     else { GEN.start(); this.textContent='Stop generator'; }
+  });
+  $('genFsBtn').addEventListener('click', function(){
+    if (!GEN.running) GEN.start(), ($('genBtn').textContent='Stop generator');
+    var cv=$('genCanvas');
+    var req=cv.requestFullscreen||cv.webkitRequestFullscreen||cv.mozRequestFullScreen||cv.msRequestFullscreen;
+    if (req) req.call(cv); else log('[gen] fullscreen not supported');
   });
 
   $('clrLog').addEventListener('click', function(){ $('log').textContent=''; });
