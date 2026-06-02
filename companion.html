@@ -224,7 +224,7 @@
    16-bit value disambiguates any |offset| < 32768 ms. Frequencies sit in the
    2-3 kHz band (robust through TV speakers + phone mics; clear of rumble and
    HF rolloff). ============================================================== */
-var VERSION = '2026-06-02-companion-v1';
+var VERSION = '2026-06-02-companion-v2-audioclock';
 var PROTO = {
   SYNC_FREQ: 800,
   DATA_FREQS: [1500, 1900, 2300, 2700],   // index 0..3 = 2-bit symbol value
@@ -587,7 +587,6 @@ var MIC = {
   },
 
   _onAudio: function(input){
-    if (!this.processedInit){ this.t0perf=performance.now(); this.t0sample=0; this.processedInit=true; }
     var n=input.length;
     // append, trimming the front when near capacity
     if (this.bufLen + n > this.CAP){
@@ -596,6 +595,15 @@ var MIC = {
       this.bufLen -= drop; this.bufBase += drop;
     }
     this.buf.set(input, this.bufLen); this.bufLen += n;
+    // Re-anchor the sample->time mapping EVERY callback: the newest received sample corresponds
+    // to ~now. A one-time anchor + cumulative sample count drifts badly on Android, where the
+    // ScriptProcessor drops/stalls buffers under main-thread load — each drop makes the audio
+    // clock fall progressively behind real time (shows up as audio "lagging" by a growing amount).
+    // Re-anchoring pins it to wall time so drops can't accumulate. (newest sample is ~one buffer +
+    // input-latency old, a small constant folded into the bias.)
+    this.t0sample = this.bufBase + this.bufLen;
+    this.t0perf = performance.now();
+    this.processedInit = true;
     this._process();
   },
 
@@ -811,10 +819,26 @@ function drawBarcode(g, W, H, msFull){
     $('pConf').className='pill '+(good?'ok':(mid?'mid':'no'));
   }
 
-  CAM.pushSample=function(t,v){ EST.pushVideo(t,v); refreshResult(); };
+  var _vidN=0, _audN=0;                 // cumulative accepted-sample counters (for the diagnostic)
+  CAM.pushSample=function(t,v){ _vidN++; EST.pushVideo(t,v); refreshResult(); };
   CAM.onStatus=function(s){ var p=$('pVid'); p.textContent='video: '+s; p.className='pill '+(s==='ok'?'ok':'no'); };
-  MIC.pushSample=function(t,v){ EST.pushAudio(t,v); $('pAud').textContent='audio: locked'; $('pAud').className='pill ok'; refreshResult(); };
+  MIC.pushSample=function(t,v){ _audN++; EST.pushAudio(t,v); $('pAud').textContent='audio: locked'; $('pAud').className='pill ok'; refreshResult(); };
   MIC.onSync=function(active){ $('syncLed').style.width=active?'100%':'0'; if(active){ $('pAud').className='pill ok'; } };
+
+  // On-screen diagnostic (no remote debugger needed). Every 3s logs the video/audio accepted
+  // rates and the raw offset window min..max — a wide min..max means the streams aren't tracking
+  // (timestamp drift / decode noise); a tight cluster with a constant value is healthy.
+  var _dbgPrevVid=0, _dbgPrevAud=0;
+  setInterval(function(){
+    if (!CAM.running && !MIC.running) return;
+    var dv=_vidN-_dbgPrevVid, da=_audN-_dbgPrevAud; _dbgPrevVid=_vidN; _dbgPrevAud=_audN;
+    var o=EST.offs;
+    var mn=Infinity, mx=-Infinity; for (var i=0;i<o.length;i++){ if(o[i]<mn)mn=o[i]; if(o[i]>mx)mx=o[i]; }
+    log('[dbg] vid '+(dv/3).toFixed(1)+'/s aud '+(da/3).toFixed(1)+'/s  offs n='+o.length+
+        ' range['+(o.length?Math.round(mn):'-')+'..'+(o.length?Math.round(mx):'-')+']');
+  }, 3000);
+  window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, offs:EST.offs.slice(),
+    lastVid:EST.lastVidMs, lastAud:EST.lastAudMs, result:EST.result() }; };
 
   // mode switch
   $('modeSeg').addEventListener('click', function(e){
