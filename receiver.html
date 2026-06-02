@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r11-cdisp-applied-receiver';
+        var RECEIVER_VERSION = '2026-06-02-r13-fsk-companion';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -87,12 +87,6 @@
         var _lastManifestInfo = null;
         var _lastClockInfo = null;
         var _debugWatchTimer = null;
-        var _calibTimer = null;   // calibration marker-report interval
-        var _mkCanvas = null;     // offscreen canvas for on-frame marker read-back
-        var _mkCtx = null;
-        var _captureProbeDone = false;  // pixel-capture capability probe runs once
-        var _captureProbeResult = null;
-        var _inCalibration = false;     // true while the server reports calibrationMode
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -198,8 +192,7 @@
                 _debugWatchTimer = null;
             },
             player: function () { return document.getElementById('player'); },
-            caf: function () { return document.getElementById('caf-el'); },
-            probe: function () { return _runCaptureProbe(); }
+            caf: function () { return document.getElementById('caf-el'); }
         };
 
         // ── LOAD interceptor ────────────────────────────────────────────────────
@@ -824,13 +817,9 @@
                 }
             }, 250);
 
-            // Start the calibration reporter (clock telemetry while calibrationMode is on).
-            _startCalibrationReporter(player, cafEl);
-
-            // Pixel-capture probe is NOT auto-run: it proved (on this Chromecast) that no
-            // read-back technique can see hardware-decoded pixels. Left callable for a future
-            // device via window.__cws.probe(); auto-run is disabled so its paused-frame test
-            // doesn't hiccup playback. To re-run on new hardware: __cws.probe() then POST result.
+            // A/V-sync calibration no longer involves the receiver: the Chromecast cannot read
+            // hardware-decoded video pixels, so measurement is done by the phone companion
+            // (camera reads the on-screen barcode, mic reads the FSK audio timecode).
 
             // Periodically refresh epoch from server (handles drift in wall clocks)
             setInterval(function () {
@@ -890,289 +879,6 @@
                     }).catch(function () {});
                 } catch(_) {}
             }, 5000);
-        }
-
-        // ══════════════════════════════════════════════════════════════════════
-        // Pixel-capture capability probe — runs EVERY known Chrome/Chromium video
-        // read-back technique against #player and reports per-technique luminance +
-        // marker decode, so we can prove which (if any) can read decoded video pixels
-        // on this device. Runs in the receiver itself (NO debugger attached, which
-        // would blank the hardware overlay) and POSTs the result to the settings page.
-        // ══════════════════════════════════════════════════════════════════════
-        var _PW = 1280, _PH = 720;
-
-        // Decode the 33-block marker strip at row centre `atY` (8px blocks from x=8).
-        function _probeDecodeStrip(px, w, atY) {
-            var bits = [], mx = 0;
-            for (var b = 0; b < 33; b++) {
-                var cx = 8 + b * 32 + 16, s = 0, c = 0;
-                for (var dx = -4; dx <= 3; dx++) for (var dy = -4; dy <= 3; dy++) {
-                    var o = ((atY + dy) * w + (cx + dx)) * 4;
-                    var L = 0.299 * px[o] + 0.587 * px[o + 1] + 0.114 * px[o + 2];
-                    s += L; c++; if (L > mx) mx = L;
-                }
-                bits.push((s / c) >= 128 ? 1 : 0);
-            }
-            var sent = 0; for (var k = 0; k < 8; k++) sent = (sent << 1) | bits[k];
-            var val = null; if (sent === 0xA5) { val = 0; for (var j = 8; j < 32; j++) val = (val << 1) | bits[j]; }
-            return { sentinel: '0x' + sent.toString(16), match: sent === 0xA5, value: val, stripMax: Math.round(mx) };
-        }
-
-        // Summarise an RGBA pixel buffer: mean/max luminance + marker decode (tries the
-        // top strip and, for GL/flipped buffers, the bottom strip).
-        function _probeSumm(px, w, h) {
-            var sum = 0, mx = 0, n = 0;
-            for (var i = 0; i < px.length; i += 64) { var L = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]; sum += L; if (L > mx) mx = L; n++; }
-            var top = _probeDecodeStrip(px, w, 20);
-            var bot = _probeDecodeStrip(px, w, h - 20);
-            var m = top.match ? top : (bot.match ? bot : (top.stripMax >= bot.stripMax ? top : bot));
-            return { meanLuma: Math.round(sum / n), maxLuma: Math.round(mx), sentinel: m.sentinel, sentinelMatch: m.match, markerValue: m.value, markerStripMax: m.stripMax };
-        }
-
-        function _probe2d(video, wrf) {
-            try {
-                var cv = document.createElement('canvas'); cv.width = _PW; cv.height = _PH;
-                var ctx = cv.getContext('2d', wrf ? { willReadFrequently: true } : undefined);
-                ctx.drawImage(video, 0, 0, _PW, _PH);
-                return _probeSumm(ctx.getImageData(0, 0, _PW, _PH).data, _PW, _PH);
-            } catch (e) { return { error: String(e && e.message || e) }; }
-        }
-
-        function _probeWebGL(video, v2) {
-            try {
-                var cv = document.createElement('canvas'); cv.width = _PW; cv.height = _PH;
-                var gl = cv.getContext(v2 ? 'webgl2' : 'webgl') || cv.getContext('experimental-webgl');
-                if (!gl) return { error: 'no ' + (v2 ? 'webgl2' : 'webgl') + ' context' };
-                var vs = gl.createShader(gl.VERTEX_SHADER);
-                gl.shaderSource(vs, 'attribute vec2 p;varying vec2 t;void main(){t=vec2((p.x+1.0)/2.0,(1.0-p.y)/2.0);gl_Position=vec4(p,0.0,1.0);}'); gl.compileShader(vs);
-                var fs = gl.createShader(gl.FRAGMENT_SHADER);
-                gl.shaderSource(fs, 'precision mediump float;uniform sampler2D s;varying vec2 t;void main(){gl_FragColor=texture2D(s,t);}'); gl.compileShader(fs);
-                var pr = gl.createProgram(); gl.attachShader(pr, vs); gl.attachShader(pr, fs); gl.linkProgram(pr); gl.useProgram(pr);
-                var buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-                var loc = gl.getAttribLocation(pr, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-                var tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-                var gerr = gl.getError();
-                gl.viewport(0, 0, _PW, _PH); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-                var px = new Uint8Array(_PW * _PH * 4); gl.readPixels(0, 0, _PW, _PH, gl.RGBA, gl.UNSIGNED_BYTE, px);
-                var r = _probeSumm(px, _PW, _PH); r.glError = gerr; return r;
-            } catch (e) { return { error: String(e && e.message || e) }; }
-        }
-
-        function _probeVideoFrame(video) {
-            try {
-                if (typeof window.VideoFrame === 'undefined') return { error: 'VideoFrame unavailable' };
-                var vf = new VideoFrame(video);
-                var cv = document.createElement('canvas'); cv.width = _PW; cv.height = _PH;
-                var ctx = cv.getContext('2d', { willReadFrequently: true }); ctx.drawImage(vf, 0, 0, _PW, _PH);
-                var r = _probeSumm(ctx.getImageData(0, 0, _PW, _PH).data, _PW, _PH);
-                if (vf.close) vf.close(); return r;
-            } catch (e) { return { error: String(e && e.message || e) }; }
-        }
-
-        function _runCaptureProbe() {
-            var p = document.getElementById('player');
-            var R = {
-                ts: Date.now(), ua: navigator.userAgent, vw: p.videoWidth, vh: p.videoHeight,
-                paused: p.paused, ct: +p.currentTime.toFixed(2), features: {}, tech: {}
-            };
-            R.features = {
-                createImageBitmap: typeof createImageBitmap === 'function',
-                webgl: _probeWebGL.length >= 0 && (function () { try { return !!document.createElement('canvas').getContext('webgl'); } catch (e) { return false; } })(),
-                webgl2: (function () { try { return !!document.createElement('canvas').getContext('webgl2'); } catch (e) { return false; } })(),
-                VideoFrame: typeof window.VideoFrame !== 'undefined',
-                VideoDecoder: typeof window.VideoDecoder !== 'undefined',
-                MediaStreamTrackProcessor: typeof window.MediaStreamTrackProcessor !== 'undefined',
-                captureStream: (typeof p.captureStream === 'function') || (typeof p.mozCaptureStream === 'function'),
-                requestVideoFrameCallback: typeof p.requestVideoFrameCallback === 'function'
-            };
-            // Synchronous techniques.
-            R.tech.canvas2d = _probe2d(p, false);
-            R.tech.canvas2d_willReadFreq = _probe2d(p, true);
-            R.tech.webgl = _probeWebGL(p, false);
-            R.tech.webgl2 = _probeWebGL(p, true);
-            R.tech.webcodecs_VideoFrame = _probeVideoFrame(p);
-
-            var tasks = [];
-            // createImageBitmap
-            if (R.features.createImageBitmap) {
-                tasks.push(createImageBitmap(p).then(function (bmp) {
-                    var cv = document.createElement('canvas'); cv.width = _PW; cv.height = _PH;
-                    var ctx = cv.getContext('2d', { willReadFrequently: true }); ctx.drawImage(bmp, 0, 0, _PW, _PH);
-                    R.tech.createImageBitmap = _probeSumm(ctx.getImageData(0, 0, _PW, _PH).data, _PW, _PH);
-                    if (bmp.close) bmp.close();
-                }).catch(function (e) { R.tech.createImageBitmap = { error: String(e && e.message || e) }; }));
-            } else R.tech.createImageBitmap = { error: 'unavailable' };
-            // drawImage inside requestVideoFrameCallback (the actually-presented frame)
-            tasks.push(new Promise(function (res) {
-                if (typeof p.requestVideoFrameCallback !== 'function') { R.tech.rvfc_draw = { error: 'no rVFC' }; return res(); }
-                var done = false;
-                p.requestVideoFrameCallback(function () { if (done) return; done = true; R.tech.rvfc_draw = _probe2d(p, true); res(); });
-                setTimeout(function () { if (!done) { done = true; R.tech.rvfc_draw = { error: 'rVFC timeout' }; res(); } }, 1500);
-            }));
-            // paused-frame read (overlay sometimes composites into a readable buffer when paused)
-            tasks.push(new Promise(function (res) {
-                var wasPaused = p.paused;
-                try { p.pause(); } catch (e) { }
-                setTimeout(function () {
-                    R.tech.paused_draw = _probe2d(p, true);
-                    if (!wasPaused) { try { p.play().catch(function () { }); } catch (e) { } }
-                    res();
-                }, 250);
-            }));
-            // captureStream + MediaStreamTrackProcessor → read one VideoFrame
-            tasks.push(new Promise(function (res) {
-                try {
-                    if (!R.features.captureStream || !R.features.MediaStreamTrackProcessor) { R.tech.trackProcessor = { error: 'captureStream/MSTP unavailable' }; return res(); }
-                    var ms = p.captureStream ? p.captureStream() : p.mozCaptureStream();
-                    var proc = new window.MediaStreamTrackProcessor({ track: ms.getVideoTracks()[0] });
-                    var reader = proc.readable.getReader(); var done = false;
-                    reader.read().then(function (r) {
-                        if (done) return; done = true;
-                        if (r.value) {
-                            var cv = document.createElement('canvas'); cv.width = _PW; cv.height = _PH;
-                            var ctx = cv.getContext('2d', { willReadFrequently: true }); ctx.drawImage(r.value, 0, 0, _PW, _PH);
-                            R.tech.trackProcessor = _probeSumm(ctx.getImageData(0, 0, _PW, _PH).data, _PW, _PH);
-                            if (r.value.close) r.value.close();
-                        } else R.tech.trackProcessor = { error: 'no frame' };
-                        try { reader.cancel(); } catch (e) { } res();
-                    }).catch(function (e) { if (!done) { done = true; R.tech.trackProcessor = { error: String(e && e.message || e) }; res(); } });
-                    setTimeout(function () { if (!done) { done = true; R.tech.trackProcessor = { error: 'timeout' }; res(); } }, 1500);
-                } catch (e) { R.tech.trackProcessor = { error: String(e && e.message || e) }; res(); }
-            }));
-            return Promise.all(tasks).then(function () { return R; });
-        }
-
-        // Compute current audio clock position in ms.
-        // audioClockMs = epochMs + cafEl.currentTime*1000 + cdispMs, where cdispMs is the device
-        // sync offset (applied here, NOT baked into the server epoch, so epochMs stays a clean
-        // >=0 "ready" sentinel even for a large negative offset). Advancing the audio clock by
-        // cdispMs makes the receiver place video cdispMs ahead → the calibrated lead.
-        function _getAudioClockMs(cafEl) {
-            return _epochMs + cafEl.currentTime * 1000 + _cdispMs;
-        }
-
-        // Compute current video clock position in ms in the same absolute media-time
-        // coordinate system as the audio clock.
-        // Prefers rVFC mediaTime (PTS of displayed frame) over player.currentTime
-        // (PTS at decoder head) to eliminate the ~1-frame display-pipeline offset.
-        function _getVideoClockMs(player) {
-            var t = (_rVFCMediaTimeSec >= 0) ? _rVFCMediaTimeSec : player.currentTime;
-            return _videoEpochMs + t * 1000;
-        }
-
-        // Convert an absolute media position into the corresponding video element
-        // currentTime value.
-        function _getVideoTimeSecForAudioMs(audioMs) {
-            // Pure content equality: place video at the same content time as audio
-            // (_contentLagMs == 0; Cdisp is baked into the server epoch).
-            return (audioMs + _contentLagMs - _videoEpochMs) / 1000;
-        }
-
-        // ── Calibration marker read-back ───────────────────────────────────────
-        // Decodes the on-frame timecode (CalibrationMarker spec) from the displayed video:
-        // draws #player to a 1280×720 offscreen canvas and reads the 33 blocks. Returns the
-        // low-24-bit content audio-ms, or null — including on a tainted canvas, in which case
-        // calibration degrades gracefully to a pure-human nudge.
-        var _lastMarkerStatus = 'init';   // diagnostic: why the last decode succeeded/failed
-        var _lastStripLuma = -1;          // avg luminance of the sampled strip (0=black)
-        function _decodeMarkerFromVideo(player) {
-            if (!player || player.readyState < 2) { _lastMarkerStatus = 'video-not-ready'; return null; }
-            var W = 1280, STRIP = 40, stripW = 33 * 32 + 16;
-            if (!_mkCanvas) {
-                _mkCanvas = document.createElement('canvas');
-                _mkCanvas.width = W; _mkCanvas.height = STRIP;
-                _mkCtx = _mkCanvas.getContext('2d', { willReadFrequently: true });
-            }
-            // Draw ONLY the top marker strip (cheap on weak Chromecast GPUs), scaling the
-            // source full-width to the 1280-wide canvas so the block coords still line up.
-            var vw = player.videoWidth || W, vh = player.videoHeight || 720;
-            try { _mkCtx.drawImage(player, 0, 0, vw, vh * STRIP / 720, 0, 0, W, STRIP); }
-            catch (e) { _lastMarkerStatus = 'drawimage-failed'; return null; }
-            var img;
-            try { img = _mkCtx.getImageData(0, 0, stripW, STRIP); }
-            catch (e) { _lastMarkerStatus = 'tainted'; return null; } // cross-origin video → pixel read blocked
-            var d = img.data, sw = img.width, i, dx, dy;
-            var bits = new Array(33), total = 0;
-            for (i = 0; i < 33; i++) {
-                var cx = 8 + i * 32 + 16, cy = 8 + 12, sum = 0, n = 0;
-                for (dx = -4; dx <= 3; dx++) for (dy = -4; dy <= 3; dy++) {
-                    var o = ((cy + dy) * sw + (cx + dx)) * 4;
-                    sum += 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2]; n++;
-                }
-                var blk = sum / n; total += blk;
-                bits[i] = blk >= 128 ? 1 : 0;
-            }
-            _lastStripLuma = Math.round(total / 33);
-            var sent = 0; for (i = 0; i < 8; i++) sent = (sent << 1) | bits[i];
-            if (sent !== 0xA5) { _lastMarkerStatus = 'no-sentinel(0x' + sent.toString(16) + ',luma=' + _lastStripLuma + ')'; return null; }
-            var val = 0, ones = 0;
-            for (i = 8; i < 32; i++) { val = (val << 1) | bits[i]; ones += bits[i]; }
-            if (bits[32] !== (ones & 1)) { _lastMarkerStatus = 'bad-parity'; return null; }
-            _lastMarkerStatus = 'ok';
-            return val; // low 24 bits of content audio-ms
-        }
-
-        // While the server reports calibrationMode, post the machine-measured A/V skew
-        // (video content on screen − audio content playing) to seed the nudge slider.
-        function _startCalibrationReporter(player, cafEl) {
-            if (_calibTimer) return;
-            _calibTimer = setInterval(function () {
-                if (!_baseUrl) return;
-                fetch(_baseUrl + 'cast/state')
-                    .then(function (r) { return r.json(); })
-                    .then(function (s) {
-                        _inCalibration = !!(s && s.calibrationMode);
-                        if (!_inCalibration) return;
-                        if (!player || !cafEl) return;
-                        // Refresh the epoch each cycle so the video tracks the live auto-converge
-                        // bias within ~500ms instead of waiting for the 10s refresh.
-                        fetch(_baseUrl + 'cast/audio-clock')
-                            .then(function (r) { return r.json(); })
-                            .then(function (d) {
-                                if (d.epochMs >= 0) {
-                                    _epochMs = d.epochMs;
-                                    if (d.videoEpochMs >= 0) _videoEpochMs = d.videoEpochMs;
-                                    _cdispMs = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
-                                }
-                                if (_epochMs < 0) return;
-                                // NOTE: Chromecast decodes video in hardware, so the frame cannot be
-                                // read back through a 2D canvas (getImageData returns all-black). We
-                                // therefore do NOT decode the on-frame marker on the receiver. We
-                                // report clock positions for telemetry; the audio/video CLOCKS are
-                                // aligned by the drift loop (no pixels needed) and the final
-                                // perceptual offset (Cdisp) is set by the manual nudge slider.
-                                var audioMs = _getAudioClockMs(cafEl);
-                                var videoMs = _getVideoClockMs(player);
-                                var bufAhead = player.buffered.length > 0
-                                    ? Math.round((player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000) : 0;
-                                fetch(_baseUrl + 'cast/calibration/report', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({
-                                        rxVersion: RECEIVER_VERSION,
-                                        markerFound: false,
-                                        markerStatus: 'n/a (Chromecast hw-decoded video is not canvas-readable)',
-                                        audioContentMs: Math.round(audioMs),
-                                        videoContentMs: Math.round(videoMs),
-                                        clockSkewMs: Math.round(videoMs - audioMs),
-                                        appliedCdispMs: (typeof d.cdispMs === 'number') ? d.cdispMs : 0,
-                                        cafCurrentTimeMs: Math.round(cafEl.currentTime * 1000),
-                                        playerCurrentTimeMs: Math.round(player.currentTime * 1000),
-                                        bufferAheadMs: bufAhead,
-                                        cafPlaying: _cafPlaying,
-                                        videoReadyState: player.readyState
-                                    })
-                                }).catch(function () {});
-                            })
-                            .catch(function () {});
-                    })
-                    .catch(function () {});
-            }, 1000);
         }
 
         // Minimal m3u8 parser — extracts segment URIs, sequence numbers, target duration
@@ -1319,7 +1025,6 @@
             _lastManifestInfo = null; _lastClockInfo = null;
             if (_debugWatchTimer) clearInterval(_debugWatchTimer);
             _debugWatchTimer = null;
-            if (_calibTimer) { clearInterval(_calibTimer); _calibTimer = null; }
             var p = document.getElementById('player');
             if (p) {
                 try { p.pause(); } catch (e) {}

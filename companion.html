@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<!--
+  BeeCaster A/V Sync Companion  (phone, HTTPS / github.io)
+  ============================================================================
+  Measures the TRUE, unambiguous audio/video offset on the Chromecast by
+  reading two ABSOLUTE timecodes that the plugin paints into the calibration
+  streams:
+
+    * VIDEO timecode  = the on-frame barcode (33-block timecode spec, below) read by
+                        the phone CAMERA.
+    * AUDIO timecode  = an FSK timecode burst read by the phone MICROPHONE.
+
+  Both carry the SAME content-clock ms. A periodic beep can only tell you the
+  fractional-second phase (500ms vs 1500ms vs 30s-out are indistinguishable);
+  an absolute timecode on BOTH senses gives the real offset:
+
+        offset = audioContentMs(heard)  -  videoContentMs(seen)     [at one instant]
+
+  >0  => audio is AHEAD of video (you hear content the picture hasn't reached).
+  <0  => audio LAGS video.
+
+  PHASE 1 (this file): measure + DISPLAY the number; user types it into the
+  Settings nudge slider (manual entry). HTTPS phone page cannot POST to the
+  HTTP plugin (mixed content). PHASE 2 adds a self-signed cert on the plugin so
+  the companion can be served same-origin and auto-fill the nudge.
+
+  SYSTEMATIC BIAS (documented, not a bug): the measurement carries the phone's
+  (cameraPipelineLatency - audioInputLatency). Camera capture/decode usually
+  lags mic input by ~tens-100ms, so the raw reading is biased slightly POSITIVE.
+  A one-time "Phone trim" field (below) lets you subtract a constant; the
+  Settings nudge absorbs the rest. This is still vastly better than a periodic
+  tone because it is ABSOLUTE and unambiguous.
+
+  SELF-TEST: with no plugin running, set mode = "Generator" on a second screen
+  (laptop/tablet); it renders the barcode + plays the FSK from one clock. Point
+  this phone (mode = "Measure") at it: the offset should read ~0 +/- the phone
+  pipeline bias. That validates the whole decode chain before touching the
+  server.
+
+  Single file, vanilla JS, no build step. Source of truth lives in the plugin
+  repo at Src\Cast\MB_Chromecast\receiver\companion.html; deploy-to-musicbee.ps1
+  syncs it to ..\beecaster-receiver (github.io).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>BeeCaster Sync Companion</title>
+  <style>
+    :root {
+      --bg: #07021a; --panel: #150b33; --line: rgba(255,255,255,.10);
+      --txt: #e7e1f5; --dim: rgba(231,225,245,.55); --accent: #00d4ff;
+      --pink: #e94b9e; --good: #4dffaa; --warn: #ffcc44; --bad: #ff5d6c;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body { background: var(--bg); color: var(--txt); font-family: 'Segoe UI', system-ui, Arial, sans-serif; }
+    body { padding: 12px 12px calc(24px + env(safe-area-inset-bottom)); max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 16px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase;
+         background: linear-gradient(90deg,#e94b9e,#a64dff,#00d4ff);
+         -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+    .sub { font-size: 11px; color: var(--dim); margin: 2px 0 12px; }
+
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .seg button { background: transparent; color: var(--dim); border: 0; padding: 8px 14px;
+                  font-size: 13px; font-weight: 700; }
+    .seg button.on { background: var(--accent); color: #04121a; }
+
+    button.act { background: var(--panel); color: var(--txt); border: 1px solid var(--line);
+                 border-radius: 8px; padding: 10px 14px; font-size: 13px; font-weight: 700; }
+    button.act:active { transform: translateY(1px); }
+    button.act.primary { background: linear-gradient(90deg,#a64dff,#00d4ff); color: #04121a; border: 0; }
+    button.act:disabled { opacity: .4; }
+
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+            padding: 12px; margin-top: 12px; }
+    .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim);
+               margin-bottom: 8px; font-weight: 700; }
+
+    /* Big result */
+    #offsetBig { font-size: 54px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.05; }
+    #offsetUnit { font-size: 22px; color: var(--dim); }
+    #offsetWord { font-size: 13px; margin-top: 2px; }
+    .conf { font-size: 12px; color: var(--dim); margin-top: 6px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:10px; font-weight:700;
+            border:1px solid var(--line); }
+    .pill.ok { color: var(--good); border-color: rgba(77,255,170,.4); }
+    .pill.no { color: var(--bad);  border-color: rgba(255,93,108,.4); }
+    .pill.mid{ color: var(--warn); border-color: rgba(255,204,68,.4); }
+
+    /* camera */
+    .camwrap { position: relative; width: 100%; background: #000; border-radius: 10px; overflow: hidden;
+               aspect-ratio: 16/9; }
+    video { width: 100%; height: 100%; object-fit: cover; display: block; }
+    #guide { position: absolute; inset: 0; pointer-events: none; }
+    #genCanvas { width: 100%; background:#000; display:block; border-radius: 10px; image-rendering: pixelated; }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .stat { background: rgba(255,255,255,.03); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+    .stat .v { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--accent); }
+    .stat .l { font-size: 9px; text-transform: uppercase; letter-spacing: .1em; color: var(--dim); margin-top: 2px; }
+
+    label.fld { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--dim); }
+    input[type=number] { background:#0d0726; color: var(--txt); border:1px solid var(--line);
+                         border-radius:8px; padding:8px; width: 96px; font-size:14px; font-variant-numeric: tabular-nums; }
+    input[type=range] { flex:1; }
+
+    #log { font-family: ui-monospace, Consolas, monospace; font-size: 10.5px; color: var(--dim);
+           white-space: pre-wrap; max-height: 150px; overflow-y: auto; line-height: 1.5; }
+    .hide { display: none !important; }
+    .hint { font-size: 11px; color: var(--dim); margin-top: 6px; }
+    .bar { height: 6px; background: rgba(255,255,255,.08); border-radius:3px; overflow:hidden; }
+    .bar > i { display:block; height:100%; width:0; background: var(--accent); }
+  </style>
+</head>
+<body>
+  <h1>BeeCaster Sync Companion</h1>
+  <div class="sub">Reads the on-screen barcode (camera) + audio timecode (mic) to measure the true A/V offset.
+    v1 &middot; <span id="ver"></span></div>
+
+  <div class="row">
+    <div class="seg" id="modeSeg">
+      <button data-mode="measure" class="on">Measure</button>
+      <button data-mode="generator">Generator (self-test)</button>
+    </div>
+  </div>
+
+  <!-- ===================== MEASURE MODE ===================== -->
+  <div id="measureUI">
+    <div class="card">
+      <h2>Result</h2>
+      <div><span id="offsetBig">&ndash;&ndash;&ndash;</span><span id="offsetUnit"> ms</span></div>
+      <div id="offsetWord">point camera at the TV barcode &amp; start the mic</div>
+      <div class="conf">
+        <span class="pill" id="pVid">video: off</span>
+        <span class="pill" id="pAud">audio: off</span>
+        <span class="pill" id="pConf">confidence: &ndash;</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="act primary" id="copyBtn">Copy offset</button>
+        <button class="act" id="resetBtn">Reset samples</button>
+      </div>
+      <div class="hint">Type the copied value into <b>Settings &rarr; Sync nudge</b> on the plugin. Sign check:
+        a known-good device read about <b>&minus;1200&nbsp;ms</b>; if your sign looks inverted, negate it.</div>
+    </div>
+
+    <div class="card">
+      <h2>Camera &mdash; video timecode (barcode)</h2>
+      <div class="camwrap">
+        <video id="cam" playsinline muted></video>
+        <canvas id="guide"></canvas>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="act primary" id="camBtn">Start camera</button>
+        <button class="act" id="camSwap">Flip cam</button>
+        <label class="fld">scan band
+          <input type="range" id="bandPos" min="2" max="80" value="47">
+        </label>
+      </div>
+      <div class="hint">Aim so the barcode strip (top edge of the cast picture) sits inside the cyan band.
+        Hold steady; fill the frame with the TV.</div>
+    </div>
+
+    <div class="card">
+      <h2>Microphone &mdash; audio timecode (FSK)</h2>
+      <div class="row">
+        <button class="act primary" id="micBtn">Start mic</button>
+        <div class="bar" style="flex:1"><i id="syncLed"></i></div>
+      </div>
+      <div class="hint">Turn the TV up. Keep the room quiet. Mic processing (AGC/NS/echo-cancel) is disabled for
+        clean tone detection.</div>
+    </div>
+
+    <div class="card">
+      <h2>Live readouts</h2>
+      <div class="grid">
+        <div class="stat"><div class="v" id="rVid">&ndash;</div><div class="l">Video tc (ms)</div></div>
+        <div class="stat"><div class="v" id="rAud">&ndash;</div><div class="l">Audio tc (ms)</div></div>
+        <div class="stat"><div class="v" id="rN">0</div><div class="l">Offset samples</div></div>
+        <div class="stat"><div class="v" id="rSd">&ndash;</div><div class="l">Spread &plusmn;ms</div></div>
+      </div>
+      <label class="fld" style="margin-top:10px">Phone trim (ms)
+        <input type="number" id="trim" value="0" step="5">
+        <span style="font-size:11px">subtracted from result</span>
+      </label>
+    </div>
+  </div>
+
+  <!-- ===================== GENERATOR MODE ===================== -->
+  <div id="generatorUI" class="hide">
+    <div class="card">
+      <h2>Generator (self-test reference)</h2>
+      <canvas id="genCanvas" width="1056" height="120"></canvas>
+      <div class="row" style="margin-top:10px">
+        <button class="act primary" id="genBtn">Start generator</button>
+        <div class="stat" style="flex:1"><div class="v" id="genMs">&ndash;</div><div class="l">content tc (ms)</div></div>
+      </div>
+      <div class="hint">Renders the barcode and plays the FSK timecode from ONE clock. Open this on a second
+        screen and point the Measure phone at it &mdash; the offset should read ~0 &plusmn; the phone's
+        camera/mic pipeline bias. This is also the exact reference the plugin's server-side FSK emitter must match.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Log <button class="act" id="clrLog" style="float:right;padding:4px 8px;font-size:11px">clear</button></h2>
+    <div id="log"></div>
+  </div>
+
+<script>
+'use strict';
+/* ===========================================================================
+   PROTOCOL  (the server-side emitter MUST mirror these constants exactly)
+   ===========================================================================
+   VIDEO barcode (rendered by the plugin's calibration.html): 33 blocks, 8 sentinel(0xA5) +
+   24-bit ms (MSB first) + 1 even-parity. white=1, black=0.
+
+   AUDIO FSK timecode frame (repeats, ~1.9/s):
+     SYNC tone  @ SYNC_FREQ for SYNC_MS  -> onset = the time anchor; the value
+                                            encodes contentMs at this instant.
+     10 data symbols @ SYM_MS each, 4-FSK (2 bits/symbol, freq index = value):
+        symbols[0..7]  = 16-bit (contentMs & 0xFFFF), MSB first  (8 syms)
+        symbols[8..9]  = checksum nibble = (sum of the 4 nibbles)&0xF (2 syms)
+     Then GUARD_MS of silence.
+   16-bit value disambiguates any |offset| < 32768 ms. Frequencies sit in the
+   2-3 kHz band (robust through TV speakers + phone mics; clear of rumble and
+   HF rolloff). ============================================================== */
+var VERSION = '2026-06-02-companion-v1';
+var PROTO = {
+  SYNC_FREQ: 800,
+  DATA_FREQS: [1500, 1900, 2300, 2700],   // index 0..3 = 2-bit symbol value
+  SYM_MS: 40,
+  SYNC_MS: 80,
+  GUARD_MS: 40,
+  N_DATA_SYMS: 10,                         // 8 value + 2 checksum
+  EDGE_MS: 3                               // raised-cosine ramp on tone edges
+};
+document.getElementById('ver').textContent = VERSION;
+
+/* ---------- tiny helpers ---------- */
+function $(id){ return document.getElementById(id); }
+function log(){ var s=[].slice.call(arguments).join(' ');
+  var el=$('log'); el.textContent += s+'\n'; el.scrollTop = el.scrollHeight;
+  if (el.textContent.length>8000) el.textContent = el.textContent.slice(-6000); }
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+function median(arr){ if(!arr.length) return NaN; var a=arr.slice().sort(function(x,y){return x-y;});
+  var m=a.length>>1; return a.length%2 ? a[m] : (a[m-1]+a[m])/2; }
+
+/* ===========================================================================
+   FSK value <-> symbol codec (shared by generator + decoder)
+   =========================================================================== */
+function valueToSymbols(value){
+  var v = value & 0xFFFF;
+  var syms = [];
+  for (var b=15; b>=0; b-=2) syms.push(((v>>b)&1)*2 + ((v>>(b-1))&1));   // 8 symbols, MSB first
+  var ck = (((v>>12)&0xF)+((v>>8)&0xF)+((v>>4)&0xF)+(v&0xF)) & 0xF;
+  syms.push((ck>>2)&3); syms.push(ck&3);                                 // 2 checksum symbols
+  return syms; // length 10
+}
+function symbolsToValue(syms){
+  if (syms.length < 10) return null;
+  var v = 0;
+  for (var i=0;i<8;i++) v = (v<<2) | (syms[i]&3);
+  v &= 0xFFFF;
+  var ckGot = ((syms[8]&3)<<2) | (syms[9]&3);
+  var ckCalc = (((v>>12)&0xF)+((v>>8)&0xF)+((v>>4)&0xF)+(v&0xF)) & 0xF;
+  return ckGot === ckCalc ? v : null;
+}
+
+/* ===========================================================================
+   OFFSET ESTIMATOR
+   ---------------------------------------------------------------------------
+   videoSamples: dense (camera fps) {t: phoneMs, v: 24-bit ms}
+   audioSamples: sparse (~2/s)      {t: phoneMs, v: 16-bit ms}
+   For each audio sample, interpolate the video timecode at the same phone-time
+   and take signed16(A - Vinterp). Median over a sliding window = the offset.
+   Both timecodes advance ~1 ms / ms so the interpolation is a straight line.
+   =========================================================================== */
+var EST = {
+  vid: [],          // {t, v}
+  aud: [],          // {t, v}
+  offs: [],         // recent signed offset samples (ms)
+  MAXVID: 240,      // ~8s @30fps
+  WINDOW: 16,       // offset samples to median over
+  lastVidMs: -1, lastVidT: 0,
+  lastAudMs: -1, lastAudT: 0,
+
+  pushVideo: function(phoneMs, v){
+    this.lastVidMs=v; this.lastVidT=phoneMs;
+    this.vid.push({t:phoneMs, v:v});
+    if (this.vid.length>this.MAXVID) this.vid.shift();
+  },
+  interpVideo: function(phoneMs){
+    var a=this.vid; if (a.length<2) return null;
+    // find bracketing samples
+    var lo=null, hi=null;
+    for (var i=a.length-1;i>=0;i--){
+      if (a[i].t<=phoneMs){ lo=a[i]; hi=a[i+1]||a[i]; break; }
+    }
+    if (!lo){ lo=a[0]; hi=a[1]; }
+    if (Math.abs(phoneMs-lo.t) > 1200) return null;       // too stale to trust
+    if (hi.t===lo.t) return lo.v;
+    var f=(phoneMs-lo.t)/(hi.t-lo.t);
+    // unwrap the 24-bit video value across the bracket before interpolating
+    var dv = wrapSigned(hi.v - lo.v, 24);
+    return lo.v + dv*f;
+  },
+  pushAudio: function(phoneMs, v16){
+    this.lastAudMs=v16; this.lastAudT=phoneMs;
+    this.aud.push({t:phoneMs, v:v16});
+    if (this.aud.length>64) this.aud.shift();
+    var vi = this.interpVideo(phoneMs);
+    if (vi===null) return;
+    var off = wrapSigned(v16 - (vi & 0xFFFF), 16);          // signed 16-bit ms
+    this.offs.push(off);
+    if (this.offs.length>this.WINDOW) this.offs.shift();
+  },
+  result: function(){
+    if (this.offs.length<3) return null;
+    var med = median(this.offs);
+    // robust spread = median abs deviation -> ~stddev
+    var devs = this.offs.map(function(o){ return Math.abs(o-med); });
+    var mad = median(devs);
+    return { offset: Math.round(med), spread: Math.round(mad*1.4826), n: this.offs.length };
+  },
+  reset: function(){ this.vid=[]; this.aud=[]; this.offs=[]; this.lastVidMs=-1; this.lastAudMs=-1; }
+};
+// wrap a difference into signed range of `bits` (handles timecode wrap)
+function wrapSigned(d, bits){ var m=1<<bits; d=((d%m)+m)%m; if (d >= m/2) d-=m; return d; }
+
+/* ===========================================================================
+   CAMERA  ->  barcode (CalibrationMarker JS port, with auto-find in a band)
+   =========================================================================== */
+var CAM = {
+  stream:null, facing:'environment', running:false,
+  work:document.createElement('canvas'), wctx:null,
+  bandFrac:0.47,                       // vertical centre of the scan band (0..1 of frame height; matches the calibration screen's centred barcode)
+  WORKW:480,                           // downscaled working width
+  pushSample:null,                     // set by app
+  onStatus:null,
+  _lastRaw:null,                       // last raw decode {ms,t} for the temporal-agreement gate
+
+  start: async function(){
+    try {
+      if (this.stream) this.stop();
+      var c = { audio:false, video:{ facingMode:this.facing, width:{ideal:1280}, height:{ideal:720} } };
+      this.stream = await navigator.mediaDevices.getUserMedia(c);
+      var v = $('cam'); v.srcObject = this.stream; await v.play();
+      this.wctx = this.work.getContext('2d', { willReadFrequently:true });
+      this.running = true;
+      log('[cam] started ('+this.facing+') '+v.videoWidth+'x'+v.videoHeight);
+      this._loop();
+    } catch(e){ log('[cam] ERROR '+e.message); if(this.onStatus) this.onStatus('err'); }
+  },
+  stop: function(){ this.running=false; if(this.stream){ this.stream.getTracks().forEach(function(t){t.stop();}); this.stream=null; } },
+
+  _loop: function(){
+    var self=this, v=$('cam');
+    function frame(_, meta){
+      if (!self.running) return;
+      try { self._decodeFrame(v, meta ? meta.mediaTime*1000 : null); } catch(e){}
+      if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(frame);
+      else requestAnimationFrame(function(){ frame(); });
+    }
+    if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(frame);
+    else requestAnimationFrame(function(){ frame(); });
+  },
+
+  _decodeFrame: function(v, _mediaMs){
+    var vw=v.videoWidth, vh=v.videoHeight; if(!vw) return;
+    var W=this.WORKW, H=Math.round(W*vh/vw);
+    if (this.work.width!==W){ this.work.width=W; this.work.height=H; }
+    var g=this.wctx;
+    g.drawImage(v, 0, 0, W, H);
+    var phoneMs = performance.now();          // camera-decode timestamp (carries camera pipeline latency)
+
+    // Search a vertical band of rows for a valid marker. The barcode is a thin
+    // strip; we sweep a few row centres around the user-chosen band position.
+    var bandCenter = Math.round(this.bandFrac*H);
+    var found = null, status='no-marker';
+    for (var dy=-Math.round(H*0.06); dy<=Math.round(H*0.06) && !found; dy+=3){
+      var cy = clamp(bandCenter+dy, 2, H-3);
+      var row = this._readRow(g, W, cy);
+      var dec = this._decodeRow(row, W);
+      if (dec.ms>=0){ found=dec; status='ok'; this._drawGuide(cy, dec.x0, dec.x1, true); }
+      else if (dec.why) status=dec.why;
+    }
+    if (!found) this._drawGuide(bandCenter, 0, 0, false);
+
+    if (found){
+      $('rVid').textContent = found.ms;
+      // Temporal gate: only trust a decode when two consecutive frames agree on an
+      // advancing timecode. An isolated false-positive won't repeat consistently, so
+      // it never reaches the estimator (which medians over a window anyway).
+      var accept=false;
+      if (this._lastRaw && (phoneMs - this._lastRaw.t) < 600){
+        var d=wrapSigned(found.ms - this._lastRaw.ms, 24);
+        if (d > -150 && d < 700) accept=true;
+      }
+      this._lastRaw = { ms:found.ms, t:phoneMs };
+      if (accept && this.pushSample) this.pushSample(phoneMs, found.ms);
+    }
+    if (this.onStatus) this.onStatus(found ? 'ok' : status);
+  },
+
+  // average a few rows around cy -> 1-D luma profile across width
+  _readRow: function(g, W, cy){
+    var img = g.getImageData(0, Math.max(0,cy-2), W, 5).data;
+    var prof = new Float32Array(W);
+    for (var x=0;x<W;x++){
+      var s=0;
+      for (var r=0;r<5;r++){ var i=(r*W+x)*4; s += 0.299*img[i]+0.587*img[i+1]+0.114*img[i+2]; }
+      prof[x]=s/5;
+    }
+    return prof;
+  },
+
+  // Locate + decode the 33-block marker within a 1-D luma profile. The camera sees
+  // the whole picture, so we can't assume fixed coords. Strategy: binarise at the
+  // midpoint of the (lightly-smoothed) black/white levels, find transitions, estimate
+  // the block unit from the small inter-edge gaps, then phase-lock on each rising edge
+  // (block 0 is always white = the MSB of sentinel 0xA5).
+  //
+  // A midpoint threshold (not Otsu) is deliberate: the dark page background (luma ~6)
+  // and the 0-bit blocks (luma 0) must both land on the BLACK side; only the 255 white
+  // blocks are bright. Otsu mis-splits that 3-level histogram and puts the background
+  // on the white side, erasing block 0's leading edge.
+  _decodeRow: function(prof, W){
+    var sm=new Float32Array(W);
+    for (var x=0;x<W;x++){ var pl=x>0?prof[x-1]:prof[x], pr=x<W-1?prof[x+1]:prof[x]; sm[x]=(pl+prof[x]+pr)/3; }
+    var lo=1e9, hi=-1e9;
+    for (x=0;x<W;x++){ if(sm[x]<lo)lo=sm[x]; if(sm[x]>hi)hi=sm[x]; }
+    if (hi-lo < 40) return {ms:-1, why:'low-contrast'};
+    var thr=(lo+hi)/2;
+    var edges=[], prev = sm[0]>=thr?1:0;
+    for (x=1;x<W;x++){ var bb=sm[x]>=thr?1:0; if(bb!==prev){ edges.push({x:x, rise:(bb===1)}); prev=bb; } }
+    if (edges.length < 6) return {ms:-1, why:'few-edges'};   // sentinel alone yields ~7 edges
+    var gaps=[]; for (var e=1;e<edges.length;e++) gaps.push(edges[e].x-edges[e-1].x);
+    var gs=gaps.slice().sort(function(a,b){return a-b;});
+    var gq=gs[Math.floor(gs.length*0.15)] || gs[0];
+    var near=gaps.filter(function(g){ return g>=gq*0.6 && g<=gq*1.6; });
+    var unit=near.length ? median(near) : gq;
+    if (unit<2.5) return {ms:-1, why:'unit-small'};
+    // Sentinel 0xA5 = blocks [1,0,1,0,0,1,0,1]. After the leading rising edge (block 0),
+    // its internal transitions fall at these block multiples — a fixed signature we can
+    // least-squares-fit bw against, so the grid doesn't drift across 33 blocks.
+    var SENT_MULT=[1,2,3,5,6,7];
+    var best={ms:-1, why:'no-lock', score:-1};
+    for (var i2=0;i2<edges.length;i2++){
+      if (!edges[i2].rise) continue;                 // marker starts on black->white (sentinel MSB=1)
+      var ex=edges[i2].x;
+      var fol=[]; for (var jj=i2+1; jj<edges.length && fol.length<6; jj++) fol.push(edges[jj].x);
+      var bwFit=unit;
+      if (fol.length>=4){                            // fit bw from the sentinel edges
+        var num=0, den=0;
+        for (var kk=0; kk<fol.length; kk++){ var mm=SENT_MULT[kk]; num+=(fol[kk]-ex)*mm; den+=mm*mm; }
+        if (den>0) bwFit=num/den;
+      }
+      var bwCands=[bwFit, unit];
+      for (var bc2=0; bc2<bwCands.length; bc2++){
+        var base=bwCands[bc2]; if (!(base>2.5)) continue;
+        for (var ds=-4; ds<=4; ds++){                // fine scale (+/-2% in 0.5% steps) + offset (+/-3px)
+          var bw=base*(1+ds*0.005);
+          for (var dx=-3; dx<=3; dx++){
+            var x0=ex+dx, x1=x0+33*bw;
+            if (x0<0 || x1>W+2) continue;
+            var dec=this._tryWindow(prof, x0, x1);
+            if (dec.ms>=0){
+              if (dec.score>best.score){ best={ms:dec.ms, why:null, score:dec.score, x0:x0, x1:x1}; }
+            } else if (best.ms<0 && dec.why){ best.why=dec.why; }
+          }
+        }
+      }
+    }
+    return best;       // best-scoring valid alignment (not the first) defeats lucky parity passes
+  },
+
+  _tryWindow: function(prof, x0, x1){
+    var blocks=33, span=x1-x0, bw=span/blocks;
+    if (bw<2) return {ms:-1, why:'too-small'};
+    // sample each block centre (mean of central half) + its internal spread
+    var vals=new Float32Array(blocks), spreads=new Float32Array(blocks), mn=1e9, mx=-1e9;
+    for (var b=0;b<blocks;b++){
+      var c=x0+(b+0.5)*bw, a=Math.round(c-bw*0.25), z=Math.round(c+bw*0.25);
+      var s=0,n=0,bmn=1e9,bmx=-1e9;
+      for (var x=a;x<=z;x++){ if(x>=0&&x<prof.length){ var v=prof[x]; s+=v; n++; if(v<bmn)bmn=v; if(v>bmx)bmx=v; } }
+      var m=n?s/n:0; vals[b]=m; spreads[b]=n?(bmx-bmn):1e9; if(m<mn)mn=m; if(m>mx)mx=m;
+    }
+    var R=mx-mn;
+    if (R < 28) return {ms:-1, why:'low-contrast'};
+    // Guard 1 (uniformity): real marker blocks are flat. Reject noisy/blurry windows.
+    var sp=[].slice.call(spreads).sort(function(p,q){return p-q;});
+    if (sp[sp.length>>1] > R*0.45) return {ms:-1, why:'non-uniform'};
+    // Guard 2 (bimodality): block luma must cluster at black/white, not spread across
+    // the range. This rejects gradients/textures that accidentally match the sentinel.
+    var midLo=mn+R*0.33, midHi=mn+R*0.67, mid=0;
+    for (b=0;b<blocks;b++) if (vals[b]>midLo && vals[b]<midHi) mid++;
+    if (mid > 5) return {ms:-1, why:'not-bimodal'};
+    var thr=(mn+mx)/2, bits=new Array(33);
+    for (var k=0;k<33;k++) bits[k]= vals[k]>=thr ? 1:0;
+    var sent=0; for (var s2=0;s2<8;s2++) sent=(sent<<1)|bits[s2];
+    if (sent!==0xA5) return {ms:-1, why:'no-sentinel'};
+    var val=0, ones=0;
+    for (var j=8;j<32;j++){ val=(val<<1)|bits[j]; ones+=bits[j]; }
+    if (bits[32] !== (ones&1)) return {ms:-1, why:'bad-parity'};
+    // alignment quality: how far each block sits from the threshold (normalised).
+    // The correct grid samples block centres (high margin); a misaligned grid that
+    // happens to pass the weak sentinel+parity samples block edges (low margin).
+    var score=0; for (b=0;b<33;b++) score+=Math.abs(vals[b]-thr);
+    return {ms:val, why:null, score: score/(33*R)};
+  },
+
+  _drawGuide: function(cy, x0, x1, ok){
+    var v=$('cam'), gc=$('guide');
+    var W=gc.clientWidth, H=gc.clientHeight;
+    if (gc.width!==W){ gc.width=W; gc.height=H; }
+    var g=gc.getContext('2d'); g.clearRect(0,0,W,H);
+    var sc=H/(this.work.height||1);
+    var y = cy*sc;
+    g.strokeStyle = ok ? 'rgba(77,255,170,.9)' : 'rgba(0,212,255,.7)';
+    g.lineWidth = 2;
+    var bandH = Math.max(14, H*0.10);
+    g.strokeRect(4, y-bandH/2, W-8, bandH);
+    if (ok && x1>x0){
+      var sx=W/(this.work.width||1);
+      g.strokeStyle='rgba(77,255,170,.9)'; g.lineWidth=3;
+      g.strokeRect(x0*sx, y-bandH/2, (x1-x0)*sx, bandH);
+    }
+  }
+};
+
+/* ===========================================================================
+   MICROPHONE  ->  FSK decode (Goertzel bank + frame state machine)
+   =========================================================================== */
+var MIC = {
+  ctx:null, node:null, src:null, stream:null, running:false,
+  sr:48000,
+  buf:null, bufLen:0, bufBase:0,        // flat sample buffer + absolute index of buf[0]
+  CAP:0,                                // capacity (samples)
+  nextHop:0, processedInit:false,
+  t0perf:0, t0sample:0,                 // sample-index -> performance.now anchor
+  recentSync:0, muteUntil:0,
+  hist:[],                              // per-hop {s, data[4], isSync}
+  pending:[],                           // sync onsets awaiting a fully-buffered frame
+  _lastAud:null,                        // last raw decode {t,v} for the temporal-agreement gate
+  pushSample:null, onSync:null,
+
+  start: async function(){
+    try {
+      if (this.ctx) await this.stop();
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio:{
+        echoCancellation:false, noiseSuppression:false, autoGainControl:false,
+        channelCount:1
+      }});
+      var AC = window.AudioContext||window.webkitAudioContext;
+      this.ctx = new AC();
+      await this.ctx.resume();
+      this.sr = this.ctx.sampleRate;
+      this.src = this.ctx.createMediaStreamSource(this.stream);
+      var bufSize=1024;
+      this.node = this.ctx.createScriptProcessor(bufSize, 1, 1);
+      this.CAP = Math.round(this.sr*2.5);
+      this.buf = new Float32Array(this.CAP);
+      this.bufLen=0; this.bufBase=0; this.nextHop=0; this.processedInit=false;
+      this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0; this._lastAud=null;
+      var self=this;
+      this.node.onaudioprocess = function(e){ self._onAudio(e.inputBuffer.getChannelData(0)); };
+      this.src.connect(this.node); this.node.connect(this.ctx.destination); // node needs a sink to pull
+      this.running=true;
+      log('[mic] started, sr='+this.sr+'Hz');
+    } catch(e){ log('[mic] ERROR '+e.message); }
+  },
+  stop: async function(){
+    this.running=false;
+    try { if(this.node){ this.node.disconnect(); this.node.onaudioprocess=null; } } catch(e){}
+    try { if(this.src) this.src.disconnect(); } catch(e){}
+    try { if(this.stream) this.stream.getTracks().forEach(function(t){t.stop();}); } catch(e){}
+    try { if(this.ctx) await this.ctx.close(); } catch(e){}
+    this.ctx=null; this.node=null; this.src=null; this.stream=null;
+  },
+
+  _onAudio: function(input){
+    if (!this.processedInit){ this.t0perf=performance.now(); this.t0sample=0; this.processedInit=true; }
+    var n=input.length;
+    // append, trimming the front when near capacity
+    if (this.bufLen + n > this.CAP){
+      var drop = this.bufLen + n - this.CAP;
+      this.buf.copyWithin(0, drop, this.bufLen);
+      this.bufLen -= drop; this.bufBase += drop;
+    }
+    this.buf.set(input, this.bufLen); this.bufLen += n;
+    this._process();
+  },
+
+  _timeOfSample: function(s){ return this.t0perf + ((s - this.t0sample)/this.sr)*1000; },
+
+  _process: function(){
+    var sr=this.sr;
+    var WIN=Math.round(0.030*sr), HOP=Math.round(0.010*sr);
+    var syncLen=Math.round(PROTO.SYNC_MS/1000*sr), symLen=Math.round(PROTO.SYM_MS/1000*sr);
+    var frameLen=syncLen + PROTO.N_DATA_SYMS*symLen;
+    var freqs=[PROTO.SYNC_FREQ].concat(PROTO.DATA_FREQS);
+    var end = this.bufBase + this.bufLen;
+    if (this.nextHop < this.bufBase) this.nextHop = this.bufBase;
+    while (this.nextHop + WIN <= end){
+      var off = this.nextHop - this.bufBase;
+      var p=[]; for (var f=0; f<freqs.length; f++) p.push(this._goertzel(off, WIN, freqs[f]));
+      var sync=p[0], data=[p[1],p[2],p[3],p[4]];
+      var dmax=Math.max(data[0],data[1],data[2],data[3]);
+      var isSync = sync>dmax*1.6 && sync>this._floor()*4;
+      var prev = this.hist.length ? this.hist[this.hist.length-1] : null;
+      this.hist.push({ s:this.nextHop, data:data, isSync:isSync });
+      if (this.hist.length>400) this.hist.shift();
+      // Queue the frame on a sync RISING edge. The data symbols haven't arrived in
+      // the buffer yet, so we decode later (below) once the whole frame is present.
+      if (isSync && (!prev || !prev.isSync) && this.nextHop > this.muteUntil){
+        this.pending.push(this.nextHop);
+        this.muteUntil = this.nextHop + frameLen;
+      }
+      this.nextHop += HOP;
+    }
+    // Decode pending frames now fully buffered; drop any that scrolled out (lost).
+    var keep=[];
+    for (var i=0;i<this.pending.length;i++){
+      var onset=this.pending[i];
+      if (onset < this.bufBase) continue;
+      if (onset + frameLen + symLen <= end) this._decodeFrameAt(onset, syncLen, symLen);
+      else keep.push(onset);
+    }
+    this.pending = keep;
+    if (this.onSync) this.onSync(performance.now()-this.recentSync < 1500);
+  },
+
+  _floor: function(){
+    // crude noise floor = small fraction of recent peak data energy
+    var mx=1e-9; for (var i=Math.max(0,this.hist.length-50); i<this.hist.length; i++){
+      var h=this.hist[i]; mx=Math.max(mx, h.data[0],h.data[1],h.data[2],h.data[3]);
+    }
+    return mx*0.02 + 1e-9;
+  },
+
+  _goertzel: function(off, len, freq){
+    var w=2*Math.PI*freq/this.sr, coeff=2*Math.cos(w);
+    var s0=0,s1=0,s2=0, b=this.buf, base=off;
+    for (var i=0;i<len;i++){ s0=b[base+i]+coeff*s1-s2; s2=s1; s1=s0; }
+    return (s1*s1 + s2*s2 - coeff*s1*s2)/len;
+  },
+
+  // Refine the coarse (hop-quantised, window-biased) sync onset to the true sync-tone
+  // start. The 80ms sync tone is a clean 800Hz block; measure its half-power region and
+  // take (midpoint - syncLen/2) — symmetric, so immune to leading/trailing window smear.
+  _refineOnset: function(coarse, syncLen){
+    var sr=this.sr, win=Math.round(0.010*sr), step=Math.round(0.002*sr);
+    var lo=coarse - Math.round(0.040*sr), hi=coarse + Math.round(0.100*sr);
+    var pos=[], pw=[], peak=0;
+    for (var s=lo; s<=hi; s+=step){
+      var off=s - this.bufBase;
+      if (off<0 || off+win>this.bufLen) continue;
+      var p=this._goertzel(off, win, PROTO.SYNC_FREQ);
+      pos.push(s); pw.push(p); if (p>peak) peak=p;
+    }
+    if (peak<=0 || pos.length<5) return -1;
+    var thr=peak*0.5, first=-1, last=-1;
+    for (var i=0;i<pw.length;i++){ if (pw[i]>=thr){ if(first<0)first=i; last=i; } }
+    if (first<0) return -1;
+    var mid=(pos[first]+pos[last])/2;
+    return Math.round(mid - syncLen/2);
+  },
+
+  // Decode one frame whose samples are fully present. Sample each data symbol over
+  // the central 80% of its slot (avoids the raised-cosine edges), pick the strongest
+  // of the 4 tones, validate the checksum, and emit (onset phone-time, value).
+  _decodeFrameAt: function(onsetSample, syncLen, symLen){
+    var refined=this._refineOnset(onsetSample, syncLen);
+    if (refined<0) return;
+    onsetSample=refined;
+    var syms=[];
+    for (var k=0;k<PROTO.N_DATA_SYMS;k++){
+      var center = onsetSample + syncLen + Math.round((k+0.5)*symLen);
+      var winStart = center - Math.round(symLen*0.4);
+      var winLen = Math.round(symLen*0.8);
+      var off = winStart - this.bufBase;
+      if (off<0 || off+winLen > this.bufLen) return;
+      var best=-1, bpk=0;
+      for (var d=0; d<4; d++){ var pw=this._goertzel(off, winLen, PROTO.DATA_FREQS[d]); if(pw>bpk){bpk=pw; best=d;} }
+      syms.push(best);
+    }
+    var val=symbolsToValue(syms);
+    if (val===null) return;
+    this.recentSync = performance.now();
+    var tMs=this._timeOfSample(onsetSample);
+    $('rAud').textContent = val;
+    // Sanity gate: the audio timecode must advance ~1ms per ms of real phone time.
+    // Require two consecutive frames to agree before trusting one — kills the rare
+    // checksum-fluke frame. Mirrors the camera's temporal gate.
+    var push=false;
+    if (this._lastAud){
+      var dtReal=tMs-this._lastAud.t, dVal=wrapSigned(val-this._lastAud.v, 16);
+      if (dtReal>0 && dtReal<2000 && Math.abs(dVal-dtReal)<200) push=true;
+    }
+    this._lastAud={ t:tMs, v:val };
+    if (push && this.pushSample) this.pushSample(tMs, val);
+  }
+};
+
+/* ===========================================================================
+   GENERATOR (self-test): barcode canvas + FSK audio from one clock
+   =========================================================================== */
+var GEN = {
+  ctx:null, running:false, epochPerf:0, schedAhead:0.3, timer:null, rafid:0,
+  start: async function(){
+    if (this.running) return;
+    var AC=window.AudioContext||window.webkitAudioContext;
+    this.ctx=new AC(); await this.ctx.resume();
+    this.epochPerf=performance.now();
+    // align audio epoch with perf epoch
+    this._acEpoch = this.ctx.currentTime;
+    this.running=true;
+    this.schedNext = this.ctx.currentTime + 0.1;
+    var self=this;
+    this.timer=setInterval(function(){ self._schedule(); }, 80);
+    this._draw();
+    log('[gen] started, sr='+this.ctx.sampleRate);
+  },
+  stop: function(){
+    this.running=false;
+    if(this.timer) clearInterval(this.timer); this.timer=null;
+    if(this.rafid) cancelAnimationFrame(this.rafid);
+    try{ if(this.ctx) this.ctx.close(); }catch(e){} this.ctx=null;
+  },
+  _contentMsAtAC: function(acTime){
+    // map audioContext time -> perf-based content ms (same clock as the barcode)
+    var perf = this.epochPerf + (acTime - this._acEpoch)*1000;
+    return Math.max(0, Math.round(perf - this.epochPerf));
+  },
+  _schedule: function(){
+    if(!this.running) return;
+    var sr=this.ctx.sampleRate;
+    var syncLen=PROTO.SYNC_MS/1000, symLen=PROTO.SYM_MS/1000, guard=PROTO.GUARD_MS/1000;
+    var frameDur=syncLen + PROTO.N_DATA_SYMS*symLen + guard;
+    var horizon=this.ctx.currentTime + this.schedAhead;
+    while (this.schedNext < horizon){
+      var start=this.schedNext;
+      var value=this._contentMsAtAC(start) & 0xFFFF;
+      this._emitFrame(start, value);
+      this.schedNext += frameDur;
+    }
+  },
+  _emitFrame: function(start, value){
+    var syncLen=PROTO.SYNC_MS/1000, symLen=PROTO.SYM_MS/1000;
+    this._tone(start, syncLen, PROTO.SYNC_FREQ);
+    var syms=valueToSymbols(value);
+    for (var k=0;k<syms.length;k++) this._tone(start+syncLen+k*symLen, symLen, PROTO.DATA_FREQS[syms[k]]);
+  },
+  _tone: function(at, dur, freq){
+    var o=this.ctx.createOscillator(), g=this.ctx.createGain(), e=PROTO.EDGE_MS/1000;
+    o.frequency.value=freq; o.type='sine';
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(0.9, at+e);
+    g.gain.setValueAtTime(0.9, at+dur-e);
+    g.gain.linearRampToValueAtTime(0, at+dur);
+    o.connect(g); g.connect(this.ctx.destination);
+    o.start(at); o.stop(at+dur+0.005);
+  },
+  _draw: function(){
+    var self=this, cv=$('genCanvas'), g=cv.getContext('2d');
+    function tick(){
+      if(!self.running) return;
+      var ms = Math.max(0, Math.round(performance.now()-self.epochPerf));
+      drawBarcode(g, cv.width, cv.height, ms);
+      $('genMs').textContent = ms;
+      self.rafid=requestAnimationFrame(tick);
+    }
+    tick();
+  }
+};
+
+// Draw the CalibrationMarker barcode (scaled to the canvas) encoding 24-bit ms.
+function drawBarcode(g, W, H, msFull){
+  var ms = ((msFull % 16777216)+16777216)%16777216;
+  var blocks=33, bw=W/blocks;
+  g.fillStyle='#000'; g.fillRect(0,0,W,H);
+  var idx=0, ones=0;
+  function blk(on){ g.fillStyle=on?'#fff':'#000'; g.fillRect(Math.floor(idx*bw),0,Math.ceil(bw),H); idx++; }
+  for (var b=7;b>=0;b--) blk((0xA5>>b)&1);
+  for (b=23;b>=0;b--){ var v=(ms>>b)&1; blk(v); ones+=v; }
+  blk(ones&1);
+}
+
+/* ===========================================================================
+   APP WIRING
+   =========================================================================== */
+(function(){
+  var trim=0;
+  function refreshResult(){
+    var r=EST.result();
+    if (!r){ $('pConf').textContent='confidence: -'; $('pConf').className='pill'; return; }
+    var shown = r.offset - trim;
+    $('offsetBig').textContent = (shown>0?'+':'') + shown;
+    $('offsetWord').textContent = shown>0 ? 'audio is AHEAD of video' : (shown<0 ? 'audio LAGS video' : 'in sync');
+    $('rN').textContent=r.n; $('rSd').textContent=r.spread;
+    var good = r.spread<=25 && r.n>=8, mid = r.spread<=60;
+    $('pConf').textContent='confidence: '+(good?'high':(mid?'medium':'low'))+' (±'+r.spread+')';
+    $('pConf').className='pill '+(good?'ok':(mid?'mid':'no'));
+  }
+
+  CAM.pushSample=function(t,v){ EST.pushVideo(t,v); refreshResult(); };
+  CAM.onStatus=function(s){ var p=$('pVid'); p.textContent='video: '+s; p.className='pill '+(s==='ok'?'ok':'no'); };
+  MIC.pushSample=function(t,v){ EST.pushAudio(t,v); $('pAud').textContent='audio: locked'; $('pAud').className='pill ok'; refreshResult(); };
+  MIC.onSync=function(active){ $('syncLed').style.width=active?'100%':'0'; if(active){ $('pAud').className='pill ok'; } };
+
+  // mode switch
+  $('modeSeg').addEventListener('click', function(e){
+    var b=e.target.closest('button'); if(!b) return;
+    [].forEach.call(this.querySelectorAll('button'), function(x){ x.classList.remove('on'); });
+    b.classList.add('on');
+    var m=b.dataset.mode;
+    $('measureUI').classList.toggle('hide', m!=='measure');
+    $('generatorUI').classList.toggle('hide', m!=='generator');
+    if (m!=='generator') GEN.stop();
+    if (m!=='measure'){ CAM.stop(); MIC.stop(); }
+  });
+
+  // camera
+  $('camBtn').addEventListener('click', function(){
+    if (CAM.running){ CAM.stop(); this.textContent='Start camera'; $('pVid').textContent='video: off'; $('pVid').className='pill'; }
+    else { CAM.start(); this.textContent='Stop camera'; }
+  });
+  $('camSwap').addEventListener('click', function(){ CAM.facing = CAM.facing==='environment'?'user':'environment'; if(CAM.running) CAM.start(); });
+  $('bandPos').addEventListener('input', function(){ CAM.bandFrac=this.value/100; });
+
+  // mic
+  $('micBtn').addEventListener('click', async function(){
+    if (MIC.running){ await MIC.stop(); this.textContent='Start mic'; $('pAud').textContent='audio: off'; $('pAud').className='pill'; }
+    else { await MIC.start(); this.textContent='Stop mic'; }
+  });
+
+  // result actions
+  $('trim').addEventListener('input', function(){ trim=parseInt(this.value,10)||0; refreshResult(); });
+  $('copyBtn').addEventListener('click', function(){
+    var r=EST.result(); if(!r){ log('[copy] no result yet'); return; }
+    var val=String(r.offset-trim);
+    if (navigator.clipboard) navigator.clipboard.writeText(val).then(function(){ log('[copy] '+val+' ms -> clipboard'); },
+      function(){ log('[copy] failed; value = '+val); });
+    else log('[copy] value = '+val);
+  });
+  $('resetBtn').addEventListener('click', function(){ EST.reset(); refreshResult(); $('rN').textContent='0'; $('rSd').textContent='-'; log('[est] reset'); });
+
+  // generator
+  $('genBtn').addEventListener('click', function(){
+    if (GEN.running){ GEN.stop(); this.textContent='Start generator'; }
+    else { GEN.start(); this.textContent='Stop generator'; }
+  });
+
+  $('clrLog').addEventListener('click', function(){ $('log').textContent=''; });
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    log('[!] getUserMedia unavailable. This page needs HTTPS (or localhost).');
+  }
+  log('[ready] '+VERSION);
+  log('Measure: Start camera (aim at TV barcode) + Start mic. Read the offset; type it into Settings nudge.');
+})();
+</script>
+</body>
+</html>
