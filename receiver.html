@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r13-fsk-companion';
+        var RECEIVER_VERSION = '2026-06-02-r14-clock-helpers-fix';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -672,6 +672,24 @@
                     // Use existing epoch
                     _beginSyncedPlayback(player, cafEl);
                 });
+        }
+
+        // Clock helpers. Audio clock = CAF position + epoch + the per-device presentation skew
+        // (Cdisp) applied receiver-side. Video clock = video epoch + the on-screen media time
+        // (rVFC when available, else currentTime) — Cdisp is applied only to audio so the two
+        // converge to the calibrated offset.
+        function _getAudioClockMs(cafEl) {
+            return _epochMs + cafEl.currentTime * 1000 + _cdispMs;
+        }
+        function _getVideoClockMs(player) {
+            var t = (_rVFCMediaTimeSec >= 0) ? _rVFCMediaTimeSec : player.currentTime;
+            return _videoEpochMs + t * 1000;
+        }
+        // Video time (s) that matches a given audio clock ms. Cdisp is applied receiver-side via
+        // the audio clock (_getAudioClockMs adds _cdispMs), so passing a cdisp-shifted audioMs here
+        // shifts the video target by the calibrated offset. Pure content equality otherwise.
+        function _getVideoTimeSecForAudioMs(audioMs) {
+            return (audioMs + _contentLagMs - _videoEpochMs) / 1000;
         }
 
         function _beginSyncedPlayback(player, cafEl) {
