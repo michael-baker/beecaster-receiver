@@ -1,46 +1,7 @@
 <!DOCTYPE html>
-<!--
-BeeCaster A/V Sync Companion  (phone, HTTPS / github.io)
-============================================================================
-Measures the TRUE, unambiguous audio/video offset on the Chromecast by
-reading two ABSOLUTE timecodes that the plugin paints into the calibration
-streams:
-
-* VIDEO timecode  = the on-frame barcode (33-block timecode spec, below) read by
-the phone CAMERA.
-* AUDIO timecode  = an FSK timecode burst read by the phone MICROPHONE.
-
-Both carry the SAME content-clock ms. A periodic beep can only tell you the
-fractional-second phase (500ms vs 1500ms vs 30s-out are indistinguishable);
-an absolute timecode on BOTH senses gives the real offset:
-
-offset = audioContentMs(heard)  -  videoContentMs(seen)     [at one instant]
-
->0  => audio is AHEAD of video (you hear content the picture hasn't reached).
-<0  => audio LAGS video.
-
-PHASE 1 (this file): measure + DISPLAY the number; user types it into the
-Settings nudge slider (manual entry). HTTPS phone page cannot POST to the
-HTTP plugin (mixed content). PHASE 2 adds a self-signed cert on the plugin so
-the companion can be served same-origin and auto-fill the nudge.
-
-SYSTEMATIC BIAS (documented, not a bug): the measurement carries the phone's
-(cameraPipelineLatency - audioInputLatency). Camera capture/decode usually
-lags mic input by ~tens-100ms, so the raw reading is biased slightly POSITIVE.
-A one-time "Phone trim" field (below) lets you subtract a constant; the
-Settings nudge absorbs the rest. This is still vastly better than a periodic
-tone because it is ABSOLUTE and unambiguous.
-
-SELF-TEST: with no plugin running, set mode = "Generator" on a second screen
-(laptop/tablet); it renders the barcode + plays the FSK from one clock. Point
-this phone (mode = "Measure") at it: the offset should read ~0 +/- the phone
-pipeline bias. That validates the whole decode chain before touching the
-server.
-
-Single file, vanilla JS, no build step. Source of truth lives in the plugin
-repo at Src\Cast\MB_Chromecast\receiver\companion.html; deploy-to-musicbee.ps1
-syncs it to ..\beecaster-receiver (github.io).
--->
+<!-- BeeCaster A/V Sync Companion (phone). Source of truth is this file in the plugin repo;
+     deploy-to-musicbee.ps1 syncs it + its sibling sync-barcode.js to ../beecaster-receiver
+     (github.io). Edit here, never the github.io copy. -->
 <html lang="en">
 <head>
 	<meta charset="utf-8">
@@ -77,7 +38,6 @@ syncs it to ..\beecaster-receiver (github.io).
     .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim);
                margin-bottom: 8px; font-weight: 700; }
 
-    /* Big result */
     #offsetBig { font-size: 54px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.05; }
     #offsetUnit { font-size: 22px; color: var(--dim); }
     .conf { font-size: 12px; color: var(--dim); margin-top: 6px; }
@@ -87,7 +47,6 @@ syncs it to ..\beecaster-receiver (github.io).
     .pill.no { color: var(--bad);  border-color: rgba(255,93,108,.4); }
     .pill.mid{ color: var(--warn); border-color: rgba(255,204,68,.4); }
 
-    /* camera */
     .camwrap { position: relative; width: 100%; background: #000; border-radius: 10px; overflow: hidden;
                aspect-ratio: 16/9; }
     video { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -116,7 +75,6 @@ syncs it to ..\beecaster-receiver (github.io).
     .bar { height: 6px; background: rgba(255,255,255,.08); border-radius:3px; overflow:hidden; }
     .bar > i { display:block; height:100%; width:0; background: var(--accent); }
 
-    /* Camera HUD: live status rides ON the preview so it's visible while aiming. */
     #camwrap.accept { box-shadow: 0 0 0 3px var(--good); }
     .camhud { position:absolute; inset:0; pointer-events:none; display:flex; flex-direction:column;
               justify-content:space-between; padding:8px; }
@@ -165,10 +123,7 @@ syncs it to ..\beecaster-receiver (github.io).
 	</div>
 </div>
 
-<!-- ===================== MEASURE MODE ===================== -->
 <div id="measureUI">
-	<!-- The camera is the hero: the user holds the phone aimed at the TV, so all the
-	     live status rides ON the preview (you can't scroll while aiming). -->
 	<div class="card">
 		<div class="camwrap" id="camwrap">
 			<video id="cam" playsinline muted></video>
@@ -252,11 +207,10 @@ syncs it to ..\beecaster-receiver (github.io).
 	</details>
 </div>
 
-<!-- ===================== GENERATOR MODE ===================== -->
 <div id="generatorUI" class="hide">
 	<div class="card">
 		<h2>Generator (self-test reference)</h2>
-		<canvas id="genCanvas" width="1056" height="120"></canvas>
+		<canvas id="genCanvas" width="1056" height="416"></canvas>
 		<div class="row" style="margin-top:10px">
 			<button class="act primary" id="genBtn">Start generator</button>
 			<button class="act" id="genFsBtn">Fullscreen</button>
@@ -282,6 +236,7 @@ syncs it to ..\beecaster-receiver (github.io).
 	</div>
 </details>
 
+<script src="sync-barcode.js"></script>
 <script>
 'use strict';
 /* ===========================================================================
@@ -300,7 +255,7 @@ syncs it to ..\beecaster-receiver (github.io).
    16-bit value disambiguates any |offset| < 32768 ms. Frequencies sit in the
    2-3 kHz band (robust through TV speakers + phone mics; clear of rumble and
    HF rolloff). ============================================================== */
-var VERSION = '2026-06-03-companion-v5-taller-rows';
+var VERSION = '2026-06-03-companion-v6-shared-barcode';
 var PROTO = {
   SYNC_FREQ: 800,
   DATA_FREQS: [1500, 1900, 2300, 2700],   // index 0..3 = 2-bit symbol value
@@ -312,7 +267,6 @@ var PROTO = {
 };
 document.getElementById('ver').textContent = VERSION;
 
-/* ---------- tiny helpers ---------- */
 function $(id){ return document.getElementById(id); }
 function log(){ var s=[].slice.call(arguments).join(' ');
   var el=$('log'); el.textContent += s+'\n'; el.scrollTop = el.scrollHeight;
@@ -321,9 +275,7 @@ function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
 function median(arr){ if(!arr.length) return NaN; var a=arr.slice().sort(function(x,y){return x-y;});
   var m=a.length>>1; return a.length%2 ? a[m] : (a[m-1]+a[m])/2; }
 
-/* ===========================================================================
-   FSK value <-> symbol codec (shared by generator + decoder)
-   =========================================================================== */
+// FSK value<->symbol codec — must stay byte-identical to FskTimecode.ValueToSymbols/SymbolAt (C#).
 function valueToSymbols(value){
   var v = value & 0xFFFF;
   var syms = [];
@@ -342,15 +294,6 @@ function symbolsToValue(syms){
   return ckGot === ckCalc ? v : null;
 }
 
-/* ===========================================================================
-   OFFSET ESTIMATOR
-   ---------------------------------------------------------------------------
-   videoSamples: dense (camera fps) {t: phoneMs, v: 24-bit ms}
-   audioSamples: sparse (~2/s)      {t: phoneMs, v: 16-bit ms}
-   For each audio sample, interpolate the video timecode at the same phone-time
-   and take signed16(A - Vinterp). Median over a sliding window = the offset.
-   Both timecodes advance ~1 ms / ms so the interpolation is a straight line.
-   =========================================================================== */
 var EST = {
   vid: [],            // {t, v}  v = 24-bit video ms (barcode)
   aud: [],            // {t, v}  v = 16-bit audio ms (FSK)
@@ -415,9 +358,6 @@ var EST = {
 // wrap a difference into signed range of `bits` (handles timecode wrap)
 function wrapSigned(d, bits){ var m=1<<bits; d=((d%m)+m)%m; if (d >= m/2) d-=m; return d; }
 
-/* ===========================================================================
-   CAMERA  ->  barcode (CalibrationMarker JS port, with auto-find in a band)
-   =========================================================================== */
 var CAM = {
   stream:null, facing:'environment', running:false,
   work:document.createElement('canvas'), wctx:null,
@@ -505,12 +445,8 @@ var CAM = {
     if (this.onStatus) this.onStatus(found ? 'ok' : status);
   },
 
-  // Average a tall strip of rows around cy from the shared full-frame buffer -> 1-D luma profile.
-  // A tall strip averages out camera noise/blur and locks more reliably; reading from the shared
-  // buffer avoids a getImageData call per candidate row. Raised 11->17 to exploit the taller
-  // on-screen barcode: more vertical samples ≈ sqrt(17/11) ≈ 1.24x SNR per block, still well inside
-  // the bar when the TV fills the frame, and negligible cost vs the alignment search. The y0 guards
-  // below clamp ROWS if a small/far barcode leaves fewer than 17 rows in the working image.
+  // Average a ROWS-high strip around cy into a 1-D luma profile; the y0 guards clamp ROWS when a
+  // small/far barcode leaves fewer than ROWS rows in the working image.
   _readRow: function(img, W, H, cy){
     var ROWS = 17, half = ROWS >> 1;
     var y0 = cy - half;
@@ -640,9 +576,6 @@ var CAM = {
   }
 };
 
-/* ===========================================================================
-   MICROPHONE  ->  FSK decode (Goertzel bank + frame state machine)
-   =========================================================================== */
 var MIC = {
   ctx:null, node:null, src:null, stream:null, running:false,
   sr:48000,
@@ -822,9 +755,6 @@ var MIC = {
   }
 };
 
-/* ===========================================================================
-   GENERATOR (self-test): barcode canvas + FSK audio from one clock
-   =========================================================================== */
 var GEN = {
   ctx:null, running:false, epochPerf:0, schedAhead:0.3, timer:null, rafid:0,
   start: async function(){
@@ -883,10 +813,12 @@ var GEN = {
   },
   _draw: function(){
     var self=this, cv=$('genCanvas'), g=cv.getContext('2d');
+    // size to ~HEIGHT_FRACTION of a 16:9 screen so the generator matches the cast screen (shared constant)
+    cv.height = Math.round(cv.width * SyncBarcode.HEIGHT_FRACTION * 9 / 16);
     function tick(){
       if(!self.running) return;
       var ms = Math.max(0, Math.round(performance.now()-self.epochPerf));
-      drawBarcode(g, cv.width, cv.height, ms);
+      SyncBarcode.draw(g, cv.width, cv.height, ms);
       $('genMs').textContent = ms;
       self.rafid=requestAnimationFrame(tick);
     }
@@ -894,33 +826,12 @@ var GEN = {
   }
 };
 
-// Draw the CalibrationMarker barcode (scaled to the canvas) encoding 24-bit ms.
-function drawBarcode(g, W, H, msFull){
-  var ms = ((msFull % 16777216)+16777216)%16777216;
-  var blocks=33, bw=W/blocks;
-  g.fillStyle='#000'; g.fillRect(0,0,W,H);
-  var idx=0, ones=0;
-  function blk(on){ g.fillStyle=on?'#fff':'#000'; g.fillRect(Math.floor(idx*bw),0,Math.ceil(bw),H); idx++; }
-  for (var b=7;b>=0;b--) blk((0xA5>>b)&1);
-  for (b=23;b>=0;b--){ var v=(ms>>b)&1; blk(v); ones+=v; }
-  blk(ones&1);
-}
-
-/* ===========================================================================
-   APP WIRING
-   =========================================================================== */
 (function(){
   var trim=0;
-  // Lock criteria: once the estimate is stable over enough samples spread across enough time,
-  // freeze it so the user can lower the phone and read a steady number instead of a live jitter.
   var locked=false, lockedVal=null;
   var LOCK_SPREAD=45, LOCK_N=12, LOCK_SPAN=8000;
   function word(ms){ return ms>0 ? 'audio AHEAD of video' : (ms<0 ? 'audio LAGS video' : 'in sync'); }
 
-  // --- friendly live status: signal meters + plain-English coaching -----------
-  // Reuses signals we already compute (camera decode-status reason codes, mic sync
-  // state, accepted-sample counts) and turns them into glanceable feedback ON the
-  // camera view, so the user knows which signal to fix without reading the log.
   var lastVidAccept=0, lastAudAccept=0, lastCamStatus='', audioAudible=false, _acceptT=0;
   function flashAccept(){
     var w=$('camwrap'); if(!w) return;
@@ -968,15 +879,11 @@ function drawBarcode(g, W, H, msFull){
     if (!CAM.running){ setCoach('Start the camera and point it at the on-screen barcode.', 'warn'); return; }
     if (!MIC.running){ setCoach('Start the mic and turn the TV volume up.', 'warn'); return; }
     var vidFresh=(performance.now()-lastVidAccept)<1500;
-    // 1) Camera can't read the barcode - top priority (it's what the user aims).
     if (!vidFresh){ var ch=camHint(lastCamStatus); if (ch){ setCoach(ch, 'warn'); return; } }
-    // 2) Can't hear the tone at all.
     if (!audioAudible){ setCoach('Turn the TV up — I can’t hear the sync tone.', 'warn'); return; }
     var vN=EST.vid.length, aN=EST.aud.length;
-    // 3) One channel lagging well behind the other.
     if (aN<LOCK_N && aN<vN*0.5){ setCoach('Raise the TV volume or quiet the room — audio is slow.', 'warn'); return; }
     if (vN<LOCK_N && vN<aN*0.5){ setCoach('Keep the barcode centered and steady — video is slow.', 'warn'); return; }
-    // 4) Both flowing - steadiness, then just accumulating.
     var r=EST.result();
     if (r && r.spread>LOCK_SPREAD){ setCoach('Hold the phone as still as you can.', ''); return; }
     setCoach('Looking good — hold still…', 'good');
@@ -1007,21 +914,18 @@ function drawBarcode(g, W, H, msFull){
     } else {
       var sh=r.offset - trim;
       $('offsetBig').textContent=(sh>0?'+':'')+sh;
-      $('offsetBig').style.color='var(--dim)';                     // grey = not committed yet
+      $('offsetBig').style.color='var(--dim)';
       setBar(Math.min(r.n/LOCK_N, r.spanMs/LOCK_SPAN) * (r.spread<=LOCK_SPREAD?1:0.5), false);
     }
     updateUi();
   }
 
-  var _vidN=0, _audN=0;                 // cumulative accepted-sample counters (for the diagnostic)
+  var _vidN=0, _audN=0;
   CAM.pushSample=function(t,v){ _vidN++; lastVidAccept=performance.now(); EST.pushVideo(t,v); flashAccept(); refreshResult(); };
   CAM.onStatus=function(s){ lastCamStatus=s; var p=$('pVid'); p.textContent='video: '+s; p.className='pill '+(s==='ok'?'ok':'no'); };
   MIC.pushSample=function(t,v){ _audN++; lastAudAccept=performance.now(); EST.pushAudio(t,v); $('pAud').textContent='audio: locked'; $('pAud').className='pill ok'; refreshResult(); };
   MIC.onSync=function(active){ audioAudible=active; $('syncLed').style.width=active?'100%':'0'; if(active){ $('pAud').className='pill ok'; } };
 
-  // On-screen diagnostic (no remote debugger needed). Every 3s logs the video/audio accepted
-  // rates and the raw offset window min..max — a wide min..max means the streams aren't tracking
-  // (timestamp drift / decode noise); a tight cluster with a constant value is healthy.
   var _dbgPrevVid=0, _dbgPrevAud=0;
   setInterval(function(){
     if (!CAM.running && !MIC.running) return;
@@ -1033,12 +937,10 @@ function drawBarcode(g, W, H, msFull){
   window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, vid:EST.vid.length, aud:EST.aud.length,
     lastVid:EST.lastVidMs, lastAud:EST.lastAudMs, locked:locked, lockedVal:lockedVal, result:EST.result() }; };
 
-  // Refresh meters + coaching ~3x/s even when no sample is accepted, so a stalled
-  // channel still updates its meter and the coaching line explains why.
+  // tick the UI even when no sample arrives, so a stalled channel still updates and explains itself
   setInterval(updateUi, 300);
   updateUi();
 
-  // mode switch
   $('modeSeg').addEventListener('click', function(e){
     var b=e.target.closest('button'); if(!b) return;
     [].forEach.call(this.querySelectorAll('button'), function(x){ x.classList.remove('on'); });
@@ -1050,7 +952,6 @@ function drawBarcode(g, W, H, msFull){
     if (m!=='measure'){ CAM.stop(); MIC.stop(); }
   });
 
-  // camera
   $('camBtn').addEventListener('click', function(){
     if (CAM.running){ CAM.stop(); this.textContent='Start camera'; lastCamStatus=''; $('pVid').textContent='video: off'; $('pVid').className='pill'; }
     else { CAM.start(); this.textContent='Stop camera'; }
@@ -1059,14 +960,12 @@ function drawBarcode(g, W, H, msFull){
   $('camSwap').addEventListener('click', function(){ CAM.facing = CAM.facing==='environment'?'user':'environment'; if(CAM.running) CAM.start(); });
   $('bandPos').addEventListener('input', function(){ CAM.bandFrac=this.value/100; });
 
-  // mic
   $('micBtn').addEventListener('click', async function(){
     if (MIC.running){ await MIC.stop(); this.textContent='Start mic'; audioAudible=false; $('pAud').textContent='audio: off'; $('pAud').className='pill'; }
     else { await MIC.start(); this.textContent='Stop mic'; }
     updateUi();
   });
 
-  // result actions
   $('trim').addEventListener('input', function(){ trim=parseInt(this.value,10)||0; refreshResult(); });
   $('copyBtn').addEventListener('click', function(){
     var val;
@@ -1084,7 +983,6 @@ function drawBarcode(g, W, H, msFull){
     updateUi();
   });
 
-  // generator
   $('genBtn').addEventListener('click', function(){
     if (GEN.running){ GEN.stop(); this.textContent='Start generator'; }
     else { GEN.start(); this.textContent='Stop generator'; }
