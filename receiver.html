@@ -237,6 +237,7 @@
                 _mode = (custom && custom.HlsStreamingMode) || '';
 
                 _reset();
+                _reportCapabilities(_baseUrl);
 
                 if (_mode === 'caf_wav_sync') {
                     // CAF will load the WAV URL (contentId) onto #caf-el automatically.
@@ -1218,6 +1219,37 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ state: state }),
             }).catch(function () {});
+        }
+
+        // Report this device's codec/feature support to the plugin (read-only; the settings page
+        // displays it). Re-sent on each LOAD so a restarted plugin always has the current matrix.
+        function _reportCapabilities(baseUrl) {
+            if (!baseUrl) return;
+            function ms(t) { try { return !!(window.MediaSource && MediaSource.isTypeSupported(t)); } catch (e) { return false; } }
+            var caps = {
+                receiverVersion: RECEIVER_VERSION,
+                screen: { w: (window.screen && screen.width) || 0, h: (window.screen && screen.height) || 0 },
+                audio: {
+                    aac:  ms('audio/mp4; codecs="mp4a.40.2"'),
+                    flac: ms('audio/mp4; codecs="flac"'),
+                    eac3: ms('audio/mp4; codecs="ec-3"'),
+                    ac3:  ms('audio/mp4; codecs="ac-3"'),
+                    opus: ms('audio/mp4; codecs="opus"')
+                },
+                video: {
+                    h264: ms('video/mp4; codecs="avc1.640029"'),
+                    hevc: ms('video/mp4; codecs="hvc1.1.6.L93.B0"'),
+                    vp9:  ms('video/mp4; codecs="vp09.00.10.08"')
+                }
+            };
+            try { caps.device = context.getDeviceCapabilities ? context.getDeviceCapabilities() : null; } catch (e) { caps.device = null; }
+            try {
+                fetch(baseUrl + 'cast/capabilities', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(caps)
+                }).catch(function () {});
+            } catch (e) {}
         }
 
     })();
