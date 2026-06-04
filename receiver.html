@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-04-r22-tier2';
+        var RECEIVER_VERSION = '2026-06-04-r23-tier2-signed';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -77,7 +77,11 @@
         var _segsBuffered = 0;    // count of segments appended to SourceBuffer
         var _epochMs     = -1;    // AudioClockTee position when CAF connected
         var _epochWallMs = -1;    // UTC wall ms at same instant
-        var _videoEpochMs = -1;   // AudioClockTee position represented by video PTS 0
+        var _videoEpochMs = -1;   // AudioClockTee position represented by video PTS 0. SIGNED — may be
+                                  // legitimately NEGATIVE when video PTS leads the audio content clock.
+                                  // Readiness is tracked by _videoEpochSet (NOT the sign): the server
+                                  // sends null until ready, so -1 here is just the uninitialised default.
+        var _videoEpochSet = false; // true once a server videoEpochMs (any value, incl. negative) adopted
         // Cdisp (presentation skew) is now baked into the server's reported audio epoch
         // (epochMs already biased by the connected device's Cdisp), so the receiver targets
         // PURE content equality (videoContentMs == audioContentMs). Kept at 0 so the legacy
@@ -142,7 +146,7 @@
             var bufferAheadSec = null;
 
             if (cafEl && _epochMs >= 0) audioClockMs = _getAudioClockMs(cafEl);
-            if (player && _videoEpochMs >= 0) videoClockMs = _getVideoClockMs(player);
+            if (player && _videoEpochSet) videoClockMs = _getVideoClockMs(player);
             if (audioClockMs != null && videoClockMs != null) {
                 errorMs = videoClockMs - audioClockMs - _cdispBaked;
                 targetSec = _getVideoTimeSecForAudioMs(audioClockMs);
@@ -391,10 +395,13 @@
                             receiverNowMs: Date.now(),
                             receiverRttMs: _serverRtt
                         };
-                        if (d.epochMs >= 0 && d.videoEpochMs >= 0) {
+                        // videoEpochMs is null until the server has computed it; once it's a number
+                        // (ANY value, including negative — video PTS can lead the audio clock) it's ready.
+                        if (d.epochMs >= 0 && typeof d.videoEpochMs === 'number') {
                             _epochMs      = d.epochMs;
                             _epochWallMs  = d.epochWallMs;
                             _videoEpochMs = d.videoEpochMs;
+                            _videoEpochSet = true;
                             _cdispMs      = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                             // BAKE the offset once at this anchor; the drift loop holds it constant.
                             _cdispBaked      = _cdispMs;
@@ -765,8 +772,7 @@
                         // its own from the live edge — that produced the wrong startup epoch (audio ahead
                         // of the small initial buffer → bogus multi-second offset → +6% catch-up →
                         // underrun → frozen video).
-                        if (typeof d.videoEpochMs === 'number' && d.videoEpochMs >= 0)
-                            _videoEpochMs = d.videoEpochMs;
+                        if (typeof d.videoEpochMs === 'number') { _videoEpochMs = d.videoEpochMs; _videoEpochSet = true; }
                         _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                         _cdispBaked      = _cdispMs;
                         _lastReanchorSeq = (typeof d.reanchorSeq === 'number') ? d.reanchorSeq : 0;
@@ -826,7 +832,7 @@
                 target = bufEnd - HEAL_LEAD_SEC;
                 if (target < lo) target = lo;
                 if (target > hi) target = hi;
-                if (_videoEpochMs < 0)
+                if (!_videoEpochSet)
                     _videoEpochMs = audioMs + _cdispBaked - target * 1000;
                 healed = true;
             }
@@ -1041,9 +1047,10 @@
                         if (d.epochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
-                            // TIER 2: adopt the server's live videoEpochMs (authority).
-                            if (typeof d.videoEpochMs === 'number' && d.videoEpochMs >= 0)
-                                _videoEpochMs = d.videoEpochMs;
+                            // TIER 2: adopt the server's live videoEpochMs (authority). Accept ANY
+                            // numeric value, including negative (video PTS can lead the audio clock);
+                            // null means the server hasn't computed it yet → keep what we have.
+                            if (typeof d.videoEpochMs === 'number') { _videoEpochMs = d.videoEpochMs; _videoEpochSet = true; }
                             _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                             if (typeof d.reanchorSeq === 'number' && d.reanchorSeq !== _lastReanchorSeq) {
                                 _lastReanchorSeq = d.reanchorSeq;
@@ -1257,7 +1264,7 @@
             _ms = null; _sb = null;
             _appendQueue = []; _appending = false; _trimming = false;
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
-            _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1; _cdispMs = 0;
+            _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1; _videoEpochSet = false; _cdispMs = 0;
             _cdispBaked = 0; _lastReanchorSeq = -1; _reanchorPending = false;
             _videoReady = false; _cafPlaying = false;
             _lastManifestInfo = null; _lastClockInfo = null;
