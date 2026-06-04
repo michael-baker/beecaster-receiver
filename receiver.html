@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-04-r20-startup-snap';
+        var RECEIVER_VERSION = '2026-06-04-r22-tier2';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -759,8 +759,14 @@
                     if (d.epochMs >= 0) {
                         _epochMs     = d.epochMs;
                         _epochWallMs = d.epochWallMs;
-                        // _videoEpochMs is NOT taken from the server here — _anchorVideo derives it
-                        // from the live edge (the server value goes stale across wall/sample gaps).
+                        // TIER 2: trust the server's LIVE videoEpochMs as the authority. It is recomputed
+                        // per frame as (content − PTS) so it tracks the wall-paced-video vs sample-paced-
+                        // audio skew and no longer goes stale across gaps. The receiver no longer derives
+                        // its own from the live edge — that produced the wrong startup epoch (audio ahead
+                        // of the small initial buffer → bogus multi-second offset → +6% catch-up →
+                        // underrun → frozen video).
+                        if (typeof d.videoEpochMs === 'number' && d.videoEpochMs >= 0)
+                            _videoEpochMs = d.videoEpochMs;
                         _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                         _cdispBaked      = _cdispMs;
                         _lastReanchorSeq = (typeof d.reanchorSeq === 'number') ? d.reanchorSeq : 0;
@@ -809,10 +815,19 @@
             if (ideal >= lo && ideal <= hi) {
                 target = ideal;                                   // reachable → honor Cdisp exactly
             } else {
-                target = bufEnd - HEAL_LEAD_SEC;                  // unreachable → heal near live edge
+                // Target unreachable: the buffer hasn't covered this content time yet (startup, an
+                // underrun, or a transient gap). Clamp to a playable position near the live edge to
+                // keep video moving — but in TIER 2 do NOT re-derive _videoEpochMs from the live edge.
+                // The server publishes a LIVE, authoritative epoch (content − PTS per frame); inventing
+                // one here is exactly what produced the wrong startup epoch (→ catch-up → underrun →
+                // freeze). Once segments extend past the target, the normal seek/trim converges against
+                // the correct server epoch. Only fall back to deriving if we have NO server epoch yet
+                // (cold start / server restart) so there is *something* to anchor against meanwhile.
+                target = bufEnd - HEAL_LEAD_SEC;
                 if (target < lo) target = lo;
                 if (target > hi) target = hi;
-                _videoEpochMs = audioMs + _cdispBaked - target * 1000;   // re-derive so error→0 here
+                if (_videoEpochMs < 0)
+                    _videoEpochMs = audioMs + _cdispBaked - target * 1000;
                 healed = true;
             }
             _rVFCMediaTimeSec = -1;
@@ -887,6 +902,29 @@
             if (_syncTimer) clearInterval(_syncTimer);
             _syncTimer = setInterval(function () {
                 if (!_cafPlaying) return;
+
+                // STRANDED-PLAYHEAD RESCUE (must run BEFORE the readyState guard below). An underrun +
+                // a forward buffer jump can leave currentTime OUTSIDE the buffered range — in a gap with
+                // no data. The element then stalls (readyState<2) and the guard would block the recovery
+                // seek forever → permanent video freeze with audio still playing. Seek back into the
+                // buffer (near the live edge) to un-stick it. This only fires when the playhead is
+                // demonstrably out of buffer, so it never triggers in normal playback.
+                var _rb = player.buffered;
+                if (_rb && _rb.length) {
+                    var _rbS = _rb.start(0), _rbE = _rb.end(_rb.length - 1), _rct = player.currentTime;
+                    if (_rct < _rbS - 0.25 || _rct > _rbE + 0.25) {
+                        var _resT = _rbE - HEAL_LEAD_SEC;
+                        if (_resT < _rbS + SEEK_GUARD_SEC) _resT = _rbS + SEEK_GUARD_SEC;
+                        _rVFCMediaTimeSec = -1;
+                        try { player.currentTime = _resT; } catch (e) {}
+                        try { if (player.paused) player.play(); } catch (e) {}
+                        player.playbackRate = 1.0;
+                        _lastSeekMs = Date.now();
+                        console.log('[cws] RESCUE: playhead ' + _rct.toFixed(2) + 's outside buf [' + _rbS.toFixed(2) + ',' + _rbE.toFixed(2) + '] → ' + _resT.toFixed(2) + 's');
+                        return;
+                    }
+                }
+
                 if (player.paused || player.readyState < 2) return;
 
                 var nowWall = Date.now();
@@ -982,14 +1020,16 @@
             // (camera reads the on-screen barcode, mic reads the FSK audio timecode).
 
             // Periodically refresh the AUDIO epoch from the server (handles slow wall-clock drift /
-            // an audio reconnect) AND watch for the re-anchor signal (reanchorSeq bumps when the
-            // user Saves a new offset). NOTE: the poll must NOT overwrite _videoEpochMs — the
-            // receiver OWNS that after _anchorVideo derives it from the live edge; the server's
-            // value is captured once and goes stale across gaps (wall-paced video vs sample-paced
-            // audio), which is what desynced track changes. It also must NOT touch _cdispBaked —
-            // only a reanchorSeq change re-bakes it (one clean anchor in the drift loop).
-            // Captured in _epochPollTimer so _reset() can clear it (else every track change leaks
-            // another poll that fights over the shared state).
+            // an audio reconnect) AND adopt the server's LIVE videoEpochMs (TIER 2) AND watch for the
+            // re-anchor signal (reanchorSeq bumps when the user Saves a new offset). The server now
+            // recomputes videoEpochMs per frame as (content − PTS), so it tracks the wall-vs-sample
+            // skew and stays correct across gaps — the receiver trusts it as authority instead of
+            // owning a self-derived value (the old self-derived value was wrong on a clean start and
+            // desynced track changes). A large adopted shift makes the drift loop do ONE clamped seek
+            // to converge; the value is EMA-smoothed server-side so small jitter stays in the dead
+            // band. It must NOT touch _cdispBaked — only a reanchorSeq change re-bakes it (one clean
+            // anchor in the drift loop). Captured in _epochPollTimer so _reset() can clear it (else
+            // every track change leaks another poll that fights over the shared state).
             if (_epochPollTimer) clearInterval(_epochPollTimer);
             _epochPollTimer = setInterval(function () {
                 if (!_baseUrl) return;
@@ -1001,6 +1041,9 @@
                         if (d.epochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
+                            // TIER 2: adopt the server's live videoEpochMs (authority).
+                            if (typeof d.videoEpochMs === 'number' && d.videoEpochMs >= 0)
+                                _videoEpochMs = d.videoEpochMs;
                             _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                             if (typeof d.reanchorSeq === 'number' && d.reanchorSeq !== _lastReanchorSeq) {
                                 _lastReanchorSeq = d.reanchorSeq;
