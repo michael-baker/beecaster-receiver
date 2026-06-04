@@ -38,7 +38,51 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-04-r24-stall-watchdog';
+        var RECEIVER_VERSION = '2026-06-04-r25-telemetry';
+
+        // ── Telemetry (Tier 1) ───────────────────────────────────────────────────
+        // The receiver is where every freeze/sync issue actually happens, but the server could
+        // only see coarse 5 s SyncReports. This captures the receiver's own console into a ring
+        // buffer and POSTs it to /cast/receiver-log on incidents + on first convergence, and counts
+        // each recovery path so we can both diagnose AND later pare back the hacks that never fire.
+        var _logRing = [];                 // recent console lines (telemetry ring)
+        var _LOG_RING_MAX = 60;
+        // Cumulative per-session counts of each recovery path — surfaces which "hacks" actually fire.
+        var _evt = { rescue: 0, stall: 0, anchor: 0, reanchor: 0, hardSeek: 0, snap: 0, mseReinit: 0, hold: 0 };
+        // Startup milestones (wall ms) for the convergence-time breakdown (the ~30 s question).
+        var _tEpoch = 0, _tPlayStart = 0, _tConverged = 0;
+        var _convergeReported = false, _initialErrMs = null;
+        var _lastRcvLogMs = 0;
+        (function () {
+            var ol = console.log, ow = console.warn, oe = console.error;
+            function cap(lvl, args) {
+                try {
+                    var s = Array.prototype.map.call(args, function (a) {
+                        return (typeof a === 'object' && a) ? (a.message || JSON.stringify(a)) : String(a);
+                    }).join(' ');
+                    _logRing.push(((Date.now() % 100000) / 1000).toFixed(3) + ' ' + lvl + ' ' + s);
+                    if (_logRing.length > _LOG_RING_MAX) _logRing.shift();
+                } catch (e) {}
+            }
+            console.log = function () { cap('I', arguments); ol.apply(console, arguments); };
+            console.warn = function () { cap('W', arguments); ow.apply(console, arguments); };
+            console.error = function () { cap('E', arguments); oe.apply(console, arguments); };
+        })();
+        // Flush the ring buffer to the server (base64 so newlines/quotes can't break the wire format).
+        // Throttled to once / 3 s unless forced, so an incident burst can't spam the server log.
+        function _postReceiverLog(reason, force) {
+            if (!_baseUrl) return;
+            var now = Date.now();
+            if (!force && (now - _lastRcvLogMs) < 3000) return;
+            _lastRcvLogMs = now;
+            try {
+                var b64 = btoa(unescape(encodeURIComponent(_logRing.join('\n'))));
+                fetch(_baseUrl + 'cast/receiver-log', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reason: reason, version: RECEIVER_VERSION, log: b64 })
+                }).catch(function () {});
+            } catch (e) {}
+        }
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -408,6 +452,7 @@
                             // BAKE the offset once at this anchor; the drift loop holds it constant.
                             _cdispBaked      = _cdispMs;
                             _lastReanchorSeq = (typeof d.reanchorSeq === 'number') ? d.reanchorSeq : 0;
+                            if (!_tEpoch) _tEpoch = Date.now();   // telemetry: epoch acquired (convergence t0)
                             cb();
                         } else {
                             attempt++;
@@ -525,7 +570,9 @@
         // ~1 s self-recovery while audio keeps playing.
         function _scheduleMseReinit(player, baseUrl, gen) {
             if (gen !== _mseGen || _mseRetryTimer) return;
+            _evt.mseReinit++;
             console.warn('[cws] video pipeline error — rebuilding MSE in 1s');
+            _postReceiverLog('mse-reinit');
             _mseRetryTimer = setTimeout(function () {
                 _mseRetryTimer = null;
                 if (gen !== _mseGen) return;             // superseded while waiting
@@ -842,6 +889,7 @@
             try { player.currentTime = target; } catch (e) {}
             player.playbackRate = 1.0;
             _lastSeekMs = Date.now();
+            _evt.anchor++; if (reason && reason.indexOf('reanchor') >= 0) _evt.reanchor++;
             console.log('[cws] anchor(' + reason + '): ' + (healed ? 'HEAL ' : '') +
                         't=' + target.toFixed(3) + ' buf=[' + bufStart.toFixed(2) + ',' + bufEnd.toFixed(2) + ']' +
                         ' audioMs=' + audioMs.toFixed(0) + ' cdisp=' + _cdispBaked +
@@ -863,6 +911,7 @@
 
             _anchorVideo(player, cafEl, 'start');
             player.play().catch(function () {});
+            _tPlayStart = Date.now(); _convergeReported = false; _initialErrMs = null;   // telemetry: playback-start milestone
             console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) +
                         's, epochMs=' + _epochMs + ' videoEpochMs=' + Math.round(_videoEpochMs) +
                         ' cafT=' + cafEl.currentTime.toFixed(3));
@@ -930,7 +979,9 @@
                         try { if (player.paused) player.play(); } catch (e) {}
                         player.playbackRate = 1.0;
                         _lastSeekMs = Date.now();
+                        _evt.rescue++;
                         console.log('[cws] RESCUE: playhead ' + _rct.toFixed(2) + 's outside buf [' + _rbS.toFixed(2) + ',' + _rbE.toFixed(2) + '] → ' + _resT.toFixed(2) + 's');
+                        _postReceiverLog('rescue');
                         return;
                     }
                 }
@@ -957,9 +1008,11 @@
                                 (_wNow - _playerStallWall) + 'ms (paused=' + player.paused + ' rs=' +
                                 player.readyState + ' bufAhead=' + (_rb.end(_rb.length - 1) - _pt).toFixed(2) +
                                 's) → recover');
+                    _evt.stall++;
                     try { if (player.paused) player.play(); } catch (e) {}
                     _anchorVideo(player, cafEl, 'stall-recover');   // re-seek in-buffer → re-prime decoder
                     _playerStallWall = _wNow;                       // reset grace so we don't hammer
+                    _postReceiverLog('stall');
                     return;
                 }
 
@@ -980,12 +1033,28 @@
                     if (_audioHeld) { _audioHeld = false; console.log('[cws] audio clock resumed at ' + (audioMs / 1000).toFixed(2) + 's — resuming sync'); }
                 } else if (nowWall - _audioLastWall > AUDIO_STALL_MS) {
                     player.playbackRate = 1.0;
-                    if (!_audioHeld) { _audioHeld = true; console.log('[cws] HOLD: audio clock stalled — pausing sync until it resumes'); }
+                    if (!_audioHeld) { _audioHeld = true; _evt.hold++; console.log('[cws] HOLD: audio clock stalled — pausing sync until it resumes'); }
                     return;
                 }
 
                 var videoMs = _getVideoClockMs(player);
                 var errorMs = videoMs - audioMs - _cdispBaked;  // target: videoContent == audioContent + Cdisp
+
+                // Convergence telemetry (the "~30 s to sync" question). Capture the first real error
+                // after playback starts, and emit a one-shot breakdown the moment we first enter the
+                // dead band: where the time went (epoch wait vs play→converge) and how it converged
+                // (startup-snap / hard-seeks / anchors). Flushes the console ring so the full trajectory
+                // lands in the server log.
+                if (_initialErrMs === null) _initialErrMs = errorMs;
+                if (!_convergeReported && _tPlayStart && Math.abs(errorMs) <= DEAD_BAND_MS) {
+                    _convergeReported = true;
+                    _tConverged = nowWall;
+                    console.log('[cws] CONVERGED: epochWait=' + (_tPlayStart - _tEpoch) + 'ms playToConverge=' +
+                                (_tConverged - _tPlayStart) + 'ms initialErr=' + Math.round(_initialErrMs) +
+                                'ms snaps=' + _evt.snap + ' hardSeeks=' + _evt.hardSeek + ' anchors=' + _evt.anchor +
+                                ' epoch=' + Math.round(_videoEpochMs) + ' cdisp=' + _cdispBaked);
+                    _postReceiverLog('converged', true);
+                }
 
                 var buf = player.buffered;
                 if (!buf || buf.length === 0) return;
@@ -1024,6 +1093,7 @@
                     player.currentTime = target;
                     player.playbackRate = 1.0;
                     _lastSeekMs = nowWall;
+                    _evt.hardSeek++; if (startupSnapPending) _evt.snap++;
                     console.log('[cws] seek' + (startupSnapPending ? '(startup-snap)' : '') + ': err=' + errorMs.toFixed(0) + 'ms → t=' + target.toFixed(3));
                     startupSnapPending = false;
                     return;
@@ -1045,7 +1115,9 @@
                 player.playbackRate = rate;
 
                 _syncLogCounter++;
-                if (_syncLogCounter % 16 === 0) {
+                // Log every tick (~250 ms) BEFORE convergence so the startup trajectory is fully
+                // captured (the "~30 s" breakdown), then back off to every 16 ticks (~4 s) once locked.
+                if (_syncLogCounter % (_convergeReported ? 16 : 1) === 0) {
                     var rVFCActive = _rVFCMediaTimeSec >= 0;
                     console.log('[cws] drift: err=' + errorMs.toFixed(0) + 'ms rate=' + rate.toFixed(4) +
                                 ' vt=' + (videoMs / 1000).toFixed(2) + ' at=' + (audioMs / 1000).toFixed(2) +
@@ -1144,7 +1216,14 @@
                             bufStartSec: player.buffered.length > 0 ? +player.buffered.start(0).toFixed(2) : -1,
                             bufEndSec:   player.buffered.length > 0 ? +player.buffered.end(player.buffered.length - 1).toFixed(2) : -1,
                             videoEpochMs: Math.round(_videoEpochMs),
-                            epochMs: _epochMs
+                            epochMs: _epochMs,
+                            // Tier-1 telemetry: element state (paused vs decode-stall), loader health,
+                            // and cumulative recovery-path counts (which "hacks" actually fire).
+                            paused: player.paused,
+                            readyState: player.readyState,
+                            appendQueueLen: _appendQueue.length,
+                            videoEpochSet: _videoEpochSet,
+                            evt: _evt
                         })
                     }).catch(function () {});
                 } catch(_) {}
