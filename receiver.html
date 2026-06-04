@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-04-r23-tier2-signed';
+        var RECEIVER_VERSION = '2026-06-04-r24-stall-watchdog';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -113,6 +113,8 @@
         var _audioLastMs   = -1;     // last observed audio-clock ms
         var _audioLastWall = 0;      // wall ms when the audio clock last advanced
         var _audioHeld     = false;  // currently holding because audio stalled
+        var _playerLastT   = -1;     // last observed player.currentTime (s) — in-buffer stall watchdog
+        var _playerStallWall = 0;    // wall ms when player.currentTime last advanced
 
         // Sync geometry (seconds / ms). Balance: gentle rate-trim for small drift, ONE clamped
         // in-buffer seek for medium drift, and a bounded RE-ANCHOR only for a GENUINE discontinuity
@@ -902,6 +904,8 @@
             var SEEK_COOLDOWN_MS = 2000;       // never seek/re-anchor more than once per 2s
             var STARTUP_SNAP_MS = 300;         // one-shot first-correction seek threshold — snap the
                                                // startup offset instead of rate-trimming it for ~15 s
+            var STALL_RECOVER_MS = 1500;       // currentTime pinned this long WITH buffer ahead ⇒ a
+                                               // paused/decode stall → resume + re-anchor to recover
             var startupSnapPending = true;     // armed per playback start; cleared after the snap or once converged
             var _syncLogCounter = 0;
 
@@ -929,6 +933,34 @@
                         console.log('[cws] RESCUE: playhead ' + _rct.toFixed(2) + 's outside buf [' + _rbS.toFixed(2) + ',' + _rbE.toFixed(2) + '] → ' + _resT.toFixed(2) + 's');
                         return;
                     }
+                }
+
+                // VIDEO-STALL WATCHDOG (in-buffer stall) — complements the rescue above, which only
+                // catches a playhead OUTSIDE the buffer. Here currentTime is frozen while INSIDE the
+                // buffer: a paused element (e.g. a Home App PAUSE during a messy bootup) or a decode
+                // stall with data buffered ahead. The `paused || readyState<2 → return` below would
+                // otherwise bail forever and the rescue never fires (playhead in-buffer), so the video
+                // froze permanently with audio still playing (observed at bootup: playerT pinned, ~7 s
+                // buffered ahead). Detect no-advance and recover: resume if paused, then re-anchor to
+                // re-prime the decoder and re-sync. Gated so it can't fire during the legitimate
+                // audio-HOLD (where video SHOULD hold) or before there is buffered data to play; the
+                // seek cooldown keeps it to at most one recovery attempt per 2 s.
+                var _wNow = Date.now();
+                var _pt = player.currentTime;
+                if (_pt > _playerLastT + 0.02) {
+                    _playerLastT = _pt; _playerStallWall = _wNow;   // advancing normally
+                } else if (!_audioHeld && _rb && _rb.length &&
+                           (_rb.end(_rb.length - 1) - _pt) > SEEK_GUARD_SEC &&
+                           (_wNow - _playerStallWall) > STALL_RECOVER_MS &&
+                           (_wNow - _lastSeekMs) > SEEK_COOLDOWN_MS) {
+                    console.log('[cws] STALL: playerT pinned at ' + _pt.toFixed(2) + 's for ' +
+                                (_wNow - _playerStallWall) + 'ms (paused=' + player.paused + ' rs=' +
+                                player.readyState + ' bufAhead=' + (_rb.end(_rb.length - 1) - _pt).toFixed(2) +
+                                's) → recover');
+                    try { if (player.paused) player.play(); } catch (e) {}
+                    _anchorVideo(player, cafEl, 'stall-recover');   // re-seek in-buffer → re-prime decoder
+                    _playerStallWall = _wNow;                       // reset grace so we don't hammer
+                    return;
                 }
 
                 if (player.paused || player.readyState < 2) return;
@@ -1257,6 +1289,7 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             _lastSeekMs = 0;
             _audioLastMs = -1; _audioLastWall = 0; _audioHeld = false;
+            _playerLastT = -1; _playerStallWall = 0;
             _mseGen++;       // invalidate any in-flight MSE init from the previous session
             if (_mseRetryTimer) { clearTimeout(_mseRetryTimer); _mseRetryTimer = null; }
             if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
