@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-04-r25-telemetry';
+        var RECEIVER_VERSION = '2026-06-04-r26-anchorwait';
 
         // ── Telemetry (Tier 1) ───────────────────────────────────────────────────
         // The receiver is where every freeze/sync issue actually happens, but the server could
@@ -159,6 +159,8 @@
         var _audioHeld     = false;  // currently holding because audio stalled
         var _playerLastT   = -1;     // last observed player.currentTime (s) — in-buffer stall watchdog
         var _playerStallWall = 0;    // wall ms when player.currentTime last advanced
+        var _startWaitCount = 0;     // bounded retries: wait for the cdisp-target to be buffered before
+                                     // the start anchor so it lands on-target (fast convergence)
 
         // Sync geometry (seconds / ms). Balance: gentle rate-trim for small drift, ONE clamped
         // in-buffer seek for medium drift, and a bounded RE-ANCHOR only for a GENUINE discontinuity
@@ -909,6 +911,24 @@
                 return;
             }
 
+            // FAST CONVERGENCE (anchor-wait): also wait until the cdisp-correct target is actually
+            // BUFFERED, so the start anchor lands ON it (≈0 initial error) and locks in seconds —
+            // instead of anchoring at a shallow live-edge buffer ~1-2 s off and rate-trimming at 3% for
+            // ~30 s. Bounded by START_WAIT_MAX so a slow/odd fetch can't hang startup (after the cap we
+            // anchor with whatever we have = the old self-healing behavior). Skipped until the server
+            // epoch is known (else the target isn't meaningful yet).
+            var START_WAIT_MAX = 30;   // × 300 ms ≈ 9 s ceiling
+            if (_videoEpochSet && _epochMs >= 0 && _startWaitCount < START_WAIT_MAX) {
+                var idealStart = _getVideoTimeSecForAudioMs(_getAudioClockMs(cafEl));
+                var loS = buf.start(0) + SEEK_GUARD_SEC, hiS = buf.end(buf.length - 1) - SEEK_GUARD_SEC;
+                if (idealStart < loS || idealStart > hiS) {
+                    _startWaitCount++;
+                    setTimeout(function () { _beginSyncedPlayback(player, cafEl); }, 300);
+                    return;
+                }
+            }
+            _startWaitCount = 0;
+
             _anchorVideo(player, cafEl, 'start');
             player.play().catch(function () {});
             _tPlayStart = Date.now(); _convergeReported = false; _initialErrMs = null;   // telemetry: playback-start milestone
@@ -1368,7 +1388,7 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             _lastSeekMs = 0;
             _audioLastMs = -1; _audioLastWall = 0; _audioHeld = false;
-            _playerLastT = -1; _playerStallWall = 0;
+            _playerLastT = -1; _playerStallWall = 0; _startWaitCount = 0;
             _mseGen++;       // invalidate any in-flight MSE init from the previous session
             if (_mseRetryTimer) { clearTimeout(_mseRetryTimer); _mseRetryTimer = null; }
             if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
