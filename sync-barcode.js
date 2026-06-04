@@ -4,16 +4,8 @@
   The on-screen barcode that carries the master audio-clock ms is rendered in TWO places that
   MUST stay byte-identical, or the phone decoder mis-reads and the self-test stops matching the
   real screen:
-    * the on-TV CALIBRATION screen  (CastScreen/calibration.html) — loads me via <script src="lib/sync-barcode.js">
-    * the phone GENERATOR self-test (receiver/companion.html)     — loads me via <script src="sync-barcode.js"> (sibling)
-
-  CANONICAL location: Src/Cast/MB_Chromecast/receiver/sync-barcode.js (sibling to companion.html so the
-  phone page self-serves on github.io and under a local/file:// static server with no extra steps).
-  deploy-to-musicbee.ps1 syncs receiver/* to the github.io repo AND copies this file into the plugin's
-  CastScreen/lib so the calibration screen gets it from /cast/lib. Edit ONCE here; both screens follow.
-
-  Plain classic script (no ES module / no build step) so it loads identically over file://, a static
-  server, and the plugin's HTTP server.
+    * the on-TV CALIBRATION screen  (calibration.html)
+    * the phone GENERATOR self-test (companion.html)
 
   PROTOCOL (the phone DECODER in companion.html — a separate responsibility — must AGREE with this):
     33 blocks = 8-bit sentinel 0xA5 + 24-bit ms (MSB-first) + 1 even-parity. white=1, black=0.

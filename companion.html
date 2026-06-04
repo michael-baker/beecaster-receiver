@@ -1,13 +1,10 @@
 <!DOCTYPE html>
-<!-- BeeCaster A/V Sync Companion (phone). Source of truth is this file in the plugin repo;
-     deploy-to-musicbee.ps1 syncs it + its sibling sync-barcode.js to ../beecaster-receiver
-     (github.io). Edit here, never the github.io copy. -->
 <html lang="en">
 <head>
-	<meta charset="utf-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-	<title>BeeCaster Sync Companion</title>
-	<style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>BeeCaster Sync Companion</title>
+    <style>
     :root {
       --bg: #07021a; --panel: #150b33; --line: rgba(255,255,255,.10);
       --txt: #e7e1f5; --dim: rgba(231,225,245,.55); --accent: #00d4ff;
@@ -112,128 +109,142 @@
 <body>
 <h1>BeeCaster Sync Companion</h1>
 <div class="sub">
-	Reads the on-screen barcode (camera) + audio timecode (mic) to measure the true A/V offset.
-	v1 &middot; <span id="ver"></span>
+    Reads the on-screen barcode (camera) + audio timecode (mic) to measure the true A/V offset.
+    v1 &middot; <span id="ver"></span>
 </div>
 
 <div class="row">
-	<div class="seg" id="modeSeg">
-		<button data-mode="measure" class="on">Measure</button>
-		<button data-mode="generator">Generator (self-test)</button>
-	</div>
+    <div class="seg" id="modeSeg">
+        <button data-mode="measure" class="on">Measure</button>
+        <button data-mode="generator">Generator (self-test)</button>
+    </div>
 </div>
 
 <div id="measureUI">
-	<div class="card">
-		<div class="camwrap" id="camwrap">
-			<video id="cam" playsinline muted></video>
-			<canvas id="guide"></canvas>
-			<div class="camhud">
-				<div class="top">
-					<div class="ofs"><span id="offsetBig">&ndash;&ndash;&ndash;</span><span class="u" id="offsetUnit"> ms</span></div>
-					<div class="state" id="stateText">Off</div>
-				</div>
-				<div class="meters">
-					<div class="meter none" id="mVid"><span class="ic">&#128247;</span><span class="ml">Video</span><span class="mbar"><i id="mVidBar"></i></span><span class="cnt" id="mVidTxt">0/12</span></div>
-					<div class="meter none" id="mAud"><span class="ic">&#128266;</span><span class="ml">Audio</span><span class="mbar"><i id="mAudBar"></i></span><span class="cnt" id="mAudTxt">0/12</span></div>
-				</div>
-			</div>
-		</div>
+    <div class="card">
+        <div class="camwrap" id="camwrap">
+            <video id="cam" playsinline muted></video>
+            <canvas id="guide"></canvas>
+            <div class="camhud">
+                <div class="top">
+                    <div class="ofs">
+                        <span id="offsetBig">&ndash;&ndash;&ndash;</span><span class="u" id="offsetUnit"> ms</span>
+                    </div>
+                    <div class="state" id="stateText">Off</div>
+                </div>
+                <div class="meters">
+                    <div class="meter none" id="mVid">
+                        <span class="ic">&#128247;</span><span class="ml">Video</span>
+                        <span class="mbar">
+                            <i id="mVidBar"></i>
+                        </span><span class="cnt" id="mVidTxt">0/12</span>
+                    </div>
+                    <div class="meter none" id="mAud">
+                        <span class="ic">&#128266;</span><span class="ml">Audio</span>
+                        <span class="mbar">
+                            <i id="mAudBar"></i>
+                        </span><span class="cnt" id="mAudTxt">0/12</span>
+                    </div>
+                </div>
+            </div>
+        </div>
 
-		<div class="coach" id="coach"><span class="arrow">&#128072;</span><span id="coachText">Tap Start camera and Start mic, then point the phone at the TV barcode.</span></div>
+        <div class="coach" id="coach">
+            <span class="arrow">&#128072;</span><span id="coachText">Tap Start camera and Start mic, then point the phone at the TV barcode.</span>
+        </div>
 
-		<div class="bar" style="margin:10px 0 4px">
-			<i id="lockBar"></i>
-		</div>
+        <div class="bar" style="margin:10px 0 4px">
+            <i id="lockBar"></i>
+        </div>
 
-		<div class="row" style="margin-top:8px">
-			<button class="act primary" id="camBtn">Start camera</button>
-			<button class="act primary" id="micBtn">Start mic</button>
-			<button class="act" id="camSwap">Flip cam</button>
-		</div>
-		<div class="row" style="margin-top:8px">
-			<label class="fld">
-				scan band
-				<input type="range" id="bandPos" min="2" max="80" value="47">
-			</label>
-		</div>
-		<div class="row" style="margin-top:10px">
-			<button class="act" id="copyBtn">Copy offset</button>
-			<button class="act" id="resetBtn">Re-measure</button>
-		</div>
-		<div class="hint">
-			Fill the frame with the TV so the barcode strip spans the width, and keep the volume up.
-			It locks on its own once both meters fill and stay steady. If applying the offset makes things worse, negate it.
-		</div>
-	</div>
+        <div class="row" style="margin-top:8px">
+            <button class="act primary" id="camBtn">Start camera</button>
+            <button class="act primary" id="micBtn">Start mic</button>
+            <button class="act" id="camSwap">Flip cam</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+            <label class="fld">
+                scan band
+                <input type="range" id="bandPos" min="2" max="80" value="47">
+            </label>
+        </div>
+        <div class="row" style="margin-top:10px">
+            <button class="act" id="copyBtn">Copy offset</button>
+            <button class="act" id="resetBtn">Re-measure</button>
+        </div>
+        <div class="hint">
+            Fill the frame with the TV so the barcode strip spans the width, and keep the volume up.
+            It locks on its own once both meters fill and stay steady. If applying the offset makes things worse, negate it.
+        </div>
+    </div>
 
-	<details class="adv">
-		<summary>Details &amp; troubleshooting</summary>
-		<div class="card" style="margin-top:8px">
-			<div class="conf">
-				<span class="pill" id="pVid">video: off</span>
-				<span class="pill" id="pAud">audio: off</span>
-				<span class="pill" id="pConf">confidence: &ndash;</span>
-			</div>
-			<div class="row" style="margin-top:8px">
-				<div class="bar" style="flex:1">
-					<i id="syncLed"></i>
-				</div>
-			</div>
-			<div class="grid" style="margin-top:10px">
-				<div class="stat">
-					<div class="v" id="rVid">&ndash;</div>
-					<div class="l">Video tc (ms)</div>
-				</div>
-				<div class="stat">
-					<div class="v" id="rAud">&ndash;</div>
-					<div class="l">Audio tc (ms)</div>
-				</div>
-				<div class="stat">
-					<div class="v" id="rN">0</div>
-					<div class="l">Offset samples</div>
-				</div>
-				<div class="stat">
-					<div class="v" id="rSd">&ndash;</div>
-					<div class="l">Spread &plusmn;ms</div>
-				</div>
-			</div>
-			<label class="fld" style="margin-top:10px">
-				Phone trim (ms)
-				<input type="number" id="trim" value="0" step="5">
-				<span style="font-size:11px">subtracted from result</span>
-			</label>
-		</div>
-	</details>
+    <details class="adv">
+        <summary>Details &amp; troubleshooting</summary>
+        <div class="card" style="margin-top:8px">
+            <div class="conf">
+                <span class="pill" id="pVid">video: off</span>
+                <span class="pill" id="pAud">audio: off</span>
+                <span class="pill" id="pConf">confidence: &ndash;</span>
+            </div>
+            <div class="row" style="margin-top:8px">
+                <div class="bar" style="flex:1">
+                    <i id="syncLed"></i>
+                </div>
+            </div>
+            <div class="grid" style="margin-top:10px">
+                <div class="stat">
+                    <div class="v" id="rVid">&ndash;</div>
+                    <div class="l">Video tc (ms)</div>
+                </div>
+                <div class="stat">
+                    <div class="v" id="rAud">&ndash;</div>
+                    <div class="l">Audio tc (ms)</div>
+                </div>
+                <div class="stat">
+                    <div class="v" id="rN">0</div>
+                    <div class="l">Offset samples</div>
+                </div>
+                <div class="stat">
+                    <div class="v" id="rSd">&ndash;</div>
+                    <div class="l">Spread &plusmn;ms</div>
+                </div>
+            </div>
+            <label class="fld" style="margin-top:10px">
+                Phone trim (ms)
+                <input type="number" id="trim" value="0" step="5">
+                <span style="font-size:11px">subtracted from result</span>
+            </label>
+        </div>
+    </details>
 </div>
 
 <div id="generatorUI" class="hide">
-	<div class="card">
-		<h2>Generator (self-test reference)</h2>
-		<canvas id="genCanvas" width="1056" height="416"></canvas>
-		<div class="row" style="margin-top:10px">
-			<button class="act primary" id="genBtn">Start generator</button>
-			<button class="act" id="genFsBtn">Fullscreen</button>
-			<div class="stat" style="flex:1">
-				<div class="v" id="genMs">&ndash;</div>
-				<div class="l">content tc (ms)</div>
-			</div>
-		</div>
-		<div class="hint">
-			Renders the barcode and plays the FSK timecode from ONE clock. <b>Start generator</b>,
-			then <b>Fullscreen</b> so it's TV-sized, and point the Measure phone at it &mdash; the offset should
-			read ~0 &plusmn; the phone's camera/mic pipeline bias (that's your Phone-trim value). It's also the
-			exact reference the plugin's server-side FSK emitter matches.
-		</div>
-	</div>
+    <div class="card">
+        <h2>Generator (self-test reference)</h2>
+        <canvas id="genCanvas" width="1056" height="416"></canvas>
+        <div class="row" style="margin-top:10px">
+            <button class="act primary" id="genBtn">Start generator</button>
+            <button class="act" id="genFsBtn">Fullscreen</button>
+            <div class="stat" style="flex:1">
+                <div class="v" id="genMs">&ndash;</div>
+                <div class="l">content tc (ms)</div>
+            </div>
+        </div>
+        <div class="hint">
+            Renders the barcode and plays the FSK timecode from ONE clock. <b>Start generator</b>,
+            then <b>Fullscreen</b> so it's TV-sized, and point the Measure phone at it &mdash; the offset should
+            read ~0 &plusmn; the phone's camera/mic pipeline bias (that's your Phone-trim value). It's also the
+            exact reference the plugin's server-side FSK emitter matches.
+        </div>
+    </div>
 </div>
 
 <details class="adv">
-	<summary>Log (advanced)</summary>
-	<div class="card" style="margin-top:8px">
-		<h2>Log <button class="act" id="clrLog" style="float:right;padding:4px 8px;font-size:11px">clear</button></h2>
-		<div id="log"></div>
-	</div>
+    <summary>Log (advanced)</summary>
+    <div class="card" style="margin-top:8px">
+        <h2>Log <button class="act" id="clrLog" style="float:right;padding:4px 8px;font-size:11px">clear</button></h2>
+        <div id="log"></div>
+    </div>
 </details>
 
 <script src="sync-barcode.js"></script>

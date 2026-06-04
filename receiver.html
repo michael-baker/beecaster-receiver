@@ -1,10 +1,10 @@
 <!DOCTYPE html>
 <html>
 <head>
-	<meta charset="utf-8">
-	<title>BeeCaster Receiver</title>
-	<script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-	<style>
+    <meta charset="utf-8">
+    <title>BeeCaster Receiver</title>
+    <script type="text/javascript" src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <style>
         *, *::before, *::after { box-sizing: border-box; }
         body { overflow: hidden; margin: 0; padding: 0; background: #000; }
         #overlay {
@@ -37,8 +37,8 @@
         'use strict';
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
-        // running the current build (rules out GitHub Pages / cast-app caching of a stale file).
-        var RECEIVER_VERSION = '2026-06-02-r18-mse-resilient';
+        // running the current build
+        var RECEIVER_VERSION = '2026-06-04-r20-startup-snap';
 
         // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
@@ -571,11 +571,24 @@
                             _loadedSegs[seg.sn] = true;
                         }
                     }
+                    // Bound _loadedSegs: segment numbers are monotonic and the playlist window is
+                    // small (hls_list_size), so any sn well below the newest can never reappear.
+                    // Without this the map grows one key per segment forever (~3600/hr) — a slow leak.
+                    var newestSn = parsed.segments.length ? parsed.segments[parsed.segments.length - 1].sn : 0;
+                    var pruneBelow = newestSn - 64;
+                    if (pruneBelow > 0) {
+                        for (var s in _loadedSegs) { if (+s < pruneBelow) delete _loadedSegs[s]; }
+                    }
                     if (newFrags.length > 0) {
                         _fetchSegments(baseUrl, newFrags, 0);
                     }
-                    // Schedule next poll: target duration / 2 (HLS spec recommendation)
-                    var pollMs = Math.max(500, (parsed.targetDuration || 1) * 500);
+                    // Schedule next poll at ~one target-duration. RFC 8216 §6.3.4 says reload after
+                    // targetDuration (the 0.5× rule is only for an UNCHANGED playlist) — the old
+                    // 0.5× polled TWICE per 1 s segment. With segments arriving 1/s into a multi-second
+                    // buffer, polling once per segment grabs every new segment with ample margin and
+                    // halves manifest GET + parse + timer churn (the receiver's top active-JS cost) for
+                    // no visible latency change.
+                    var pollMs = Math.max(1000, (parsed.targetDuration || 1) * 1000);
                     _pollTimer = setTimeout(function () { _pollManifest(baseUrl); }, pollMs);
                 })
                 .catch(function (e) {
@@ -866,6 +879,9 @@
             var MAX_TRIM_SAFE = 0.03;          // ±3% when the buffer is low
             var BUFFER_LOW_SEC = 4;
             var SEEK_COOLDOWN_MS = 2000;       // never seek/re-anchor more than once per 2s
+            var STARTUP_SNAP_MS = 300;         // one-shot first-correction seek threshold — snap the
+                                               // startup offset instead of rate-trimming it for ~15 s
+            var startupSnapPending = true;     // armed per playback start; cleared after the snap or once converged
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
@@ -921,7 +937,10 @@
 
                 // Medium drift → ONE clamped in-buffer seek (the proven recovery). Clamping keeps the
                 // target inside the buffer, so a near-edge target seeks to the edge instead of failing.
-                if (Math.abs(errorMs) > HARD_SEEK_MS && canSeek) {
+                // STARTUP SNAP: for the FIRST correction of a session use a lower threshold so a
+                // few-hundred-ms startup offset snaps in ~1 s instead of rate-trimming for ~15 s.
+                var seekThresh = startupSnapPending ? STARTUP_SNAP_MS : HARD_SEEK_MS;
+                if (Math.abs(errorMs) > seekThresh && canSeek) {
                     var target = ideal;
                     if (target < bufStart + SEEK_GUARD_SEC) target = bufStart + SEEK_GUARD_SEC;
                     if (target > bufEnd - SEEK_GUARD_SEC)   target = bufEnd - SEEK_GUARD_SEC;
@@ -929,9 +948,13 @@
                     player.currentTime = target;
                     player.playbackRate = 1.0;
                     _lastSeekMs = nowWall;
-                    console.log('[cws] seek: err=' + errorMs.toFixed(0) + 'ms → t=' + target.toFixed(3));
+                    console.log('[cws] seek' + (startupSnapPending ? '(startup-snap)' : '') + ': err=' + errorMs.toFixed(0) + 'ms → t=' + target.toFixed(3));
+                    startupSnapPending = false;
                     return;
                 }
+
+                // Startup snap no longer needed once we're inside the dead band (converged on its own).
+                if (startupSnapPending && Math.abs(errorMs) <= DEAD_BAND_MS) startupSnapPending = false;
 
                 // Fine alignment → gentle rate trim on the (muted) video only.
                 var bufAheadSec = bufEnd - player.currentTime;
