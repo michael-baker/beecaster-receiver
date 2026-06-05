@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-04-r26-anchorwait';
+        var RECEIVER_VERSION = '2026-06-05-r27-single-sync';
 
         // ── Telemetry (Tier 1) ───────────────────────────────────────────────────
         // The receiver is where every freeze/sync issue actually happens, but the server could
@@ -314,7 +314,6 @@
             var p = document.getElementById('player');
             if (p && !p.paused) p.pause();
             _cafPlaying = false;
-            _postAck('PAUSED');
             setTimeout(function () { _showOverlay(0); }, 1500);
         });
 
@@ -330,7 +329,6 @@
                 var p2 = document.getElementById('player');
                 if (p2 && p2.paused) p2.play().catch(function () {});
             }
-            _postAck('PLAYING');
         });
 
         // ── Queue next / prev ──────────────────────────────────────────────────
@@ -1415,15 +1413,6 @@
         function _showOverlay(opacity) {
             var el = document.getElementById('overlay');
             if (el) el.style.opacity = String(opacity);
-        }
-
-        function _postAck(state) {
-            if (!_baseUrl) return;
-            fetch(_baseUrl + 'cast/ack', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ state: state }),
-            }).catch(function () {});
         }
 
         // Report this device's codec/feature support to the plugin (read-only; the settings page
