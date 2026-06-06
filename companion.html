@@ -265,7 +265,7 @@
    DATA value = 16-bit (contentMs & 0xFFFF) MSB-first + 4-bit checksum (=(sum of the
    4 nibbles)&0xF). 16-bit value disambiguates any |offset| < 32768 ms. Band
    ~1.5-2.1 kHz (measured to survive a real 5 m speaker->mic capture). =========== */
-var VERSION = '2026-06-07-companion-v10-ppm';
+var VERSION = '2026-06-07-companion-v10b-bigbuffer';
 var PROTO = {
   SYNC_FREQ: 1500,                         // steady-tone SYNC marker (legacy TONE method); 150Hz below data
   CHIRP_F0: 1500, CHIRP_F1: 2150,          // chirp band: the SYNC chirp AND the PPM DATA chirps span this
@@ -630,7 +630,11 @@ var MIC = {
       this.src = this.ctx.createMediaStreamSource(this.stream);
       var bufSize=1024;
       this.node = this.ctx.createScriptProcessor(bufSize, 1, 1);
-      this.CAP = Math.round(this.sr*2.5);
+      // The ring buffer must hold a WHOLE timecode frame so the decoder can read all of it AFTER the
+      // onset is found. The chirp PPM frame is the longest (~3.3s); size to it + margin. (The old 2.5s
+      // buffer was SHORTER than the PPM frame, so chirp frames never fully buffered and never decoded.)
+      var chirpFrameSec = (PROTO.SYNC_MS + PROTO.N_DATA_BITS*2*PROTO.PPM_GAP_MS + PROTO.GUARD_MS)/1000;
+      this.CAP = Math.round(this.sr * Math.max(2.5, chirpFrameSec + 1.6));
       this.buf = new Float32Array(this.CAP);
       this.bufLen=0; this.bufBase=0; this.nextHop=0; this.nextHopC=0; this.processedInit=false;
       this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0; this._lastAud=null;
