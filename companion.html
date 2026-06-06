@@ -267,14 +267,14 @@
         symbols[0..7]  = 16-bit (contentMs & 0xFFFF), MSB first  (8 syms)
         symbols[8..9]  = checksum nibble = (sum of the 4 nibbles)&0xF (2 syms)
      Then GUARD_MS of silence.
-   16-bit value disambiguates any |offset| < 32768 ms. The comfortable 1.2-2.4 kHz
-   band (chirp sweeps to 3.5 kHz) clears phone-mic roll-off on Android + iPhone and
-   stays below the piercing 3-4 kHz zone. ====================================== */
-var VERSION = '2026-06-06-companion-v7-chirp-or-tone';
+   16-bit value disambiguates any |offset| < 32768 ms. Everything sits in the narrow
+   ~1.5-2.1 kHz band measured to survive a real 5 m speaker->mic capture (steep
+   roll-off above ~2.2 kHz killed the old higher tones). ======================== */
+var VERSION = '2026-06-06-companion-v8-narrowband';
 var PROTO = {
-  SYNC_FREQ: 1200,                         // steady-tone SYNC marker ("tones" method)
-  CHIRP_F0: 1500, CHIRP_F1: 3500,          // swept-chirp SYNC marker ("chirp" method); spans SYNC_MS
-  DATA_FREQS: [1500, 1800, 2100, 2400],    // index 0..3 = 2-bit symbol value (same for both markers)
+  SYNC_FREQ: 1500,                         // steady-tone SYNC marker ("tones" method); 150Hz below data
+  CHIRP_F0: 1500, CHIRP_F1: 2150,          // swept-chirp SYNC marker ("chirp" method); spans SYNC_MS, in-band
+  DATA_FREQS: [1650, 1800, 1950, 2100],    // index 0..3 = 2-bit symbol value (same for both markers)
   SYM_MS: 40,
   SYNC_MS: 80,
   GUARD_MS: 40,
@@ -602,10 +602,11 @@ var MIC = {
   recentSync:0, muteUntil:0,
   hist:[],                              // per-hop {s, data[4], isSync}
   pending:[],                           // {s,src} onsets awaiting a fully-buffered frame (src: tone|chirp)
-  _chirpTmpl:null, _chirpEt:0, _chirpLen:0, _prevChirp:false,
+  _chirpTmpl:null, _chirpEt:0, _chirpLen:0, _prevChirp:false, _dbgMaxRho:0,
   // chirp matched-filter thresholds (tune on real hardware): coarse = permissive trigger to catch
-  // the peak region; strict = accept threshold applied to the refined peak ρ (in 0..1).
-  chirpCoarseThr:0.12, chirpStrictThr:0.30,
+  // the peak region; strict = accept threshold applied to the refined peak ρ (in 0..1). Lowered for
+  // the narrow band, where less time-bandwidth gives a lower (but cleaner, in-band) correlation peak.
+  chirpCoarseThr:0.08, chirpStrictThr:0.15,
   _lastAud:null,                        // last raw decode {t,v} for the temporal-agreement gate
   pushSample:null, onSync:null,
 
@@ -703,7 +704,9 @@ var MIC = {
       var cLen=this._chirpLen, HOPC=Math.max(1, Math.round(0.002*sr));   // 2 ms coarse hop
       if (this.nextHopC < this.bufBase) this.nextHopC = this.bufBase;
       while (this.nextHopC + cLen <= end){
-        var isC = this._chirpRho(this.nextHopC - this.bufBase) > this.chirpCoarseThr;
+        var rhoC = this._chirpRho(this.nextHopC - this.bufBase);
+        if (rhoC > this._dbgMaxRho) this._dbgMaxRho = rhoC;   // diagnostic: best correlation this interval
+        var isC = rhoC > this.chirpCoarseThr;
         if (isC && !this._prevChirp && this.nextHopC > this.muteUntil){
           this.pending.push({ s:this.nextHopC, src:'chirp' });
           this.muteUntil = this.nextHopC + frameLen;
@@ -731,6 +734,20 @@ var MIC = {
       var h=this.hist[i]; mx=Math.max(mx, h.data[0],h.data[1],h.data[2],h.data[3]);
     }
     return mx*0.02 + 1e-9;
+  },
+
+  // Diagnostic: relative energy (dB vs the in-band peak) at probe freqs over the last ~0.5 s of mic
+  // audio. Shows the REAL passband THIS phone's getUserMedia stream sees (NS/AGC off) — use it to
+  // confirm/retune the SYNC + data frequencies to where the speaker→room→mic chain actually delivers.
+  _bandProfile: function(){
+    if (!this.buf || this.bufLen < this.sr*0.4) return '(buffering)';
+    var probes=[800,1000,1200,1500,1650,1800,1950,2100,2300,2600,3000,3500];
+    var win=Math.min(this.bufLen, Math.round(this.sr*0.5)), off=this.bufLen-win;
+    var e=[], mx=1e-12;
+    for (var i=0;i<probes.length;i++){ var p=this._goertzel(off, win, probes[i]); e.push(p); if(p>mx)mx=p; }
+    var s='';
+    for (var j=0;j<probes.length;j++) s += probes[j]+':'+Math.round(10*Math.log10(e[j]/mx+1e-12))+' ';
+    return s.trim();
   },
 
   _goertzel: function(off, len, freq){
@@ -790,7 +807,7 @@ var MIC = {
   },
 
   // Refine the coarse (hop-quantised, window-biased) sync onset to the true sync-tone
-  // start. The 80ms sync tone is a clean 1200 Hz block; measure its half-power region and
+  // start. The 80ms sync tone is a clean 1500 Hz block; measure its half-power region and
   // take (midpoint - syncLen/2) — symmetric, so immune to leading/trailing window smear.
   _refineOnset: function(coarse, syncLen){
     var sr=this.sr, win=Math.round(0.010*sr), step=Math.round(0.002*sr);
@@ -1025,6 +1042,10 @@ var GEN = {
     var r=EST.result();
     log('[dbg] vid '+(dv/3).toFixed(1)+'/s aud '+(da/3).toFixed(1)+'/s  vN='+EST.vid.length+' aN='+EST.aud.length+
         (r ? ('  off='+r.offset+' spread=±'+r.spread+' span='+(r.spanMs/1000).toFixed(0)+'s'+(locked?' LOCKED':'')) : '  (waiting)'));
+    if (MIC.running){
+      log('[band dB] '+MIC._bandProfile());
+      log('[chirp] best ρ/3s='+MIC._dbgMaxRho.toFixed(3)+'  accept≥'+MIC.chirpStrictThr); MIC._dbgMaxRho=0;
+    }
   }, 3000);
   window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, vid:EST.vid.length, aud:EST.aud.length,
     lastVid:EST.lastVidMs, lastAud:EST.lastAudMs, locked:locked, lockedVal:lockedVal, result:EST.result() }; };
