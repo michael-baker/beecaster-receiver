@@ -270,12 +270,12 @@
    16-bit value disambiguates any |offset| < 32768 ms. Everything sits in the narrow
    ~1.5-2.1 kHz band measured to survive a real 5 m speaker->mic capture (steep
    roll-off above ~2.2 kHz killed the old higher tones). ======================== */
-var VERSION = '2026-06-06-companion-v8b-decodedbg';
+var VERSION = '2026-06-06-companion-v8c-longsym';
 var PROTO = {
   SYNC_FREQ: 1500,                         // steady-tone SYNC marker ("tones" method); 150Hz below data
   CHIRP_F0: 1500, CHIRP_F1: 2150,          // swept-chirp SYNC marker ("chirp" method); spans SYNC_MS, in-band
   DATA_FREQS: [1650, 1800, 1950, 2100],    // index 0..3 = 2-bit symbol value (same for both markers)
-  SYM_MS: 40,
+  SYM_MS: 100,                             // long symbols ride out room reverb (new tone outlasts prior ring)
   SYNC_MS: 80,
   GUARD_MS: 40,
   N_DATA_SYMS: 10,                         // 8 value + 2 checksum
@@ -841,9 +841,11 @@ var MIC = {
     onsetSample=refined;
     var syms=[];
     for (var k=0;k<PROTO.N_DATA_SYMS;k++){
-      var center = onsetSample + syncLen + Math.round((k+0.5)*symLen);
-      var winStart = center - Math.round(symLen*0.4);
-      var winLen = Math.round(symLen*0.8);
+      // Sample the LATTER part of each (long) symbol slot: by then the previous symbol's reverb
+      // ring has decayed and the current steady tone dominates. Critical in live/reverberant rooms.
+      var slotStart = onsetSample + syncLen + k*symLen;
+      var winStart = slotStart + Math.round(symLen*0.45);
+      var winLen = Math.round(symLen*0.50);
       var off = winStart - this.bufBase;
       if (off<0 || off+winLen > this.bufLen) return;
       var best=-1, bpk=0;
@@ -864,7 +866,7 @@ var MIC = {
     var push=false;
     if (this._lastAud){
       var dtReal=tMs-this._lastAud.t, dVal=wrapSigned(val-this._lastAud.v, 16);
-      if (dtReal>0 && dtReal<2000 && Math.abs(dVal-dtReal)<200) push=true;
+      if (dtReal>0 && dtReal<3000 && Math.abs(dVal-dtReal)<200) push=true;
     }
     this._lastAud={ t:tMs, v:val };
     if (push){ this._dbgPush++; if (this.pushSample) this.pushSample(tMs, val); }

@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-05-r27-single-sync';
+        var RECEIVER_VERSION = '2026-06-06-r28-fast-calib-stop';
 
         // ── Telemetry (Tier 1) ───────────────────────────────────────────────────
         // The receiver is where every freeze/sync issue actually happens, but the server could
@@ -136,6 +136,13 @@
                                  // constant; only re-baked on a re-anchor (reanchorSeq change).
         var _lastReanchorSeq = -1; // last reanchorSeq seen; a change = "Save" → one clean re-anchor
         var _reanchorPending = false; // set by the poll on a reanchorSeq change; the drift loop does one clean seek
+        // A/V-sync calibration stop: the barcode/tone test pattern is part of the CONTINUOUS stream, so
+        // when the user hits Stop it is still buffered ~10-15 s ahead of the play head and would linger
+        // that long. We watch calibActive on the audio-clock poll and, on the true→false edge, blank the
+        // screen + mute the CAF beep INSTANTLY, then reveal the theme once the buffered pattern drains.
+        var _lastCalibActive = false; // last calibActive seen on the poll (edge detect)
+        var _calibStopBlanked = false; // true while we're holding the post-Stop blank/mute
+        var _calibStopRevealTimer = null; // drains-then-reveals the theme after a Stop
         var _serverRtt   = 0;    // round-trip time estimate to server
         var _cafPlaying  = false;
         var _videoReady  = false;
@@ -1166,6 +1173,14 @@
                     .then(function (r) { return r.json(); })
                     .then(function (d) {
                         _serverRtt = Date.now() - t0;
+                        // Calibration Stop edge (independent of epoch readiness): hide the buffered
+                        // barcode/tone the instant the test ends, instead of waiting for it to drain.
+                        var calibActive = (d.calibActive === true);
+                        if (calibActive !== _lastCalibActive) {
+                            _lastCalibActive = calibActive;
+                            if (!calibActive) _calibStopBlank(player, cafEl);       // Stop → blank + mute now
+                            else if (_calibStopBlanked) _calibStopReveal(cafEl);    // re-Start after a Stop → reveal
+                        }
                         if (d.epochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
@@ -1384,6 +1399,11 @@
             if (_pollTimer)  { clearTimeout(_pollTimer); _pollTimer = null; }
             if (_epochPollTimer) { clearInterval(_epochPollTimer); _epochPollTimer = null; }
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
+            // Drop any pending calibration-stop blank/mute — a fresh LOAD owns the overlay + audio now.
+            if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
+            _lastCalibActive = false; _calibStopBlanked = false;
+            var _cafReset = document.getElementById('caf-el');
+            if (_cafReset) { try { _cafReset.muted = false; } catch (e) {} }
             _lastSeekMs = 0;
             _audioLastMs = -1; _audioLastWall = 0; _audioHeld = false;
             _playerLastT = -1; _playerStallWall = 0; _startWaitCount = 0;
@@ -1413,6 +1433,38 @@
         function _showOverlay(opacity) {
             var el = document.getElementById('overlay');
             if (el) el.style.opacity = String(opacity);
+        }
+
+        // Calibration Stop: the test pattern is part of the continuous stream, so the Stop only swaps
+        // content (barcode/tone → theme) at the live WRITE edge — ~10-15 s ahead of what the receiver is
+        // showing. Rather than wait for that to drain (the "Stop takes 5-10 s" complaint), cover the
+        // buffered pattern with the black overlay and mute the CAF beep immediately, then reveal the
+        // theme once the buffered pattern has played out (drain ≈ buffer-ahead at rate≈1).
+        function _calibStopBlank(player, cafEl) {
+            _calibStopBlanked = true;
+            var bufAheadMs = 0;
+            try {
+                if (player && player.buffered && player.buffered.length > 0)
+                    bufAheadMs = Math.max(0, (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000);
+            } catch (e) {}
+            // Floor (cover the 0.4 s fade + poll jitter) and cap (guard against a garbage buffer reading).
+            var revealMs = Math.min(20000, Math.max(1500, bufAheadMs + 1000));
+            console.log('[cws] calibration stopped — overlay + CAF mute now; reveal theme in ~' +
+                        Math.round(revealMs) + 'ms (buffer drain)');
+            _showOverlay(1);
+            if (cafEl) { try { cafEl.muted = true; } catch (e) {} }
+            if (_calibStopRevealTimer) clearTimeout(_calibStopRevealTimer);
+            _calibStopRevealTimer = setTimeout(function () {
+                _calibStopRevealTimer = null;
+                _calibStopReveal(document.getElementById('caf-el'));
+            }, revealMs);
+        }
+
+        function _calibStopReveal(cafEl) {
+            if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
+            _calibStopBlanked = false;
+            if (cafEl) { try { cafEl.muted = false; } catch (e) {} }
+            _showOverlay(0);
         }
 
         // Report this device's codec/feature support to the plugin (read-only; the settings page
