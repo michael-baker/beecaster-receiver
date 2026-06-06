@@ -270,7 +270,7 @@
    16-bit value disambiguates any |offset| < 32768 ms. Everything sits in the narrow
    ~1.5-2.1 kHz band measured to survive a real 5 m speaker->mic capture (steep
    roll-off above ~2.2 kHz killed the old higher tones). ======================== */
-var VERSION = '2026-06-06-companion-v8-narrowband';
+var VERSION = '2026-06-06-companion-v8b-decodedbg';
 var PROTO = {
   SYNC_FREQ: 1500,                         // steady-tone SYNC marker ("tones" method); 150Hz below data
   CHIRP_F0: 1500, CHIRP_F1: 2150,          // swept-chirp SYNC marker ("chirp" method); spans SYNC_MS, in-band
@@ -603,6 +603,7 @@ var MIC = {
   hist:[],                              // per-hop {s, data[4], isSync}
   pending:[],                           // {s,src} onsets awaiting a fully-buffered frame (src: tone|chirp)
   _chirpTmpl:null, _chirpEt:0, _chirpLen:0, _prevChirp:false, _dbgMaxRho:0,
+  _dbgFrames:0, _dbgCksum:0, _dbgPush:0, _dbgRefineFail:0, _dbgLastSyms:'-',
   // chirp matched-filter thresholds (tune on real hardware): coarse = permissive trigger to catch
   // the peak region; strict = accept threshold applied to the refined peak ρ (in 0..1). Lowered for
   // the narrow band, where less time-bandwidth gives a lower (but cleaner, in-band) correlation peak.
@@ -790,7 +791,10 @@ var MIC = {
   // if the refined peak ρ is below the strict accept threshold (rejects noise / a passing tone).
   _refineOnsetChirp: function(coarse, syncLen){
     var sr=this.sr, L=this._chirpLen;
-    var lo=coarse - Math.round(0.006*sr), hi=coarse + Math.round(0.010*sr);
+    // Wide window: the coarse trigger fires on the correlation's RISING edge (first ρ>coarseThr),
+    // which can be many ms before the true peak when reverb broadens the correlation — so search
+    // well forward of the trigger to be sure of bracketing the peak.
+    var lo=coarse - Math.round(0.010*sr), hi=coarse + Math.round(0.025*sr);
     var stepA=Math.max(1, Math.round(0.0004*sr));               // ~0.4 ms coarse step
     var best=-1, bestRho=0, s, off, r;
     for (s=lo; s<=hi; s+=stepA){
@@ -833,7 +837,7 @@ var MIC = {
   _decodeFrameAt: function(onsetSample, src, syncLen, symLen){
     var refined = (src==='chirp') ? this._refineOnsetChirp(onsetSample, syncLen)
                                   : this._refineOnset(onsetSample, syncLen);
-    if (refined<0) return;
+    if (refined<0){ this._dbgRefineFail++; return; }
     onsetSample=refined;
     var syms=[];
     for (var k=0;k<PROTO.N_DATA_SYMS;k++){
@@ -846,8 +850,11 @@ var MIC = {
       for (var d=0; d<4; d++){ var pw=this._goertzel(off, winLen, PROTO.DATA_FREQS[d]); if(pw>bpk){bpk=pw; best=d;} }
       syms.push(best);
     }
+    this._dbgFrames++;
     var val=symbolsToValue(syms);
+    this._dbgLastSyms = src[0]+':'+syms.join('')+(val===null?' ck✗':' ck✓='+val);
     if (val===null) return;
+    this._dbgCksum++;
     this.recentSync = performance.now();
     var tMs=this._timeOfSample(onsetSample);
     $('rAud').textContent = val;
@@ -860,7 +867,7 @@ var MIC = {
       if (dtReal>0 && dtReal<2000 && Math.abs(dVal-dtReal)<200) push=true;
     }
     this._lastAud={ t:tMs, v:val };
-    if (push && this.pushSample) this.pushSample(tMs, val);
+    if (push){ this._dbgPush++; if (this.pushSample) this.pushSample(tMs, val); }
   }
 };
 
@@ -1045,6 +1052,8 @@ var GEN = {
     if (MIC.running){
       log('[band dB] '+MIC._bandProfile());
       log('[chirp] best ρ/3s='+MIC._dbgMaxRho.toFixed(3)+'  accept≥'+MIC.chirpStrictThr); MIC._dbgMaxRho=0;
+      log('[decode] frames='+MIC._dbgFrames+' cksumOK='+MIC._dbgCksum+' pushed='+MIC._dbgPush+' refineFail='+MIC._dbgRefineFail+'  last '+MIC._dbgLastSyms);
+      MIC._dbgFrames=MIC._dbgCksum=MIC._dbgPush=MIC._dbgRefineFail=0;
     }
   }, 3000);
   window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, vid:EST.vid.length, aud:EST.aud.length,
