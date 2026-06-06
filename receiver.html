@@ -38,7 +38,7 @@
 
         // Bump on every receiver change so the settings panel can confirm the Chromecast is
         // running the current build
-        var RECEIVER_VERSION = '2026-06-06-r28-fast-calib-stop';
+        var RECEIVER_VERSION = '2026-06-07-r29-fast-pause-stop';
 
         // ── Telemetry (Tier 1) ───────────────────────────────────────────────────
         // The receiver is where every freeze/sync issue actually happens, but the server could
@@ -145,6 +145,11 @@
         var _calibStopRevealTimer = null; // drains-then-reveals the theme after a Stop
         var _serverRtt   = 0;    // round-trip time estimate to server
         var _cafPlaying  = false;
+        var _everPlayed  = false; // true once playback has started at least once this session.
+                                  // Gates the manifest poll: (_everPlayed && !_cafPlaying) == "was
+                                  // playing, now paused" → stop fetching forward so the buffer can't
+                                  // bloat while paused/stopped. False during startup so pre-buffering
+                                  // is never blocked; reset on every _reset() (re-LOAD).
         var _videoReady  = false;
         var _maxBufferedWindowSec = 24;
         var _backBufferKeepSec = 10;
@@ -327,6 +332,7 @@
         // ── CAF PLAYING ────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
             _cafPlaying = true;
+            _everPlayed = true;   // playback has started → arm the pause-bloat gate in _pollManifest
             if (_mode === 'caf_wav_sync') {
                 // CAF now owns audio — do NOT silence it
                 var p = document.getElementById('player');
@@ -610,6 +616,18 @@
 
         // Parse m3u8, fetch new segments, schedule next poll
         function _pollManifest(baseUrl) {
+            // Pause-bloat gate: while paused/stopped the play-head is frozen but the server's live
+            // edge keeps advancing, so fetching+appending forward segments here would grow the MSE
+            // buffer without bound — the documented "bloat → wedge the weak receiver" failure. Skip
+            // the fetch while we were-playing-but-are-now-paused and just re-check shortly; the next
+            // PLAYING resumes it. Only gate AFTER playback has started (_everPlayed) so startup
+            // pre-buffering is never blocked. Safe against segment gaps: a pause ≥2s forces a clean
+            // re-LOAD on resume (full reset, no gap), and a sub-2s pause skips < one playlist window,
+            // so the missed segments are still fetchable on resume.
+            if (_everPlayed && !_cafPlaying) {
+                _pollTimer = setTimeout(function () { _pollManifest(baseUrl); }, 1000);
+                return;
+            }
             var manifestUrl = baseUrl + 'cast/split_video/stream.m3u8';
             fetch(manifestUrl)
                 .then(function (r) {
@@ -1416,7 +1434,7 @@
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
             _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1; _videoEpochSet = false; _cdispMs = 0;
             _cdispBaked = 0; _lastReanchorSeq = -1; _reanchorPending = false;
-            _videoReady = false; _cafPlaying = false;
+            _videoReady = false; _cafPlaying = false; _everPlayed = false;
             _lastManifestInfo = null; _lastClockInfo = null;
             if (_debugWatchTimer) clearInterval(_debugWatchTimer);
             _debugWatchTimer = null;

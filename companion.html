@@ -265,14 +265,15 @@
    DATA value = 16-bit (contentMs & 0xFFFF) MSB-first + 4-bit checksum (=(sum of the
    4 nibbles)&0xF). 16-bit value disambiguates any |offset| < 32768 ms. Band
    ~1.5-2.1 kHz (measured to survive a real 5 m speaker->mic capture). =========== */
-var VERSION = '2026-06-06-companion-v9-chirpdata';
+var VERSION = '2026-06-07-companion-v10-ppm';
 var PROTO = {
   SYNC_FREQ: 1500,                         // steady-tone SYNC marker (legacy TONE method); 150Hz below data
-  CHIRP_F0: 1500, CHIRP_F1: 2150,          // chirp band: the SYNC chirp AND the up/down DATA chirps span this
+  CHIRP_F0: 1500, CHIRP_F1: 2150,          // chirp band: the SYNC chirp AND the PPM DATA chirps span this
   DATA_FREQS: [1650, 1800, 1950, 2100],    // TONE-method 4-FSK data tones (legacy)
   SYM_MS: 100,                             // TONE-method data symbol length (legacy)
-  DCHIRP_MS: 60,                           // CHIRP-method data symbol: one up/down chirp = 1 bit (robust default)
-  N_DATA_BITS: 20,                         // CHIRP method: 16-bit value (MSB-first) + 4-bit checksum
+  DCHIRP_MS: 60,                           // CHIRP-method (PPM) data chirp pulse length
+  PPM_GAP_MS: 80,                          // CHIRP-method (PPM) slot spacing; symbol = 2*PPM_GAP_MS, chirp in early/late slot
+  N_DATA_BITS: 20,                         // 16-bit value (MSB-first) + 4-bit checksum, 1 bit per PPM symbol
   SYNC_MS: 80,
   GUARD_MS: 40,
   N_DATA_SYMS: 10,                         // TONE method: 8 value + 2 checksum symbols
@@ -677,9 +678,9 @@ var MIC = {
     var sr=this.sr;
     var WIN=Math.round(0.030*sr), HOP=Math.round(0.010*sr);
     var syncLen=Math.round(PROTO.SYNC_MS/1000*sr), symLen=Math.round(PROTO.SYM_MS/1000*sr);
-    var dChirpLen=Math.round(PROTO.DCHIRP_MS/1000*sr);
+    var ppmSymLen=2*Math.round(PROTO.PPM_GAP_MS/1000*sr);
     var toneFrameLen=syncLen + PROTO.N_DATA_SYMS*symLen;        // TONE method (10 data tones)
-    var chirpFrameLen=syncLen + PROTO.N_DATA_BITS*dChirpLen;    // CHIRP method (20 up/down data chirps)
+    var chirpFrameLen=syncLen + PROTO.N_DATA_BITS*ppmSymLen;    // CHIRP method (20 PPM symbols)
     var freqs=[PROTO.SYNC_FREQ].concat(PROTO.DATA_FREQS);
     var end = this.bufBase + this.bufLen;
 
@@ -728,7 +729,7 @@ var MIC = {
     for (var i=0;i<this.pending.length;i++){
       var pe=this.pending[i], onset=pe.s;
       if (onset < this.bufBase) continue;
-      var fl=(pe.src==='chirp')?chirpFrameLen:toneFrameLen, sl=(pe.src==='chirp')?dChirpLen:symLen;
+      var fl=(pe.src==='chirp')?chirpFrameLen:toneFrameLen, sl=(pe.src==='chirp')?ppmSymLen:symLen;
       if (onset + fl + sl <= end) this._decodeFrameAt(onset, pe.src);
       else keep.push(pe);
     }
@@ -804,6 +805,14 @@ var MIC = {
   },
   _chirpRho: function(off){ return this._corr(off, this._chirpTmpl, this._chirpEt); },
 
+  // Best normalised correlation over a small ±window — absorbs minor onset/clock drift per PPM slot
+  // so a slightly-misaligned chirp still scores near its true strength (echo-tolerant).
+  _corrBest: function(off, t, et){
+    var sr=this.sr, rng=Math.round(0.008*sr), step=Math.max(1,Math.round(0.002*sr)), b=0;
+    for (var d=-rng; d<=rng; d+=step){ var o=off+d; if(o<0||o+t.length>this.bufLen) continue; var r=this._corr(o,t,et); if(r>b)b=r; }
+    return b;
+  },
+
   // Refine a coarse chirp trigger to the precise onset. The matched-filter peak IS the chirp start
   // (template[0] = chirp start), so no half-power trick is needed. Two-stage (coarse step then a
   // 1-sample pass around it) keeps the audio-thread cost bounded. Returns the onset sample, or -1
@@ -863,13 +872,15 @@ var MIC = {
 
     var val;
     if (src==='chirp'){
-      var dLen=Math.round(PROTO.DCHIRP_MS/1000*sr), bits=0;
+      // PPM: each symbol = 2 slots (2*PPM_GAP); the chirp sits in the EARLY slot (bit 1) or LATE (bit 0).
+      // Decode = which slot has the stronger chirp correlation. Presence/position survives echoes.
+      var dGap=Math.round(PROTO.PPM_GAP_MS/1000*sr), symL=2*dGap, bits=0;
       for (var bi=0; bi<PROTO.N_DATA_BITS; bi++){
-        var coff=(onsetSample + syncLen + bi*dLen) - this.bufBase;
-        if (coff<0 || coff+dLen > this.bufLen) return;
-        var ru=this._corr(coff, this._upTmpl, this._upEt);   // up-chirp   = bit 1
-        var rd=this._corr(coff, this._dnTmpl, this._dnEt);   // down-chirp = bit 0
-        bits=(bits<<1)|(ru>=rd?1:0);
+        var symStart=(onsetSample + syncLen + bi*symL) - this.bufBase;
+        if (symStart<0 || symStart+symL > this.bufLen) return;
+        var cEarly=this._corrBest(symStart,      this._upTmpl, this._upEt);   // chirp in EARLY slot = bit 1
+        var cLate =this._corrBest(symStart+dGap, this._upTmpl, this._upEt);   // chirp in LATE slot  = bit 0
+        bits=(bits<<1)|(cEarly>=cLate?1:0);
       }
       this._dbgFrames++;
       val=bitsToValue(bits);
@@ -980,7 +991,7 @@ var GEN = {
 (function(){
   var trim=0;
   var locked=false, lockedVal=null;
-  var LOCK_SPREAD=45, LOCK_N=12, LOCK_SPAN=8000;
+  var LOCK_SPREAD=45, LOCK_N=6, LOCK_SPAN=8000;   // PPM frames are ~3.3s; offset is constant, so fewer samples lock it
   function word(ms){ return ms>0 ? 'audio AHEAD of video' : (ms<0 ? 'audio LAGS video' : 'in sync'); }
 
   var lastVidAccept=0, lastAudAccept=0, lastCamStatus='', audioAudible=false, _acceptT=0;
