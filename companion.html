@@ -257,24 +257,29 @@
    24-bit ms (MSB first) + 1 even-parity. white=1, black=0.
 
    AUDIO FSK timecode frame (repeats, ~1.9/s):
-     SYNC tone  @ SYNC_FREQ for SYNC_MS  -> onset = the time anchor; the value
-                                            encodes contentMs at this instant.
-     10 data symbols @ SYM_MS each, 4-FSK (2 bits/symbol, freq index = value):
+     SYNC marker @ SYNC_MS -> onset = the time anchor. ONE of two markers; the
+       companion auto-detects whichever is transmitted (no setting to match):
+         (a) steady SYNC_FREQ tone     -> Goertzel onset      ("tones" method)
+         (b) CHIRP_F0->CHIRP_F1 sweep  -> matched-filter onset ("chirp" method;
+             crosses room nulls + survives noise-suppression -> longer reach)
+     10 data symbols @ SYM_MS each, 4-FSK (2 bits/symbol, freq index = value) —
+     IDENTICAL for both markers:
         symbols[0..7]  = 16-bit (contentMs & 0xFFFF), MSB first  (8 syms)
         symbols[8..9]  = checksum nibble = (sum of the 4 nibbles)&0xF (2 syms)
      Then GUARD_MS of silence.
-   16-bit value disambiguates any |offset| < 32768 ms. Frequencies sit in the
-   2-3 kHz band (robust through TV speakers + phone mics; clear of rumble and
-   HF rolloff). ============================================================== */
-var VERSION = '2026-06-03-companion-v6-shared-barcode';
+   16-bit value disambiguates any |offset| < 32768 ms. The comfortable 1.2-2.4 kHz
+   band (chirp sweeps to 3.5 kHz) clears phone-mic roll-off on Android + iPhone and
+   stays below the piercing 3-4 kHz zone. ====================================== */
+var VERSION = '2026-06-06-companion-v7-chirp-or-tone';
 var PROTO = {
-  SYNC_FREQ: 800,
-  DATA_FREQS: [1500, 1900, 2300, 2700],   // index 0..3 = 2-bit symbol value
+  SYNC_FREQ: 1200,                         // steady-tone SYNC marker ("tones" method)
+  CHIRP_F0: 1500, CHIRP_F1: 3500,          // swept-chirp SYNC marker ("chirp" method); spans SYNC_MS
+  DATA_FREQS: [1500, 1800, 2100, 2400],    // index 0..3 = 2-bit symbol value (same for both markers)
   SYM_MS: 40,
   SYNC_MS: 80,
   GUARD_MS: 40,
   N_DATA_SYMS: 10,                         // 8 value + 2 checksum
-  EDGE_MS: 3                               // raised-cosine ramp on tone edges
+  EDGE_MS: 3                               // raised-cosine ramp on tone/chirp edges
 };
 document.getElementById('ver').textContent = VERSION;
 
@@ -592,11 +597,15 @@ var MIC = {
   sr:48000,
   buf:null, bufLen:0, bufBase:0,        // flat sample buffer + absolute index of buf[0]
   CAP:0,                                // capacity (samples)
-  nextHop:0, processedInit:false,
+  nextHop:0, nextHopC:0, processedInit:false,
   t0perf:0, t0sample:0,                 // sample-index -> performance.now anchor
   recentSync:0, muteUntil:0,
   hist:[],                              // per-hop {s, data[4], isSync}
-  pending:[],                           // sync onsets awaiting a fully-buffered frame
+  pending:[],                           // {s,src} onsets awaiting a fully-buffered frame (src: tone|chirp)
+  _chirpTmpl:null, _chirpEt:0, _chirpLen:0, _prevChirp:false,
+  // chirp matched-filter thresholds (tune on real hardware): coarse = permissive trigger to catch
+  // the peak region; strict = accept threshold applied to the refined peak ρ (in 0..1).
+  chirpCoarseThr:0.12, chirpStrictThr:0.30,
   _lastAud:null,                        // last raw decode {t,v} for the temporal-agreement gate
   pushSample:null, onSync:null,
 
@@ -616,8 +625,9 @@ var MIC = {
       this.node = this.ctx.createScriptProcessor(bufSize, 1, 1);
       this.CAP = Math.round(this.sr*2.5);
       this.buf = new Float32Array(this.CAP);
-      this.bufLen=0; this.bufBase=0; this.nextHop=0; this.processedInit=false;
+      this.bufLen=0; this.bufBase=0; this.nextHop=0; this.nextHopC=0; this.processedInit=false;
       this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0; this._lastAud=null;
+      this._prevChirp=false; this._initChirp();
       var self=this;
       this.node.onaudioprocess = function(e){ self._onAudio(e.inputBuffer.getChannelData(0)); };
       this.src.connect(this.node); this.node.connect(this.ctx.destination); // node needs a sink to pull
@@ -664,6 +674,8 @@ var MIC = {
     var frameLen=syncLen + PROTO.N_DATA_SYMS*symLen;
     var freqs=[PROTO.SYNC_FREQ].concat(PROTO.DATA_FREQS);
     var end = this.bufBase + this.bufLen;
+
+    // ── SYNC detector A: steady-tone marker (Goertzel). Detects the "tones" method. ──
     if (this.nextHop < this.bufBase) this.nextHop = this.bufBase;
     while (this.nextHop + WIN <= end){
       var off = this.nextHop - this.bufBase;
@@ -677,18 +689,37 @@ var MIC = {
       // Queue the frame on a sync RISING edge. The data symbols haven't arrived in
       // the buffer yet, so we decode later (below) once the whole frame is present.
       if (isSync && (!prev || !prev.isSync) && this.nextHop > this.muteUntil){
-        this.pending.push(this.nextHop);
+        this.pending.push({ s:this.nextHop, src:'tone' });
         this.muteUntil = this.nextHop + frameLen;
       }
       this.nextHop += HOP;
     }
+
+    // ── SYNC detector B: swept-chirp marker (matched filter). Detects the "chirp" method. ──
+    // Runs ALONGSIDE A so the phone auto-adapts to whichever marker the server transmits — a
+    // steady tone barely correlates with a sweep and the chirp has no energy at SYNC_FREQ, so in
+    // practice only one ever fires. Needs the FULL chirp buffered (longer look-ahead than A).
+    if (this._chirpTmpl){
+      var cLen=this._chirpLen, HOPC=Math.max(1, Math.round(0.002*sr));   // 2 ms coarse hop
+      if (this.nextHopC < this.bufBase) this.nextHopC = this.bufBase;
+      while (this.nextHopC + cLen <= end){
+        var isC = this._chirpRho(this.nextHopC - this.bufBase) > this.chirpCoarseThr;
+        if (isC && !this._prevChirp && this.nextHopC > this.muteUntil){
+          this.pending.push({ s:this.nextHopC, src:'chirp' });
+          this.muteUntil = this.nextHopC + frameLen;
+        }
+        this._prevChirp = isC;
+        this.nextHopC += HOPC;
+      }
+    }
+
     // Decode pending frames now fully buffered; drop any that scrolled out (lost).
     var keep=[];
     for (var i=0;i<this.pending.length;i++){
-      var onset=this.pending[i];
+      var pe=this.pending[i], onset=pe.s;
       if (onset < this.bufBase) continue;
-      if (onset + frameLen + symLen <= end) this._decodeFrameAt(onset, syncLen, symLen);
-      else keep.push(onset);
+      if (onset + frameLen + symLen <= end) this._decodeFrameAt(onset, pe.src, syncLen, symLen);
+      else keep.push(pe);
     }
     this.pending = keep;
     if (this.onSync) this.onSync(performance.now()-this.recentSync < 1500);
@@ -709,8 +740,57 @@ var MIC = {
     return (s1*s1 + s2*s2 - coeff*s1*s2)/len;
   },
 
+  // Build the chirp matched-filter template at the mic sample rate from the SHARED chirp params.
+  // Defined in continuous time, so it matches the C# transmitter regardless of either side's
+  // sample rate. Energy-normalised correlation makes detection amplitude-independent (so the TX
+  // amplitude is irrelevant here, and no envelope scaling is needed beyond matching the edge ramp).
+  _initChirp: function(){
+    var sr=this.sr, L=Math.round(PROTO.SYNC_MS/1000*sr);
+    var edge=Math.max(1, Math.round(PROTO.EDGE_MS/1000*sr));
+    var f0=PROTO.CHIRP_F0, f1=PROTO.CHIRP_F1, T=PROTO.SYNC_MS/1000, k=(f1-f0)/T;
+    var t=new Float32Array(L), et=0;
+    for (var i=0;i<L;i++){
+      var tau=i/sr, env=1.0;
+      if (i<edge) env=i/edge; else if (i>L-edge) env=(L-i)/edge;
+      if (env<0) env=0;
+      var v=env*Math.sin(2*Math.PI*(f0*tau + 0.5*k*tau*tau));
+      t[i]=v; et+=v*v;
+    }
+    this._chirpTmpl=t; this._chirpLen=L; this._chirpEt=et>0?et:1e-9;
+  },
+
+  // Normalised cross-correlation magnitude |ρ| in [0,1] between buf[off..off+L) and the template.
+  _chirpRho: function(off){
+    var t=this._chirpTmpl, L=this._chirpLen, b=this.buf, dot=0, eb=0;
+    for (var i=0;i<L;i++){ var x=b[off+i]; dot+=x*t[i]; eb+=x*x; }
+    if (eb<=1e-12) return 0;
+    return Math.abs(dot)/Math.sqrt(eb*this._chirpEt);
+  },
+
+  // Refine a coarse chirp trigger to the precise onset. The matched-filter peak IS the chirp start
+  // (template[0] = chirp start), so no half-power trick is needed. Two-stage (coarse step then a
+  // 1-sample pass around it) keeps the audio-thread cost bounded. Returns the onset sample, or -1
+  // if the refined peak ρ is below the strict accept threshold (rejects noise / a passing tone).
+  _refineOnsetChirp: function(coarse, syncLen){
+    var sr=this.sr, L=this._chirpLen;
+    var lo=coarse - Math.round(0.006*sr), hi=coarse + Math.round(0.010*sr);
+    var stepA=Math.max(1, Math.round(0.0004*sr));               // ~0.4 ms coarse step
+    var best=-1, bestRho=0, s, off, r;
+    for (s=lo; s<=hi; s+=stepA){
+      off=s - this.bufBase; if (off<0 || off+L>this.bufLen) continue;
+      r=this._chirpRho(off); if (r>bestRho){ bestRho=r; best=s; }
+    }
+    if (best<0) return -1;
+    for (s=best-stepA; s<=best+stepA; s++){                     // fine 1-sample pass around the peak
+      off=s - this.bufBase; if (off<0 || off+L>this.bufLen) continue;
+      r=this._chirpRho(off); if (r>bestRho){ bestRho=r; best=s; }
+    }
+    if (bestRho < this.chirpStrictThr) return -1;
+    return best;
+  },
+
   // Refine the coarse (hop-quantised, window-biased) sync onset to the true sync-tone
-  // start. The 80ms sync tone is a clean 800Hz block; measure its half-power region and
+  // start. The 80ms sync tone is a clean 1200 Hz block; measure its half-power region and
   // take (midpoint - syncLen/2) — symmetric, so immune to leading/trailing window smear.
   _refineOnset: function(coarse, syncLen){
     var sr=this.sr, win=Math.round(0.010*sr), step=Math.round(0.002*sr);
@@ -733,8 +813,9 @@ var MIC = {
   // Decode one frame whose samples are fully present. Sample each data symbol over
   // the central 80% of its slot (avoids the raised-cosine edges), pick the strongest
   // of the 4 tones, validate the checksum, and emit (onset phone-time, value).
-  _decodeFrameAt: function(onsetSample, syncLen, symLen){
-    var refined=this._refineOnset(onsetSample, syncLen);
+  _decodeFrameAt: function(onsetSample, src, syncLen, symLen){
+    var refined = (src==='chirp') ? this._refineOnsetChirp(onsetSample, syncLen)
+                                  : this._refineOnset(onsetSample, syncLen);
     if (refined<0) return;
     onsetSample=refined;
     var syms=[];
