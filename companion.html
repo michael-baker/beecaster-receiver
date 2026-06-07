@@ -269,7 +269,7 @@
    needs +/-100ms) + 4-bit CRC-4 (poly x^4+x+1); 9 bits disambiguate |offset|<32768ms.
    Decode validates the CRC then medians many frames over a long window, so a stray
    misdecode is rejected as an outlier. Band ~1.5-2.1 kHz (survives a real 5m capture). */
-var VERSION = '2026-06-07-companion-v11-chirp-v2';
+var VERSION = '2026-06-07-companion-v11b-chirp-v2-diag';
 var PROTO = {
   SYNC_FREQ: 1500,                         // steady-tone SYNC marker (legacy TONE method); 150Hz below data
   CHIRP_F0: 1500, CHIRP_F1: 2150,          // chirp band: the SYNC chirp AND the PPM DATA chirps span this
@@ -616,15 +616,20 @@ var MIC = {
   nextHop:0, nextHopC:0, processedInit:false,
   t0perf:0, t0sample:0,                 // sample-index -> performance.now anchor
   recentSync:0, muteUntil:0,
+  methodLock:null,                      // once a method is positively identified ('chirp'|'tone'), stop running
+                                        // the OTHER detector — they share muteUntil/pending and the v2 DOWN-sync
+                                        // (ends @1500Hz) + UP data (starts @1500Hz) trip the legacy tone Goertzel.
   hist:[],                              // per-hop {s, data[4], isSync}
   pending:[],                           // {s,src} onsets awaiting a fully-buffered frame (src: tone|chirp)
   _chirpTmpl:null, _chirpEt:0, _chirpLen:0, _prevChirp:false, _dbgMaxRho:0,
   _upTmpl:null, _upEt:0,                // UP-chirp DATA template (chirp method; SYNC uses the DOWN _chirpTmpl)
   _dbgFrames:0, _dbgCksum:0, _dbgPush:0, _dbgRefineFail:0, _dbgLastSyms:'-',
-  // chirp matched-filter thresholds (tune on real hardware): coarse = permissive trigger to catch
-  // the peak region; strict = accept threshold applied to the refined peak ρ (in 0..1). Lowered for
-  // the narrow band, where less time-bandwidth gives a lower (but cleaner, in-band) correlation peak.
-  chirpCoarseThr:0.08, chirpStrictThr:0.15,
+  _dbgSyncRho:0, _dbgPres:0, _dbgMargA:0, _dbgMargB:0, _dbgCoin:0, _dbgLastQ:-1,   // per-frame chirp-decode diagnostics
+  // chirp matched-filter thresholds (tune on real hardware): coarse = trigger to catch the peak region;
+  // strict = accept threshold applied to the refined peak ρ (in 0..1). Coarse sits ABOVE the up-data-chirp
+  // cross-correlation (~0.074 vs the DOWN-sync template) and below the real sync (ρ~0.3-0.56 observed), so
+  // data chirps don't false-trigger sync acquisition; well below the real sync so detection stays reliable.
+  chirpCoarseThr:0.12, chirpStrictThr:0.15,
   pushSample:null, onSync:null,
 
   start: async function(){
@@ -648,7 +653,7 @@ var MIC = {
       this.CAP = Math.round(this.sr * Math.max(2.5, chirpFrameSec + 1.6));
       this.buf = new Float32Array(this.CAP);
       this.bufLen=0; this.bufBase=0; this.nextHop=0; this.nextHopC=0; this.processedInit=false;
-      this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0;
+      this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0; this.methodLock=null;
       this._prevChirp=false; this._initChirp();
       var self=this;
       this.node.onaudioprocess = function(e){ self._onAudio(e.inputBuffer.getChannelData(0)); };
@@ -700,6 +705,10 @@ var MIC = {
     var end = this.bufBase + this.bufLen;
 
     // ── SYNC detector A: steady-tone marker (Goertzel). Detects the "tones" method. ──
+    // Skipped once the CHIRP method is positively identified — the v2 down-sync ends at SYNC_FREQ and
+    // up-data-chirps start there, so this would otherwise false-fire on the chirp signal and, via the
+    // shared muteUntil, starve detector B. (If the server really sends tones, chirp never locks and this runs.)
+    if (this.methodLock !== 'chirp'){
     if (this.nextHop < this.bufBase) this.nextHop = this.bufBase;
     while (this.nextHop + WIN <= end){
       var off = this.nextHop - this.bufBase;
@@ -718,12 +727,12 @@ var MIC = {
       }
       this.nextHop += HOP;
     }
+    }
 
     // ── SYNC detector B: swept-chirp marker (matched filter). Detects the "chirp" method. ──
-    // Runs ALONGSIDE A so the phone auto-adapts to whichever marker the server transmits — a
-    // steady tone barely correlates with a sweep and the chirp has no energy at SYNC_FREQ, so in
-    // practice only one ever fires. Needs the FULL chirp buffered (longer look-ahead than A).
-    if (this._chirpTmpl){
+    // Auto-adapts alongside A until a method locks. Skipped once the TONE method is positively
+    // identified (a tone checksum passed). Needs the FULL chirp buffered (longer look-ahead than A).
+    if (this._chirpTmpl && this.methodLock !== 'tone'){
       var cLen=this._chirpLen, HOPC=Math.max(1, Math.round(0.002*sr));   // 2 ms coarse hop
       if (this.nextHopC < this.bufBase) this.nextHopC = this.bufBase;
       while (this.nextHopC + cLen <= end){
@@ -822,10 +831,12 @@ var MIC = {
   },
   _chirpRho: function(off){ return this._corr(off, this._chirpTmpl, this._chirpEt); },
 
-  // Best normalised correlation over a small ±window — absorbs minor onset/clock drift per PPM slot
-  // so a slightly-misaligned chirp still scores near its true strength (echo-tolerant).
-  _corrBest: function(off, t, et){
-    var sr=this.sr, rng=Math.round(0.008*sr), step=Math.max(1,Math.round(0.002*sr)), b=0;
+  // Best normalised correlation over a ±winMs window (default 8ms) — absorbs onset jitter AND clock
+  // skew per PPM slot. Later symbols sit further from the onset, so a fixed % mic-vs-cast clock skew is
+  // a larger absolute drift there; the decoder passes a window that grows with the slot's distance so a
+  // skewed chirp still lands in the search. The wide PPM gap leaves room for this without the two slots' windows overlapping.
+  _corrBest: function(off, t, et, winMs){
+    var sr=this.sr, rng=Math.round((winMs||8)/1000*sr), step=Math.max(1,Math.round(0.002*sr)), b=0;
     for (var d=-rng; d<=rng; d+=step){ var o=off+d; if(o<0||o+t.length>this.bufLen) continue; var r=this._corr(o,t,et); if(r>b)b=r; }
     return b;
   },
@@ -886,21 +897,35 @@ var MIC = {
                                   : this._refineOnset(onsetSample, syncLen);
     if (refined<0){ this._dbgRefineFail++; return; }
     onsetSample=refined;
+    // A refined chirp onset (down-sync matched at ≥ strict ρ) positively identifies the CHIRP method —
+    // lock it so the legacy tone detector stops interfering, even before the data bits decode cleanly.
+    if (src==='chirp') this.methodLock='chirp';
 
     var val;
     if (src==='chirp'){
       // PPM: each symbol = 2 slots (2*PPM_GAP); the chirp sits in the EARLY slot (bit 1) or LATE (bit 0).
-      // Decode = which slot has the stronger chirp correlation. Presence/position survives echoes.
+      // Decode = which slot has the stronger UP-chirp correlation. Position survives echoes/comb-nulls.
       var dGap=Math.round(PROTO.PPM_GAP_MS/1000*sr), symL=2*dGap, bits=0;
-      for (var bi=0; bi<PROTO.N_DATA_BITS; bi++){
+      var nb=PROTO.N_DATA_BITS, half=nb>>1;
+      var presSum=0, margA=0, margB=0, coin=0;   // diagnostics: presence + margin split by FRAME position
+      for (var bi=0; bi<nb; bi++){
         var symStart=(onsetSample + syncLen + bi*symL) - this.bufBase;
         if (symStart<0 || symStart+symL > this.bufLen) return;
-        var cEarly=this._corrBest(symStart,      this._upTmpl, this._upEt);   // chirp in EARLY slot = bit 1
-        var cLate =this._corrBest(symStart+dGap, this._upTmpl, this._upEt);   // chirp in LATE slot  = bit 0
+        var winMs=8 + 0.004*(syncLen + bi*symL)/sr*1000;   // grow window with slot distance to track ~±0.4% clock skew
+        var cEarly=this._corrBest(symStart,      this._upTmpl, this._upEt, winMs);   // chirp in EARLY slot = bit 1
+        var cLate =this._corrBest(symStart+dGap, this._upTmpl, this._upEt, winMs);   // chirp in LATE slot  = bit 0
         bits=(bits<<1)|(cEarly>=cLate?1:0);
+        var m=Math.abs(cEarly-cLate); presSum+=Math.max(cEarly,cLate); if(m<0.03) coin++;
+        if (bi<half) margA+=m; else margB+=m;   // early-frame bits vs late-frame bits
       }
       this._dbgFrames++;
       val=bitsToValue(bits);
+      // [adec] diagnostics. margA = mean margin of the FIRST half of bits, margB = the LAST half. If
+      // margA >> margB the late bits are drifting out of their slots (clock skew/timing). If BOTH are
+      // small (<~0.05) the room is killing per-bit contrast (a contrast problem, not a timing one).
+      this._dbgSyncRho=this._corr(onsetSample-this.bufBase, this._chirpTmpl, this._chirpEt);
+      this._dbgPres=presSum/nb; this._dbgMargA=margA/half; this._dbgMargB=margB/(nb-half);
+      this._dbgCoin=coin; this._dbgLastQ=(val===null?-1:(val>>7));
       this._dbgLastSyms='c:'+bits.toString(2)+(val===null?' ck✗':' ck✓='+val);
     } else {
       var symLen=Math.round(PROTO.SYM_MS/1000*sr), syms=[];
@@ -919,6 +944,7 @@ var MIC = {
     }
     if (val===null) return;            // CRC (or tone checksum) failed — reject; never reaches the median
     this._dbgCksum++;
+    if (src==='tone') this.methodLock='tone';   // a valid tone checksum positively identifies the legacy method
     this.recentSync = performance.now();
     var tMs=this._timeOfSample(onsetSample);
     $('rAud').textContent = val;
@@ -1113,7 +1139,11 @@ var GEN = {
     if (MIC.running){
       log('[band dB] '+MIC._bandProfile());
       log('[chirp] best ρ/3s='+MIC._dbgMaxRho.toFixed(3)+'  accept≥'+MIC.chirpStrictThr); MIC._dbgMaxRho=0;
-      log('[decode] frames='+MIC._dbgFrames+' cksumOK='+MIC._dbgCksum+' pushed='+MIC._dbgPush+' refineFail='+MIC._dbgRefineFail+'  last '+MIC._dbgLastSyms);
+      log('[decode] frames='+MIC._dbgFrames+' cksumOK='+MIC._dbgCksum+' pushed='+MIC._dbgPush+' refineFail='+MIC._dbgRefineFail+' lock='+(MIC.methodLock||'none')+'  last '+MIC._dbgLastSyms);
+      // Per-frame chirp diagnostics (last decoded frame): syncρ = sync match at the refined onset;
+      // pres = mean chirp presence; margE/L = mean early/late decision margin for the FIRST/LAST half of
+      // bits; coin = bits near coin-flip. margE>>margL => clock skew/drift; both<~0.05 => no contrast.
+      log('[adec] syncρ='+MIC._dbgSyncRho.toFixed(2)+' pres='+MIC._dbgPres.toFixed(2)+' margE/L='+MIC._dbgMargA.toFixed(3)+'/'+MIC._dbgMargB.toFixed(3)+' coin='+MIC._dbgCoin+'/'+PROTO.N_DATA_BITS+' lastq='+MIC._dbgLastQ);
       MIC._dbgFrames=MIC._dbgCksum=MIC._dbgPush=MIC._dbgRefineFail=0;
     }
   }, 3000);
