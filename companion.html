@@ -256,33 +256,21 @@
    VIDEO barcode (rendered by the plugin's calibration.html): 33 blocks, 8 sentinel(0xA5) +
    24-bit ms (MSB first) + 1 even-parity. white=1, black=0.
 
-   AUDIO timecode frame: SYNC marker @ SYNC_MS (onset = time anchor) then DATA then
-   GUARD_MS silence. The companion auto-detects whichever method is transmitted:
-     CHIRP method (robust default, "v2"): SYNC = DOWN-chirp CHIRP_F1->CHIRP_F0; DATA =
-       N_DATA_BITS PPM symbols, one 80ms UP-chirp per symbol in its EARLY (bit 1) or
-       LATE (bit 0) slot, slots PPM_GAP_MS apart, the rest silent. Sync & data sweep in
-       OPPOSITE directions => near-orthogonal matched filters (sync never fires on a
-       data chirp); the wide PPM gap lets the "silent" slot decay to the floor so the
-       early/late decision keeps real contrast even in a reverberant room.
-     TONE method (legacy): SYNC = SYNC_FREQ tone; DATA = 10 x 4-FSK tones (2 bits ea).
-   CHIRP value = 9-bit round(contentMs/128) MSB-first (128ms quantum; companion only
-   needs +/-100ms) + 4-bit CRC-4 (poly x^4+x+1); 9 bits disambiguate |offset|<32768ms.
-   Decode validates the CRC then medians many frames over a long window, so a stray
-   misdecode is rejected as an outlier. Band ~1.5-2.1 kHz (survives a real 5m capture). */
-var VERSION = '2026-06-07-companion-v11b-chirp-v2-diag';
+   AUDIO timecode = BEACON (no data payload). A DOWN-chirp CHIRP_F1->CHIRP_F0 of SYNC_MS, emitted
+   at content-ms == 0 (mod BEACON_MS), silence between. The companion TIMES each beacon onset
+   (matched filter) and pairs it with the video barcode at that instant: the beacon's content-ms is
+   a multiple of BEACON_MS, so the A/V offset = -(videoMs mod BEACON_MS) folded to ±BEACON_MS/2,
+   medianed over many beacons. NO per-bit decode — every past data scheme (4-FSK tones, up/down
+   chirps, PPM-position chirps) lost its per-bit contrast in real rooms (comb nulls / reverb / AGC);
+   only chirp ONSET detection survived (ρ≈0.3-0.6). Precision = onset timing + barcode, not BEACON_MS.
+   Band ~1.5-2.1 kHz (survives a real 5m capture). MUST match FskTimecode (SYNC_MS/BEACON_MS/band). */
+var VERSION = '2026-06-07-companion-v13-beacon';
 var PROTO = {
-  SYNC_FREQ: 1500,                         // steady-tone SYNC marker (legacy TONE method); 150Hz below data
-  CHIRP_F0: 1500, CHIRP_F1: 2150,          // chirp band: the SYNC chirp AND the PPM DATA chirps span this
-  DATA_FREQS: [1650, 1800, 1950, 2100],    // TONE-method 4-FSK data tones (legacy)
-  SYM_MS: 100,                             // TONE-method data symbol length (legacy)
-  DCHIRP_MS: 80,                           // CHIRP-method (PPM) data UP-chirp pulse length (= SYNC_MS)
-  PPM_GAP_MS: 200,                         // CHIRP-method (PPM) slot spacing; symbol = 2*PPM_GAP_MS, chirp in early/late slot.
-                                           // KEY reverb-tolerance knob: must outlast room reverb (robust to RT60~600ms; lower toward 120 for faster lock in dead rooms). MUST match FskTimecode.PpmGapMs.
-  N_DATA_BITS: 13,                         // CHIRP: 9-bit value (MSB-first, 128ms quantum) + 4-bit CRC, 1 bit per PPM symbol. MUST match FskTimecode.NDataBits.
-  SYNC_MS: 80,
-  GUARD_MS: 40,
-  N_DATA_SYMS: 10,                         // TONE method: 8 value + 2 checksum symbols
-  EDGE_MS: 3                               // raised-cosine ramp on tone/chirp edges
+  CHIRP_F0: 1500, CHIRP_F1: 2150,          // beacon chirp band (the DOWN-chirp sweeps F1 -> F0)
+  SYNC_MS: 150,                            // beacon chirp length (longer = more matched-filter gain). MUST match FskTimecode.SyncMs.
+  BEACON_MS: 4096,                         // beacon period: a chirp at content-ms == 0 (mod BEACON_MS). Sets the
+                                           // unambiguous offset range (±BEACON_MS/2 ≈ ±2s); raise if offsets can exceed that. MUST match FskTimecode.BeaconMs.
+  EDGE_MS: 3                               // raised-cosine ramp on chirp edges
 };
 document.getElementById('ver').textContent = VERSION;
 
@@ -293,38 +281,6 @@ function log(){ var s=[].slice.call(arguments).join(' ');
 function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
 function median(arr){ if(!arr.length) return NaN; var a=arr.slice().sort(function(x,y){return x-y;});
   var m=a.length>>1; return a.length%2 ? a[m] : (a[m-1]+a[m])/2; }
-
-// FSK value<->symbol codec — must stay byte-identical to FskTimecode.ValueToSymbols/SymbolAt (C#).
-function valueToSymbols(value){
-  var v = value & 0xFFFF;
-  var syms = [];
-  for (var b=15; b>=0; b-=2) syms.push(((v>>b)&1)*2 + ((v>>(b-1))&1));   // 8 symbols, MSB first
-  var ck = (((v>>12)&0xF)+((v>>8)&0xF)+((v>>4)&0xF)+(v&0xF)) & 0xF;
-  syms.push((ck>>2)&3); syms.push(ck&3);                                 // 2 checksum symbols
-  return syms; // length 10
-}
-function symbolsToValue(syms){
-  if (syms.length < 10) return null;
-  var v = 0;
-  for (var i=0;i<8;i++) v = (v<<2) | (syms[i]&3);
-  v &= 0xFFFF;
-  var ckGot = ((syms[8]&3)<<2) | (syms[9]&3);
-  var ckCalc = (((v>>12)&0xF)+((v>>8)&0xF)+((v>>4)&0xF)+(v&0xF)) & 0xF;
-  return ckGot === ckCalc ? v : null;
-}
-// CRC-4 (poly x^4+x+1 = 0b10011) over the 9-bit chirp value, MSB-first. Byte-identical to FskTimecode.Crc4 (C#).
-function crc4(value9){
-  var reg=(value9 & 0x1FF)<<4;                 // 9 data bits, then 4 zero bits for the remainder
-  for (var i=12;i>=4;i--){ if ((reg>>i)&1) reg ^= (0x13 << (i-4)); }   // 0x13 = 0b10011
-  return reg & 0xF;
-}
-// CHIRP-method bit codec — 13 bits = 9-bit value (MSB-first, 128ms quantum) + 4-bit CRC. Mirrors FskTimecode
-// (C#). Returns the reconstructed content-ms (value*128, 0..65408) on a valid CRC, else null. The 128ms
-// quantum is fine: the offset is medianed over many frames and we only need +/-100ms.
-function bitsToValue(bits13){
-  var q=(bits13>>>4)&0x1FF, ckGot=bits13&0xF;
-  return crc4(q)===ckGot ? (q<<7) : null;      // q<<7 == q*128 ms
-}
 
 var EST = {
   vid: [],            // {t, v}  v = 24-bit video ms (barcode)
@@ -613,22 +569,15 @@ var MIC = {
   sr:48000,
   buf:null, bufLen:0, bufBase:0,        // flat sample buffer + absolute index of buf[0]
   CAP:0,                                // capacity (samples)
-  nextHop:0, nextHopC:0, processedInit:false,
+  nextHopC:0, processedInit:false,
   t0perf:0, t0sample:0,                 // sample-index -> performance.now anchor
   recentSync:0, muteUntil:0,
-  methodLock:null,                      // once a method is positively identified ('chirp'|'tone'), stop running
-                                        // the OTHER detector — they share muteUntil/pending and the v2 DOWN-sync
-                                        // (ends @1500Hz) + UP data (starts @1500Hz) trip the legacy tone Goertzel.
-  hist:[],                              // per-hop {s, data[4], isSync}
-  pending:[],                           // {s,src} onsets awaiting a fully-buffered frame (src: tone|chirp)
+  pending:[],                           // {s} chirp-sync onsets awaiting a fully-buffered frame
   _chirpTmpl:null, _chirpEt:0, _chirpLen:0, _prevChirp:false, _dbgMaxRho:0,
-  _upTmpl:null, _upEt:0,                // UP-chirp DATA template (chirp method; SYNC uses the DOWN _chirpTmpl)
-  _dbgFrames:0, _dbgCksum:0, _dbgPush:0, _dbgRefineFail:0, _dbgLastSyms:'-',
-  _dbgSyncRho:0, _dbgPres:0, _dbgMargA:0, _dbgMargB:0, _dbgCoin:0, _dbgLastQ:-1,   // per-frame chirp-decode diagnostics
-  // chirp matched-filter thresholds (tune on real hardware): coarse = trigger to catch the peak region;
-  // strict = accept threshold applied to the refined peak ρ (in 0..1). Coarse sits ABOVE the up-data-chirp
-  // cross-correlation (~0.074 vs the DOWN-sync template) and below the real sync (ρ~0.3-0.56 observed), so
-  // data chirps don't false-trigger sync acquisition; well below the real sync so detection stays reliable.
+  _dbgBeacons:0, _dbgPush:0, _dbgRefineFail:0, _dbgSyncRho:0, _dbgLastV:-1,   // beacon diagnostics
+  // beacon matched-filter thresholds (tune on real hardware): coarse = trigger to catch the peak region;
+  // strict = accept threshold applied to the refined peak ρ (in 0..1). Both sit below the real beacon
+  // (ρ~0.3-0.6 observed) so detection stays reliable, above the noise floor so silence doesn't trigger.
   chirpCoarseThr:0.12, chirpStrictThr:0.15,
   pushSample:null, onSync:null,
 
@@ -646,14 +595,13 @@ var MIC = {
       this.src = this.ctx.createMediaStreamSource(this.stream);
       var bufSize=1024;
       this.node = this.ctx.createScriptProcessor(bufSize, 1, 1);
-      // The ring buffer must hold a WHOLE timecode frame so the decoder can read all of it AFTER the
-      // onset is found. The chirp PPM frame is the longest (~5.3s with the v2 wide PPM gap); size it to
-      // the frame + margin. (A buffer SHORTER than the frame would never fully buffer it, so it'd never decode.)
-      var chirpFrameSec = (PROTO.SYNC_MS + PROTO.N_DATA_BITS*2*PROTO.PPM_GAP_MS + PROTO.GUARD_MS)/1000;
-      this.CAP = Math.round(this.sr * Math.max(2.5, chirpFrameSec + 1.6));
+      // The beacon carries no data — there's nothing to read AFTER the onset — so the ring buffer only
+      // needs to hold one beacon chirp + the refine look-ahead. ~1.2 s gives ample margin (and lets the
+      // detector see a full beacon even if a callback stalls). Far smaller than the old 5.3s PPM frame.
+      this.CAP = Math.round(this.sr * 1.2);
       this.buf = new Float32Array(this.CAP);
-      this.bufLen=0; this.bufBase=0; this.nextHop=0; this.nextHopC=0; this.processedInit=false;
-      this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0; this.methodLock=null;
+      this.bufLen=0; this.bufBase=0; this.nextHopC=0; this.processedInit=false;
+      this.pending=[]; this.muteUntil=0; this.recentSync=0;
       this._prevChirp=false; this._initChirp();
       var self=this;
       this.node.onaudioprocess = function(e){ self._onAudio(e.inputBuffer.getChannelData(0)); };
@@ -696,43 +644,16 @@ var MIC = {
 
   _process: function(){
     var sr=this.sr;
-    var WIN=Math.round(0.030*sr), HOP=Math.round(0.010*sr);
-    var syncLen=Math.round(PROTO.SYNC_MS/1000*sr), symLen=Math.round(PROTO.SYM_MS/1000*sr);
-    var ppmSymLen=2*Math.round(PROTO.PPM_GAP_MS/1000*sr);
-    var toneFrameLen=syncLen + PROTO.N_DATA_SYMS*symLen;        // TONE method (10 data tones)
-    var chirpFrameLen=syncLen + PROTO.N_DATA_BITS*ppmSymLen;    // CHIRP method (20 PPM symbols)
-    var freqs=[PROTO.SYNC_FREQ].concat(PROTO.DATA_FREQS);
+    var syncLen=Math.round(PROTO.SYNC_MS/1000*sr);
+    var beaconLen=Math.round(PROTO.BEACON_MS/1000*sr);
+    var muteLen=Math.round(beaconLen*0.5);   // after a hit, mute half a beacon period: longer than any
+                                             // reverb tail, shorter than the period, so we re-arm before the next beacon
+    var refineAhead=Math.round(0.030*sr);    // _refineOnsetChirp searches up to +25 ms past the trigger
     var end = this.bufBase + this.bufLen;
 
-    // ── SYNC detector A: steady-tone marker (Goertzel). Detects the "tones" method. ──
-    // Skipped once the CHIRP method is positively identified — the v2 down-sync ends at SYNC_FREQ and
-    // up-data-chirps start there, so this would otherwise false-fire on the chirp signal and, via the
-    // shared muteUntil, starve detector B. (If the server really sends tones, chirp never locks and this runs.)
-    if (this.methodLock !== 'chirp'){
-    if (this.nextHop < this.bufBase) this.nextHop = this.bufBase;
-    while (this.nextHop + WIN <= end){
-      var off = this.nextHop - this.bufBase;
-      var p=[]; for (var f=0; f<freqs.length; f++) p.push(this._goertzel(off, WIN, freqs[f]));
-      var sync=p[0], data=[p[1],p[2],p[3],p[4]];
-      var dmax=Math.max(data[0],data[1],data[2],data[3]);
-      var isSync = sync>dmax*1.6 && sync>this._floor()*4;
-      var prev = this.hist.length ? this.hist[this.hist.length-1] : null;
-      this.hist.push({ s:this.nextHop, data:data, isSync:isSync });
-      if (this.hist.length>400) this.hist.shift();
-      // Queue the frame on a sync RISING edge. The data symbols haven't arrived in
-      // the buffer yet, so we decode later (below) once the whole frame is present.
-      if (isSync && (!prev || !prev.isSync) && this.nextHop > this.muteUntil){
-        this.pending.push({ s:this.nextHop, src:'tone' });
-        this.muteUntil = this.nextHop + toneFrameLen;
-      }
-      this.nextHop += HOP;
-    }
-    }
-
-    // ── SYNC detector B: swept-chirp marker (matched filter). Detects the "chirp" method. ──
-    // Auto-adapts alongside A until a method locks. Skipped once the TONE method is positively
-    // identified (a tone checksum passed). Needs the FULL chirp buffered (longer look-ahead than A).
-    if (this._chirpTmpl && this.methodLock !== 'tone'){
+    // BEACON detector: the swept DOWN-chirp marker (matched filter), fired on its onset. Needs the FULL
+    // chirp buffered before it can correlate (look-ahead of cLen). Timed below once the refine window is in.
+    if (this._chirpTmpl){
       var cLen=this._chirpLen, HOPC=Math.max(1, Math.round(0.002*sr));   // 2 ms coarse hop
       if (this.nextHopC < this.bufBase) this.nextHopC = this.bufBase;
       while (this.nextHopC + cLen <= end){
@@ -740,33 +661,24 @@ var MIC = {
         if (rhoC > this._dbgMaxRho) this._dbgMaxRho = rhoC;   // diagnostic: best correlation this interval
         var isC = rhoC > this.chirpCoarseThr;
         if (isC && !this._prevChirp && this.nextHopC > this.muteUntil){
-          this.pending.push({ s:this.nextHopC, src:'chirp' });
-          this.muteUntil = this.nextHopC + chirpFrameLen;
+          this.pending.push({ s:this.nextHopC });
+          this.muteUntil = this.nextHopC + muteLen;
         }
         this._prevChirp = isC;
         this.nextHopC += HOPC;
       }
     }
 
-    // Decode pending frames now fully buffered; drop any that scrolled out (lost).
+    // Time each pending beacon once its chirp + refine window are buffered; drop any that scrolled out.
     var keep=[];
     for (var i=0;i<this.pending.length;i++){
       var pe=this.pending[i], onset=pe.s;
       if (onset < this.bufBase) continue;
-      var fl=(pe.src==='chirp')?chirpFrameLen:toneFrameLen, sl=(pe.src==='chirp')?ppmSymLen:symLen;
-      if (onset + fl + sl <= end) this._decodeFrameAt(onset, pe.src);
+      if (onset + syncLen + refineAhead <= end) this._onBeacon(onset);
       else keep.push(pe);
     }
     this.pending = keep;
     if (this.onSync) this.onSync(performance.now()-this.recentSync < 1500);
-  },
-
-  _floor: function(){
-    // crude noise floor = small fraction of recent peak data energy
-    var mx=1e-9; for (var i=Math.max(0,this.hist.length-50); i<this.hist.length; i++){
-      var h=this.hist[i]; mx=Math.max(mx, h.data[0],h.data[1],h.data[2],h.data[3]);
-    }
-    return mx*0.02 + 1e-9;
   },
 
   // Diagnostic: relative energy (dB vs the in-band peak) at probe freqs over the last ~0.5 s of mic
@@ -790,16 +702,14 @@ var MIC = {
     return (s1*s1 + s2*s2 - coeff*s1*s2)/len;
   },
 
-  // Build the chirp matched-filter template at the mic sample rate from the SHARED chirp params.
-  // Defined in continuous time, so it matches the C# transmitter regardless of either side's
-  // sample rate. Energy-normalised correlation makes detection amplitude-independent (so the TX
-  // amplitude is irrelevant here, and no envelope scaling is needed beyond matching the edge ramp).
+  // Build the beacon matched-filter template (DOWN-chirp f1 -> f0, SYNC_MS long) at the mic sample
+  // rate from the SHARED chirp params. Defined in continuous time, so it matches the C# transmitter
+  // regardless of either side's sample rate. Energy-normalised correlation makes detection
+  // amplitude-independent (TX amplitude irrelevant; only the edge ramp must match).
   _initChirp: function(){
     var sr=this.sr, L=Math.round(PROTO.SYNC_MS/1000*sr);
     var edge=Math.max(1, Math.round(PROTO.EDGE_MS/1000*sr));
     var f0=PROTO.CHIRP_F0, f1=PROTO.CHIRP_F1, T=PROTO.SYNC_MS/1000, k=(f1-f0)/T;
-    // SYNC template = DOWN-chirp (f1 -> f0). Data chirps sweep UP, so this matched filter is
-    // near-orthogonal to them and won't false-trigger on a data chirp (which would mis-anchor the frame).
     var t=new Float32Array(L), et=0;
     for (var i=0;i<L;i++){
       var tau=i/sr, env=1.0;
@@ -809,18 +719,6 @@ var MIC = {
       t[i]=v; et+=v*v;
     }
     this._chirpTmpl=t; this._chirpLen=L; this._chirpEt=et>0?et:1e-9;
-
-    // DATA template = UP-chirp (f0 -> f1), DCHIRP_MS long. The PPM decoder compares this template's
-    // energy in the EARLY vs LATE slot of each symbol — position (not direction) carries the bit.
-    var dL=Math.round(PROTO.DCHIRP_MS/1000*sr), Td=dL/sr, kd=(f1-f0)/Td;
-    var up=new Float32Array(dL), eu=0;
-    for (var j=0;j<dL;j++){
-      var td=j/sr, ev=1.0;
-      if (j<edge) ev=j/edge; else if (j>dL-edge) ev=(dL-j)/edge;
-      if (ev<0) ev=0;
-      var u=ev*Math.sin(2*Math.PI*(f0*td + 0.5*kd*td*td)); up[j]=u; eu+=u*u;   // up: f0 -> f1
-    }
-    this._upTmpl=up; this._upEt=eu>0?eu:1e-9;
   },
 
   // Normalised cross-correlation magnitude |ρ| in [0,1] between buf[off..off+t.length) and template t.
@@ -830,16 +728,6 @@ var MIC = {
     return eb<=1e-12 ? 0 : Math.abs(dot)/Math.sqrt(eb*et);
   },
   _chirpRho: function(off){ return this._corr(off, this._chirpTmpl, this._chirpEt); },
-
-  // Best normalised correlation over a ±winMs window (default 8ms) — absorbs onset jitter AND clock
-  // skew per PPM slot. Later symbols sit further from the onset, so a fixed % mic-vs-cast clock skew is
-  // a larger absolute drift there; the decoder passes a window that grows with the slot's distance so a
-  // skewed chirp still lands in the search. The wide PPM gap leaves room for this without the two slots' windows overlapping.
-  _corrBest: function(off, t, et, winMs){
-    var sr=this.sr, rng=Math.round((winMs||8)/1000*sr), step=Math.max(1,Math.round(0.002*sr)), b=0;
-    for (var d=-rng; d<=rng; d+=step){ var o=off+d; if(o<0||o+t.length>this.bufLen) continue; var r=this._corr(o,t,et); if(r>b)b=r; }
-    return b;
-  },
 
   // Refine a coarse chirp trigger to the precise onset. The matched-filter peak IS the chirp start
   // (template[0] = chirp start), so no half-power trick is needed. Two-stage (coarse step then a
@@ -866,93 +754,25 @@ var MIC = {
     return best;
   },
 
-  // Refine the coarse (hop-quantised, window-biased) sync onset to the true sync-tone
-  // start. The 80ms sync tone is a clean 1500 Hz block; measure its half-power region and
-  // take (midpoint - syncLen/2) — symmetric, so immune to leading/trailing window smear.
-  _refineOnset: function(coarse, syncLen){
-    var sr=this.sr, win=Math.round(0.010*sr), step=Math.round(0.002*sr);
-    var lo=coarse - Math.round(0.040*sr), hi=coarse + Math.round(0.100*sr);
-    var pos=[], pw=[], peak=0;
-    for (var s=lo; s<=hi; s+=step){
-      var off=s - this.bufBase;
-      if (off<0 || off+win>this.bufLen) continue;
-      var p=this._goertzel(off, win, PROTO.SYNC_FREQ);
-      pos.push(s); pw.push(p); if (p>peak) peak=p;
-    }
-    if (peak<=0 || pos.length<5) return -1;
-    var thr=peak*0.5, first=-1, last=-1;
-    for (var i=0;i<pw.length;i++){ if (pw[i]>=thr){ if(first<0)first=i; last=i; } }
-    if (first<0) return -1;
-    var mid=(pos[first]+pos[last])/2;
-    return Math.round(mid - syncLen/2);
-  },
-
-  // Decode one fully-buffered frame. Refine the onset (chirp peak or tone half-power), then read DATA:
-  //   chirp method = N_DATA_BITS PPM bits (UP-chirp matched filter, EARLY vs LATE slot per bit),
-  //   tone  method = 10 × 4-FSK tones (Goertzel; legacy). Validate the CRC/checksum, then emit
-  //   (onset phone-time, value); EST medians many frames so a stray misdecode is just an outlier.
-  _decodeFrameAt: function(onsetSample, src){
-    var sr=this.sr, syncLen=Math.round(PROTO.SYNC_MS/1000*sr);
-    var refined = (src==='chirp') ? this._refineOnsetChirp(onsetSample, syncLen)
-                                  : this._refineOnset(onsetSample, syncLen);
+  // Time one buffered beacon. Refine the DOWN-chirp onset (reject if its peak ρ < strict), then pair
+  // the onset with the video barcode at that instant. The beacon's content-ms is a multiple of
+  // BEACON_MS and the A/V offset is small (<BEACON_MS/2), so the beacon's content-ms is the multiple
+  // of BEACON_MS NEAREST the video time. Push (onset phone-time, that multiple) into EST, which medians
+  // A − V over many beacons → the A/V offset. Nothing is decoded from the audio (onset timing only).
+  _onBeacon: function(onsetSample){
+    var refined = this._refineOnsetChirp(onsetSample);
     if (refined<0){ this._dbgRefineFail++; return; }
-    onsetSample=refined;
-    // A refined chirp onset (down-sync matched at ≥ strict ρ) positively identifies the CHIRP method —
-    // lock it so the legacy tone detector stops interfering, even before the data bits decode cleanly.
-    if (src==='chirp') this.methodLock='chirp';
-
-    var val;
-    if (src==='chirp'){
-      // PPM: each symbol = 2 slots (2*PPM_GAP); the chirp sits in the EARLY slot (bit 1) or LATE (bit 0).
-      // Decode = which slot has the stronger UP-chirp correlation. Position survives echoes/comb-nulls.
-      var dGap=Math.round(PROTO.PPM_GAP_MS/1000*sr), symL=2*dGap, bits=0;
-      var nb=PROTO.N_DATA_BITS, half=nb>>1;
-      var presSum=0, margA=0, margB=0, coin=0;   // diagnostics: presence + margin split by FRAME position
-      for (var bi=0; bi<nb; bi++){
-        var symStart=(onsetSample + syncLen + bi*symL) - this.bufBase;
-        if (symStart<0 || symStart+symL > this.bufLen) return;
-        var winMs=8 + 0.004*(syncLen + bi*symL)/sr*1000;   // grow window with slot distance to track ~±0.4% clock skew
-        var cEarly=this._corrBest(symStart,      this._upTmpl, this._upEt, winMs);   // chirp in EARLY slot = bit 1
-        var cLate =this._corrBest(symStart+dGap, this._upTmpl, this._upEt, winMs);   // chirp in LATE slot  = bit 0
-        bits=(bits<<1)|(cEarly>=cLate?1:0);
-        var m=Math.abs(cEarly-cLate); presSum+=Math.max(cEarly,cLate); if(m<0.03) coin++;
-        if (bi<half) margA+=m; else margB+=m;   // early-frame bits vs late-frame bits
-      }
-      this._dbgFrames++;
-      val=bitsToValue(bits);
-      // [adec] diagnostics. margA = mean margin of the FIRST half of bits, margB = the LAST half. If
-      // margA >> margB the late bits are drifting out of their slots (clock skew/timing). If BOTH are
-      // small (<~0.05) the room is killing per-bit contrast (a contrast problem, not a timing one).
-      this._dbgSyncRho=this._corr(onsetSample-this.bufBase, this._chirpTmpl, this._chirpEt);
-      this._dbgPres=presSum/nb; this._dbgMargA=margA/half; this._dbgMargB=margB/(nb-half);
-      this._dbgCoin=coin; this._dbgLastQ=(val===null?-1:(val>>7));
-      this._dbgLastSyms='c:'+bits.toString(2)+(val===null?' ck✗':' ck✓='+val);
-    } else {
-      var symLen=Math.round(PROTO.SYM_MS/1000*sr), syms=[];
-      for (var k=0;k<PROTO.N_DATA_SYMS;k++){
-        var slotStart = onsetSample + syncLen + k*symLen;
-        var winStart = slotStart + Math.round(symLen*0.45), winLen = Math.round(symLen*0.50);
-        var off = winStart - this.bufBase;
-        if (off<0 || off+winLen > this.bufLen) return;
-        var best=-1, bpk=0;
-        for (var d=0; d<4; d++){ var pw=this._goertzel(off, winLen, PROTO.DATA_FREQS[d]); if(pw>bpk){bpk=pw; best=d;} }
-        syms.push(best);
-      }
-      this._dbgFrames++;
-      val=symbolsToValue(syms);
-      this._dbgLastSyms='t:'+syms.join('')+(val===null?' ck✗':' ck✓='+val);
-    }
-    if (val===null) return;            // CRC (or tone checksum) failed — reject; never reaches the median
-    this._dbgCksum++;
-    if (src==='tone') this.methodLock='tone';   // a valid tone checksum positively identifies the legacy method
+    this._dbgBeacons++;
+    this._dbgSyncRho = this._corr(refined - this.bufBase, this._chirpTmpl, this._chirpEt);
     this.recentSync = performance.now();
-    var tMs=this._timeOfSample(onsetSample);
-    $('rAud').textContent = val;
-    // Push every CRC-valid frame straight into EST, which medians many of them over a long window (the
-    // A/V offset is constant). No two-frame "advance" gate: chirp frames are ~5s apart (the old <3s gate
-    // could NEVER pass for the chirp method), and a 4-bit-CRC fluke (~1/16) is rejected as a median outlier.
-    this._dbgPush++;
-    if (this.pushSample) this.pushSample(tMs, val);
+    var tMs = this._timeOfSample(refined);
+    var vms = EST.predictVideo(tMs);     // video content-ms at the onset instant (null until video locks)
+    if (vms===null) return;              // can't resolve WHICH beacon yet — wait for the barcode
+    var B = PROTO.BEACON_MS;
+    var vAudio = ((Math.round(vms / B) * B) % 65536 + 65536) % 65536;   // nearest beacon phase to the video time
+    this._dbgLastV = vAudio; this._dbgPush++;
+    $('rAud').textContent = vAudio;
+    if (this.pushSample) this.pushSample(tMs, vAudio);
   }
 };
 
@@ -966,7 +786,7 @@ var GEN = {
     // align audio epoch with perf epoch
     this._acEpoch = this.ctx.currentTime;
     this.running=true;
-    this.schedNext = this.ctx.currentTime + 0.1;
+    this._beaconContentMs = null;   // _schedule aligns the first beacon to a content-ms multiple of BEACON_MS
     var self=this;
     this.timer=setInterval(function(){ self._schedule(); }, 80);
     this._draw();
@@ -985,32 +805,38 @@ var GEN = {
   },
   _schedule: function(){
     if(!this.running) return;
-    var sr=this.ctx.sampleRate;
-    var syncLen=PROTO.SYNC_MS/1000, symLen=PROTO.SYM_MS/1000, guard=PROTO.GUARD_MS/1000;
-    var frameDur=syncLen + PROTO.N_DATA_SYMS*symLen + guard;
+    var B=PROTO.BEACON_MS;
+    // _contentMsAtAC(ac) ≈ (ac - _acEpoch)*1000, so the AC time for content-ms c is _acEpoch + c/1000.
+    // Emit a beacon at every content-ms that is a multiple of B (matches FskTimecode's beacon phase).
+    if (this._beaconContentMs == null)
+      this._beaconContentMs = Math.ceil(this._contentMsAtAC(this.ctx.currentTime) / B) * B;
     var horizon=this.ctx.currentTime + this.schedAhead;
-    while (this.schedNext < horizon){
-      var start=this.schedNext;
-      var value=this._contentMsAtAC(start) & 0xFFFF;
-      this._emitFrame(start, value);
-      this.schedNext += frameDur;
+    while (this._acEpoch + this._beaconContentMs/1000 < horizon){
+      this._emitBeacon(this._acEpoch + this._beaconContentMs/1000);
+      this._beaconContentMs += B;
     }
   },
-  _emitFrame: function(start, value){
-    var syncLen=PROTO.SYNC_MS/1000, symLen=PROTO.SYM_MS/1000;
-    this._tone(start, syncLen, PROTO.SYNC_FREQ);
-    var syms=valueToSymbols(value);
-    for (var k=0;k<syms.length;k++) this._tone(start+syncLen+k*symLen, symLen, PROTO.DATA_FREQS[syms[k]]);
+  // Schedule one DOWN-chirp beacon. Mirrors FskTimecode.Fill so this self-test exercises the SAME
+  // waveform the plugin sends (the companion should then measure offset ≈ 0, since GEN's audio and
+  // barcode share one epoch).
+  _emitBeacon: function(at){
+    var sr=this.ctx.sampleRate, syncLen=Math.round(PROTO.SYNC_MS/1000*sr);
+    var buf=this.ctx.createBuffer(1, syncLen, sr), ch=buf.getChannelData(0);
+    this._chirpInto(ch, 0, syncLen, false, sr);   // DOWN-chirp beacon (f1 -> f0)
+    var node=this.ctx.createBufferSource(); node.buffer=buf;
+    node.connect(this.ctx.destination); node.start(at);
   },
-  _tone: function(at, dur, freq){
-    var o=this.ctx.createOscillator(), g=this.ctx.createGain(), e=PROTO.EDGE_MS/1000;
-    o.frequency.value=freq; o.type='sine';
-    g.gain.setValueAtTime(0, at);
-    g.gain.linearRampToValueAtTime(0.9, at+e);
-    g.gain.setValueAtTime(0.9, at+dur-e);
-    g.gain.linearRampToValueAtTime(0, at+dur);
-    o.connect(g); g.connect(this.ctx.destination);
-    o.start(at); o.stop(at+dur+0.005);
+  // Write one linear chirp of L samples into arr[off..], up = CHIRP_F0->CHIRP_F1 (down = the reverse),
+  // raised-cosine edge. Continuous-time phase, so it matches the decoder's matched-filter templates.
+  _chirpInto: function(arr, off, L, up, sr){
+    var f0=PROTO.CHIRP_F0, f1=PROTO.CHIRP_F1, k=(f1-f0)/(L/sr);
+    var edge=Math.max(1, Math.round(PROTO.EDGE_MS/1000*sr));
+    for (var i=0;i<L;i++){
+      var t=i/sr, env=1.0;
+      if (i<edge) env=i/edge; else if (i>L-edge) env=(L-i)/edge;
+      var ph = up ? (f0*t + 0.5*k*t*t) : (f1*t - 0.5*k*t*t);
+      arr[off+i] = 0.9*env*Math.sin(2*Math.PI*ph);
+    }
   },
   _draw: function(){
     var self=this, cv=$('genCanvas'), g=cv.getContext('2d');
@@ -1139,12 +965,12 @@ var GEN = {
     if (MIC.running){
       log('[band dB] '+MIC._bandProfile());
       log('[chirp] best ρ/3s='+MIC._dbgMaxRho.toFixed(3)+'  accept≥'+MIC.chirpStrictThr); MIC._dbgMaxRho=0;
-      log('[decode] frames='+MIC._dbgFrames+' cksumOK='+MIC._dbgCksum+' pushed='+MIC._dbgPush+' refineFail='+MIC._dbgRefineFail+' lock='+(MIC.methodLock||'none')+'  last '+MIC._dbgLastSyms);
-      // Per-frame chirp diagnostics (last decoded frame): syncρ = sync match at the refined onset;
-      // pres = mean chirp presence; margE/L = mean early/late decision margin for the FIRST/LAST half of
-      // bits; coin = bits near coin-flip. margE>>margL => clock skew/drift; both<~0.05 => no contrast.
-      log('[adec] syncρ='+MIC._dbgSyncRho.toFixed(2)+' pres='+MIC._dbgPres.toFixed(2)+' margE/L='+MIC._dbgMargA.toFixed(3)+'/'+MIC._dbgMargB.toFixed(3)+' coin='+MIC._dbgCoin+'/'+PROTO.N_DATA_BITS+' lastq='+MIC._dbgLastQ);
-      MIC._dbgFrames=MIC._dbgCksum=MIC._dbgPush=MIC._dbgRefineFail=0;
+      // [beacon] beacons = onsets detected this interval; pushed = those paired with a video lock and fed
+      // to EST; refineFail = triggers whose refined ρ was below strict; syncρ = match at the last refined
+      // onset; lastV = last pushed beacon-phase (ms). pushed climbing => the beacon path is working.
+      log('[beacon] beacons='+MIC._dbgBeacons+' pushed='+MIC._dbgPush+' refineFail='+MIC._dbgRefineFail+
+          ' syncρ='+MIC._dbgSyncRho.toFixed(2)+' lastV='+MIC._dbgLastV);
+      MIC._dbgBeacons=MIC._dbgPush=MIC._dbgRefineFail=0;
     }
   }, 3000);
   window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, vid:EST.vid.length, aud:EST.aud.length,
