@@ -258,22 +258,27 @@
 
    AUDIO timecode frame: SYNC marker @ SYNC_MS (onset = time anchor) then DATA then
    GUARD_MS silence. The companion auto-detects whichever method is transmitted:
-     CHIRP method (robust default): SYNC = up-chirp CHIRP_F0->CHIRP_F1; DATA = 20
-       up/down chirps (1 bit each), matched-filter decoded. Broadband, so every bit
-       crosses the room's comb-filter NULLS that kill narrowband tones at distance.
+     CHIRP method (robust default, "v2"): SYNC = DOWN-chirp CHIRP_F1->CHIRP_F0; DATA =
+       N_DATA_BITS PPM symbols, one 80ms UP-chirp per symbol in its EARLY (bit 1) or
+       LATE (bit 0) slot, slots PPM_GAP_MS apart, the rest silent. Sync & data sweep in
+       OPPOSITE directions => near-orthogonal matched filters (sync never fires on a
+       data chirp); the wide PPM gap lets the "silent" slot decay to the floor so the
+       early/late decision keeps real contrast even in a reverberant room.
      TONE method (legacy): SYNC = SYNC_FREQ tone; DATA = 10 x 4-FSK tones (2 bits ea).
-   DATA value = 16-bit (contentMs & 0xFFFF) MSB-first + 4-bit checksum (=(sum of the
-   4 nibbles)&0xF). 16-bit value disambiguates any |offset| < 32768 ms. Band
-   ~1.5-2.1 kHz (measured to survive a real 5 m speaker->mic capture). =========== */
-var VERSION = '2026-06-07-companion-v10b-bigbuffer';
+   CHIRP value = 9-bit round(contentMs/128) MSB-first (128ms quantum; companion only
+   needs +/-100ms) + 4-bit CRC-4 (poly x^4+x+1); 9 bits disambiguate |offset|<32768ms.
+   Decode validates the CRC then medians many frames over a long window, so a stray
+   misdecode is rejected as an outlier. Band ~1.5-2.1 kHz (survives a real 5m capture). */
+var VERSION = '2026-06-07-companion-v11-chirp-v2';
 var PROTO = {
   SYNC_FREQ: 1500,                         // steady-tone SYNC marker (legacy TONE method); 150Hz below data
   CHIRP_F0: 1500, CHIRP_F1: 2150,          // chirp band: the SYNC chirp AND the PPM DATA chirps span this
   DATA_FREQS: [1650, 1800, 1950, 2100],    // TONE-method 4-FSK data tones (legacy)
   SYM_MS: 100,                             // TONE-method data symbol length (legacy)
-  DCHIRP_MS: 60,                           // CHIRP-method (PPM) data chirp pulse length
-  PPM_GAP_MS: 80,                          // CHIRP-method (PPM) slot spacing; symbol = 2*PPM_GAP_MS, chirp in early/late slot
-  N_DATA_BITS: 20,                         // 16-bit value (MSB-first) + 4-bit checksum, 1 bit per PPM symbol
+  DCHIRP_MS: 80,                           // CHIRP-method (PPM) data UP-chirp pulse length (= SYNC_MS)
+  PPM_GAP_MS: 200,                         // CHIRP-method (PPM) slot spacing; symbol = 2*PPM_GAP_MS, chirp in early/late slot.
+                                           // KEY reverb-tolerance knob: must outlast room reverb (robust to RT60~600ms; lower toward 120 for faster lock in dead rooms). MUST match FskTimecode.PpmGapMs.
+  N_DATA_BITS: 13,                         // CHIRP: 9-bit value (MSB-first, 128ms quantum) + 4-bit CRC, 1 bit per PPM symbol. MUST match FskTimecode.NDataBits.
   SYNC_MS: 80,
   GUARD_MS: 40,
   N_DATA_SYMS: 10,                         // TONE method: 8 value + 2 checksum symbols
@@ -307,17 +312,24 @@ function symbolsToValue(syms){
   var ckCalc = (((v>>12)&0xF)+((v>>8)&0xF)+((v>>4)&0xF)+(v&0xF)) & 0xF;
   return ckGot === ckCalc ? v : null;
 }
-// CHIRP-method bit codec — 20 bits = 16-bit value (MSB-first) + 4-bit checksum. Mirrors FskTimecode (C#).
-function bitsToValue(bits20){
-  var v=(bits20>>>4)&0xFFFF, ckGot=bits20&0xF;
-  var ckCalc=(((v>>12)&0xF)+((v>>8)&0xF)+((v>>4)&0xF)+(v&0xF))&0xF;
-  return ckGot===ckCalc ? v : null;
+// CRC-4 (poly x^4+x+1 = 0b10011) over the 9-bit chirp value, MSB-first. Byte-identical to FskTimecode.Crc4 (C#).
+function crc4(value9){
+  var reg=(value9 & 0x1FF)<<4;                 // 9 data bits, then 4 zero bits for the remainder
+  for (var i=12;i>=4;i--){ if ((reg>>i)&1) reg ^= (0x13 << (i-4)); }   // 0x13 = 0b10011
+  return reg & 0xF;
+}
+// CHIRP-method bit codec — 13 bits = 9-bit value (MSB-first, 128ms quantum) + 4-bit CRC. Mirrors FskTimecode
+// (C#). Returns the reconstructed content-ms (value*128, 0..65408) on a valid CRC, else null. The 128ms
+// quantum is fine: the offset is medianed over many frames and we only need +/-100ms.
+function bitsToValue(bits13){
+  var q=(bits13>>>4)&0x1FF, ckGot=bits13&0xF;
+  return crc4(q)===ckGot ? (q<<7) : null;      // q<<7 == q*128 ms
 }
 
 var EST = {
   vid: [],            // {t, v}  v = 24-bit video ms (barcode)
-  aud: [],            // {t, v}  v = 16-bit audio ms (FSK)
-  MAX_AGE_MS: 30000,  // the offset is CONSTANT, so accumulate over the last 30s
+  aud: [],            // {t, v}  v = audio ms (CHIRP: 128ms-quantized; TONE: 16-bit)
+  MAX_AGE_MS: 45000,  // the offset is CONSTANT, so accumulate over the last 45s (chirp frames are ~5s apart)
   MAX_N: 1200,
   lastVidMs: -1, lastAudMs: -1,
 
@@ -607,13 +619,12 @@ var MIC = {
   hist:[],                              // per-hop {s, data[4], isSync}
   pending:[],                           // {s,src} onsets awaiting a fully-buffered frame (src: tone|chirp)
   _chirpTmpl:null, _chirpEt:0, _chirpLen:0, _prevChirp:false, _dbgMaxRho:0,
-  _upTmpl:null, _dnTmpl:null, _upEt:0, _dnEt:0,   // up/down DATA-chirp templates (chirp method)
+  _upTmpl:null, _upEt:0,                // UP-chirp DATA template (chirp method; SYNC uses the DOWN _chirpTmpl)
   _dbgFrames:0, _dbgCksum:0, _dbgPush:0, _dbgRefineFail:0, _dbgLastSyms:'-',
   // chirp matched-filter thresholds (tune on real hardware): coarse = permissive trigger to catch
   // the peak region; strict = accept threshold applied to the refined peak ρ (in 0..1). Lowered for
   // the narrow band, where less time-bandwidth gives a lower (but cleaner, in-band) correlation peak.
   chirpCoarseThr:0.08, chirpStrictThr:0.15,
-  _lastAud:null,                        // last raw decode {t,v} for the temporal-agreement gate
   pushSample:null, onSync:null,
 
   start: async function(){
@@ -631,13 +642,13 @@ var MIC = {
       var bufSize=1024;
       this.node = this.ctx.createScriptProcessor(bufSize, 1, 1);
       // The ring buffer must hold a WHOLE timecode frame so the decoder can read all of it AFTER the
-      // onset is found. The chirp PPM frame is the longest (~3.3s); size to it + margin. (The old 2.5s
-      // buffer was SHORTER than the PPM frame, so chirp frames never fully buffered and never decoded.)
+      // onset is found. The chirp PPM frame is the longest (~5.3s with the v2 wide PPM gap); size it to
+      // the frame + margin. (A buffer SHORTER than the frame would never fully buffer it, so it'd never decode.)
       var chirpFrameSec = (PROTO.SYNC_MS + PROTO.N_DATA_BITS*2*PROTO.PPM_GAP_MS + PROTO.GUARD_MS)/1000;
       this.CAP = Math.round(this.sr * Math.max(2.5, chirpFrameSec + 1.6));
       this.buf = new Float32Array(this.CAP);
       this.bufLen=0; this.bufBase=0; this.nextHop=0; this.nextHopC=0; this.processedInit=false;
-      this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0; this._lastAud=null;
+      this.hist=[]; this.pending=[]; this.muteUntil=0; this.recentSync=0;
       this._prevChirp=false; this._initChirp();
       var self=this;
       this.node.onaudioprocess = function(e){ self._onAudio(e.inputBuffer.getChannelData(0)); };
@@ -778,27 +789,29 @@ var MIC = {
     var sr=this.sr, L=Math.round(PROTO.SYNC_MS/1000*sr);
     var edge=Math.max(1, Math.round(PROTO.EDGE_MS/1000*sr));
     var f0=PROTO.CHIRP_F0, f1=PROTO.CHIRP_F1, T=PROTO.SYNC_MS/1000, k=(f1-f0)/T;
+    // SYNC template = DOWN-chirp (f1 -> f0). Data chirps sweep UP, so this matched filter is
+    // near-orthogonal to them and won't false-trigger on a data chirp (which would mis-anchor the frame).
     var t=new Float32Array(L), et=0;
     for (var i=0;i<L;i++){
       var tau=i/sr, env=1.0;
       if (i<edge) env=i/edge; else if (i>L-edge) env=(L-i)/edge;
       if (env<0) env=0;
-      var v=env*Math.sin(2*Math.PI*(f0*tau + 0.5*k*tau*tau));
+      var v=env*Math.sin(2*Math.PI*(f1*tau - 0.5*k*tau*tau));   // DOWN: f1 -> f0
       t[i]=v; et+=v*v;
     }
     this._chirpTmpl=t; this._chirpLen=L; this._chirpEt=et>0?et:1e-9;
 
-    // DATA up/down chirp templates (shorter than the sync) for up-vs-down bit discrimination.
+    // DATA template = UP-chirp (f0 -> f1), DCHIRP_MS long. The PPM decoder compares this template's
+    // energy in the EARLY vs LATE slot of each symbol — position (not direction) carries the bit.
     var dL=Math.round(PROTO.DCHIRP_MS/1000*sr), Td=dL/sr, kd=(f1-f0)/Td;
-    var up=new Float32Array(dL), dn=new Float32Array(dL), eu=0, ed=0;
+    var up=new Float32Array(dL), eu=0;
     for (var j=0;j<dL;j++){
       var td=j/sr, ev=1.0;
       if (j<edge) ev=j/edge; else if (j>dL-edge) ev=(dL-j)/edge;
       if (ev<0) ev=0;
-      var u=ev*Math.sin(2*Math.PI*(f0*td + 0.5*kd*td*td)); up[j]=u; eu+=u*u;   // up:   f0 -> f1
-      var d=ev*Math.sin(2*Math.PI*(f1*td - 0.5*kd*td*td)); dn[j]=d; ed+=d*d;   // down: f1 -> f0
+      var u=ev*Math.sin(2*Math.PI*(f0*td + 0.5*kd*td*td)); up[j]=u; eu+=u*u;   // up: f0 -> f1
     }
-    this._upTmpl=up; this._upEt=eu>0?eu:1e-9; this._dnTmpl=dn; this._dnEt=ed>0?ed:1e-9;
+    this._upTmpl=up; this._upEt=eu>0?eu:1e-9;
   },
 
   // Normalised cross-correlation magnitude |ρ| in [0,1] between buf[off..off+t.length) and template t.
@@ -864,9 +877,9 @@ var MIC = {
   },
 
   // Decode one fully-buffered frame. Refine the onset (chirp peak or tone half-power), then read DATA:
-  //   chirp method = 20 up/down chirps (matched filter; broadband, so each bit crosses the comb nulls),
-  //   tone  method = 10 × 4-FSK tones (Goertzel; legacy). Validate checksum + the two-frame temporal
-  //   gate, then emit (onset phone-time, value).
+  //   chirp method = N_DATA_BITS PPM bits (UP-chirp matched filter, EARLY vs LATE slot per bit),
+  //   tone  method = 10 × 4-FSK tones (Goertzel; legacy). Validate the CRC/checksum, then emit
+  //   (onset phone-time, value); EST medians many frames so a stray misdecode is just an outlier.
   _decodeFrameAt: function(onsetSample, src){
     var sr=this.sr, syncLen=Math.round(PROTO.SYNC_MS/1000*sr);
     var refined = (src==='chirp') ? this._refineOnsetChirp(onsetSample, syncLen)
@@ -904,20 +917,16 @@ var MIC = {
       val=symbolsToValue(syms);
       this._dbgLastSyms='t:'+syms.join('')+(val===null?' ck✗':' ck✓='+val);
     }
-    if (val===null) return;
+    if (val===null) return;            // CRC (or tone checksum) failed — reject; never reaches the median
     this._dbgCksum++;
     this.recentSync = performance.now();
     var tMs=this._timeOfSample(onsetSample);
     $('rAud').textContent = val;
-    // Two-frame temporal gate: the decoded ms must advance ~1ms per ms of real phone time across
-    // consecutive frames before we trust it — kills the rare checksum-fluke frame.
-    var push=false;
-    if (this._lastAud){
-      var dtReal=tMs-this._lastAud.t, dVal=wrapSigned(val-this._lastAud.v, 16);
-      if (dtReal>0 && dtReal<3000 && Math.abs(dVal-dtReal)<200) push=true;
-    }
-    this._lastAud={ t:tMs, v:val };
-    if (push){ this._dbgPush++; if (this.pushSample) this.pushSample(tMs, val); }
+    // Push every CRC-valid frame straight into EST, which medians many of them over a long window (the
+    // A/V offset is constant). No two-frame "advance" gate: chirp frames are ~5s apart (the old <3s gate
+    // could NEVER pass for the chirp method), and a 4-bit-CRC fluke (~1/16) is rejected as a median outlier.
+    this._dbgPush++;
+    if (this.pushSample) this.pushSample(tMs, val);
   }
 };
 
@@ -995,7 +1004,9 @@ var GEN = {
 (function(){
   var trim=0;
   var locked=false, lockedVal=null;
-  var LOCK_SPREAD=45, LOCK_N=6, LOCK_SPAN=8000;   // PPM frames are ~3.3s; offset is constant, so fewer samples lock it
+  // Chirp-v2 frames are ~5s apart and the value is 128ms-quantized (so per-sample spread is larger but
+  // the MEDIAN center stays accurate to well within ±100ms). Relaxed from the tone-era ±45ms / n6.
+  var LOCK_SPREAD=90, LOCK_N=4, LOCK_SPAN=8000;
   function word(ms){ return ms>0 ? 'audio AHEAD of video' : (ms<0 ? 'audio LAGS video' : 'in sync'); }
 
   var lastVidAccept=0, lastAudAccept=0, lastCamStatus='', audioAudible=false, _acceptT=0;
@@ -1064,7 +1075,7 @@ var GEN = {
     var r=EST.result();
     if (!r){ $('pConf').textContent='confidence: -'; $('pConf').className='pill'; setBar(0,false); updateUi(); return; }
     $('rN').textContent=r.vN+'+'+r.aN; $('rSd').textContent=r.spread;
-    var good = r.spread<=25 && r.n>=8, mid = r.spread<=60;
+    var good = r.spread<=60 && r.n>=5, mid = r.spread<=100;   // relaxed for the 128ms chirp quantum (±100ms goal)
     $('pConf').textContent='confidence: '+(good?'high':(mid?'medium':'low'))+' (±'+r.spread+')';
     $('pConf').className='pill '+(good?'ok':(mid?'mid':'no'));
 
