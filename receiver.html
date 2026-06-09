@@ -22,18 +22,26 @@
             width: 100%; height: 100%;
             object-fit: cover;
         }
+        #syncErr {
+            position: absolute; left: 0; right: 0; top: 0;
+            background: rgba(176,0,0,0.94); color: #fff;
+            font: 600 30px/1.4 system-ui, "Segoe UI", sans-serif;
+            padding: 28px 40px; text-align: center;
+            z-index: 20; display: none;
+        }
     </style>
 </head>
 <body>
 <video id="caf-el" class="castMediaElement"></video>
 <video id="player" playsinline muted></video>
 <div id="overlay"></div>
+<div id="syncErr"></div>
 
 <script>
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-09-r31-calib-hold';
+        var RECEIVER_VERSION = '2026-06-10-r32-calib-syncerr';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -142,6 +150,12 @@
         var REANCHOR_OUTSIDE_SEC = 1.5;
         var AUDIO_STALL_MS      = 700;
         var AUDIO_JUMP_MS       = 4000;  // audio clock leaping forward > this in one tick ⇒ ring skip ⇒ hard recover
+
+        // Calibration-only failure banner thresholds.
+        var CALIB_ERR_MS        = 2500;
+        var CALIB_ERR_GRACE_MS  = 6000;
+        var CALIB_ERR_TICKS     = 3;
+        var _calibErrTicks      = 0;
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -912,6 +926,16 @@
                 // ring-skip) still apply. The companion-nudge loop only needs stability, not auto-align.
                 if (_calibActive) {
                     if (player.playbackRate !== 1.0) player.playbackRate = 1.0;
+                    // A sustained large offset after the grace window means the local pipeline can't keep up, so flag it.
+                    var settled = _tPlayStart
+                        && (nowWall - _tPlayStart) > CALIB_ERR_GRACE_MS
+                        && (nowWall - _lastSeekMs) > CALIB_ERR_GRACE_MS;
+                    if (settled && Math.abs(errorMs) > CALIB_ERR_MS) {
+                        if (++_calibErrTicks >= CALIB_ERR_TICKS) _showSyncError(errorMs);
+                    } else {
+                        _calibErrTicks = 0;
+                        _hideSyncError();
+                    }
                     return;
                 }
 
@@ -1178,6 +1202,7 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
             _lastCalibActive = false; _calibActive = false; _calibStopBlanked = false;
+            _hideSyncError();
             var _cafReset = document.getElementById('caf-el');
             if (_cafReset) { try { _cafReset.muted = false; } catch (e) {} }
             _lastSeekMs = 0;
@@ -1212,8 +1237,23 @@
             if (el) el.style.opacity = String(opacity);
         }
 
+        function _showSyncError(errMs) {
+            var el = document.getElementById('syncErr');
+            if (!el) return;
+            el.textContent = 'A/V sync lost (' + (errMs / 1000).toFixed(1) + 's). Your PC may be too slow '
+                + 'to render the cast, or the local pipeline stalled. Stop calibration and retry.';
+            el.style.display = 'block';
+        }
+
+        function _hideSyncError() {
+            _calibErrTicks = 0;
+            var el = document.getElementById('syncErr');
+            if (el) el.style.display = 'none';
+        }
+
         function _calibStopBlank(player, cafEl) {
             _calibStopBlanked = true;
+            _hideSyncError();
             var bufAheadMs = 0;
             try {
                 if (player && player.buffered && player.buffered.length > 0)
