@@ -225,7 +225,6 @@
                     serverRttMs: _serverRtt
                 },
                 contentLagMs: _contentLagMs,
-                audioOutputLatencyMs: _audioOutputLatencyMs,
                 latestClockPoll: _lastClockInfo,
                 latestManifest: _lastManifestInfo,
                 queue: {
@@ -398,11 +397,6 @@
             _showOverlay(1);
             console.log('[cws] Starting caf_wav_sync pipeline');
 
-            // Measure device audio output latency once before anything starts.
-            // Posted to server in the first sync-report so contentLagMs can be
-            // calibrated automatically per device without manual config.
-            _measureAudioOutputLatency();
-
             // Step 1: Wait for audio clock epoch (CAF has connected to /cast/caf-audio)
             _waitForEpoch(baseUrl, function () {
                 console.log('[cws] Epoch acquired: epochMs=' + _epochMs + ' epochWallMs=' + _epochWallMs + ' videoEpochMs=' + _videoEpochMs);
@@ -417,22 +411,6 @@
         // the ~1-frame display-pipeline offset from the PLL error signal.
         var _rVFCMediaTimeSec = -1;
         var _rVFCRenderedCount = 0;
-        // Measured audio output latency (ms) — AudioContext.outputLatency, read once on
-        // startup and reported to the server so it can compute contentLagMs accurately.
-        var _audioOutputLatencyMs = -1;
-
-        // Measure AudioContext.outputLatency without producing any sound.
-        function _measureAudioOutputLatency() {
-            try {
-                var ctx = new (window.AudioContext || window.webkitAudioContext)();
-                _audioOutputLatencyMs = Math.round((ctx.outputLatency || 0) * 1000);
-                ctx.close();
-                console.log('[cws] AudioContext.outputLatency=' + _audioOutputLatencyMs + 'ms');
-            } catch(e) {
-                console.warn('[cws] AudioContext not available: ' + e);
-                _audioOutputLatencyMs = 0;
-            }
-        }
 
         // Poll /cast/audio-clock until both epochs are available.
         // Retries indefinitely — no timeout — because preroll + encoder startup
@@ -1255,7 +1233,6 @@
                             pllErrorMs: Math.round(pllErr),
                             cdispMs: Math.round(_cdispBaked),
                             contentLagMs: _contentLagMs,
-                            audioOutputLatencyMs: _audioOutputLatencyMs,
                             rVFCAvailable: typeof player.requestVideoFrameCallback === 'function',
                             rVFCActive: rVFCActive,
                             rVFCRenderedCount: _rVFCRenderedCount,
