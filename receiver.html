@@ -13,13 +13,10 @@
             transition: opacity 0.4s ease;
             pointer-events: none; z-index: 10;
         }
-        /* CAF protocol vehicle — in caf_wav_sync it produces audio output.
-           Invisible but NOT muted. */
         #caf-el {
             position: absolute; width: 1px; height: 1px;
             opacity: 0; pointer-events: none;
         }
-        /* Video player — muted, visual output only. Manual MSE drives it. */
         #player {
             position: absolute; inset: 0;
             width: 100%; height: 100%;
@@ -36,20 +33,11 @@
     (function () {
         'use strict';
 
-        // Bump on every receiver change so the settings panel can confirm the Chromecast is
-        // running the current build
-        var RECEIVER_VERSION = '2026-06-07-r29-fast-pause-stop';
+        var RECEIVER_VERSION = '2026-06-09-r30-ringskip-recover';
 
-        // ── Telemetry (Tier 1) ───────────────────────────────────────────────────
-        // The receiver is where every freeze/sync issue actually happens, but the server could
-        // only see coarse 5 s SyncReports. This captures the receiver's own console into a ring
-        // buffer and POSTs it to /cast/receiver-log on incidents + on first convergence, and counts
-        // each recovery path so we can both diagnose AND later pare back the hacks that never fire.
-        var _logRing = [];                 // recent console lines (telemetry ring)
+        var _logRing = [];
         var _LOG_RING_MAX = 60;
-        // Cumulative per-session counts of each recovery path — surfaces which "hacks" actually fire.
         var _evt = { rescue: 0, stall: 0, anchor: 0, reanchor: 0, hardSeek: 0, snap: 0, mseReinit: 0, hold: 0 };
-        // Startup milestones (wall ms) for the convergence-time breakdown (the ~30 s question).
         var _tEpoch = 0, _tPlayStart = 0, _tConverged = 0;
         var _convergeReported = false, _initialErrMs = null;
         var _lastRcvLogMs = 0;
@@ -68,8 +56,6 @@
             console.warn = function () { cap('W', arguments); ow.apply(console, arguments); };
             console.error = function () { cap('E', arguments); oe.apply(console, arguments); };
         })();
-        // Flush the ring buffer to the server (base64 so newlines/quotes can't break the wire format).
-        // Throttled to once / 3 s unless forced, so an incident burst can't spam the server log.
         function _postReceiverLog(reason, force) {
             if (!_baseUrl) return;
             var now = Date.now();
@@ -84,7 +70,6 @@
             } catch (e) {}
         }
 
-        // ── CAF init ────────────────────────────────────────────────────────────
         var CHANNEL       = 'urn:x-cast:com.google.cast.media';
         var context       = cast.framework.CastReceiverContext.getInstance();
         var playerManager = context.getPlayerManager();
@@ -101,87 +86,61 @@
             function (req) { return req; }
         );
 
-        // ── Module state ───────────────────────────────────────────────────────
         var _baseUrl     = '';
         var _mode        = '';
-        var _syncTimer   = null;  // PLL sync interval
-        var _pollTimer   = null;  // m3u8 poll interval
-        var _ms          = null;  // MediaSource for manual MSE
-        var _sb          = null;  // SourceBuffer
-        var _mseGen      = 0;     // bumped on every MSE (re)init and _reset(). Async callbacks
-                                  // (sourceopen / init-fetch / SB error / player.onerror) capture the
-                                  // gen and BAIL if superseded — so a re-LOAD (track change / re-cast /
-                                  // calibration) can't have an orphaned old MediaSource crash the new one.
-        var _mseRetryTimer = null;// debounced video-MSE rebuild after a fatal SourceBuffer/element error
-        var _appendQueue = [];    // segments waiting to be appended
+        var _syncTimer   = null;
+        var _pollTimer   = null;
+        var _ms          = null;
+        var _sb          = null;
+        var _mseGen      = 0;
+        var _mseRetryTimer = null;
+        var _appendQueue = [];
         var _appending   = false;
         var _trimming    = false;
-        var _loadedSegs  = {};    // sn → true
+        var _quotaRetries = 0;        // consecutive appendBuffer quota failures on the head item
+        var _drainRetryTimer = null;  // deferred re-drain (NEVER recurse synchronously on quota)
+        var MAX_QUOTA_RETRIES = 50;   // ~4 s of trimming/retrying, then drop the stuck segment
+        var _loadedSegs  = {};
         var _initLoaded  = false;
-        var _segsBuffered = 0;    // count of segments appended to SourceBuffer
-        var _epochMs     = -1;    // AudioClockTee position when CAF connected
-        var _epochWallMs = -1;    // UTC wall ms at same instant
-        var _videoEpochMs = -1;   // AudioClockTee position represented by video PTS 0. SIGNED — may be
-                                  // legitimately NEGATIVE when video PTS leads the audio content clock.
-                                  // Readiness is tracked by _videoEpochSet (NOT the sign): the server
-                                  // sends null until ready, so -1 here is just the uninitialised default.
-        var _videoEpochSet = false; // true once a server videoEpochMs (any value, incl. negative) adopted
-        // Cdisp (presentation skew) is now baked into the server's reported audio epoch
-        // (epochMs already biased by the connected device's Cdisp), so the receiver targets
-        // PURE content equality (videoContentMs == audioContentMs).
-        var _cdispMs     = 0;    // latest Cdisp reported by /cast/audio-clock (raw; baked at anchor)
-        var _cdispBaked  = 0;    // Cdisp BAKED into the video target — set once at anchor, then held
-                                 // constant; only re-baked on a re-anchor (reanchorSeq change).
-        var _lastReanchorSeq = -1; // last reanchorSeq seen; a change = "Save" → one clean re-anchor
-        var _reanchorPending = false; // set by the poll on a reanchorSeq change; the drift loop does one clean seek
-        // A/V-sync calibration stop: the barcode/tone test pattern is part of the CONTINUOUS stream, so
-        // when the user hits Stop it is still buffered ~10-15 s ahead of the play head and would linger
-        // that long. We watch calibActive on the audio-clock poll and, on the true→false edge, blank the
-        // screen + mute the CAF beep INSTANTLY, then reveal the theme once the buffered pattern drains.
-        var _lastCalibActive = false; // last calibActive seen on the poll (edge detect)
-        var _calibStopBlanked = false; // true while we're holding the post-Stop blank/mute
-        var _calibStopRevealTimer = null; // drains-then-reveals the theme after a Stop
-        var _serverRtt   = 0;    // round-trip time estimate to server
+        var _segsBuffered = 0;
+        var _epochMs     = -1;
+        var _epochWallMs = -1;
+        var _videoEpochMs = -1;
+        var _videoEpochSet = false;
+        var _cdispMs     = 0;
+        var _cdispBaked  = 0;
+        var _lastReanchorSeq = -1;
+        var _reanchorPending = false;
+        var _lastEpochJumpSeq = -1;  // last epochJumpSeq seen; a change = server ring-skip → hard recover
+        var _lastCalibActive = false;
+        var _calibStopBlanked = false;
+        var _calibStopRevealTimer = null;
+        var _serverRtt   = 0;
         var _cafPlaying  = false;
-        var _everPlayed  = false; // true once playback has started at least once this session.
-                                  // Gates the manifest poll: (_everPlayed && !_cafPlaying) == "was
-                                  // playing, now paused" → stop fetching forward so the buffer can't
-                                  // bloat while paused/stopped. False during startup so pre-buffering
-                                  // is never blocked; reset on every _reset() (re-LOAD).
+        var _everPlayed  = false;
         var _videoReady  = false;
         var _maxBufferedWindowSec = 24;
         var _backBufferKeepSec = 10;
         var _lastManifestInfo = null;
         var _lastClockInfo = null;
         var _debugWatchTimer = null;
-        var _epochPollTimer = null;  // /cast/audio-clock poll (epoch refresh + reanchor signal)
-        var _reportTimer = null;     // sync-report POST interval
-        var _lastSeekMs  = 0;        // last seek/anchor wall time (anti seek-storm), module-level
+        var _epochPollTimer = null;
+        var _reportTimer = null;
+        var _lastSeekMs  = 0;
 
-        // Audio-clock health. The PLL syncs VIDEO to the AUDIO clock, so a frozen audio clock (a CAF
-        // reconnect, a server blip, a buffering stall) must NOT cause video seeking — that just
-        // thrashes against a dead reference (the seek-storm) and, worse, re-derives a garbage epoch
-        // from a frozen audioMs. Instead we HOLD: keep playing at rate 1.0, no seeks, no re-anchor,
-        // until the audio clock advances again — then the normal PLL re-converges on its own
-        // (loss of sync IS recoverable as long as the reference clock is alive).
-        var _audioLastMs   = -1;     // last observed audio-clock ms
-        var _audioLastWall = 0;      // wall ms when the audio clock last advanced
-        var _audioHeld     = false;  // currently holding because audio stalled
-        var _playerLastT   = -1;     // last observed player.currentTime (s) — in-buffer stall watchdog
-        var _playerStallWall = 0;    // wall ms when player.currentTime last advanced
-        var _startWaitCount = 0;     // bounded retries: wait for the cdisp-target to be buffered before
-                                     // the start anchor so it lands on-target (fast convergence)
+        var _audioLastMs   = -1;
+        var _audioLastWall = 0;
+        var _audioHeld     = false;
+        var _playerLastT   = -1;
+        var _playerStallWall = 0;
+        var _startWaitCount = 0;
 
-        // Sync geometry (seconds / ms). Balance: gentle rate-trim for small drift, ONE clamped
-        // in-buffer seek for medium drift, and a bounded RE-ANCHOR only for a GENUINE discontinuity
-        // (target well outside the buffer — track change / seek / fast-forward) while the audio
-        // clock is healthy. Edge-of-buffer is NOT a discontinuity — it clamps and waits.
-        var SEEK_GUARD_SEC      = 0.5;   // keep targets this clear of both buffer edges
-        var HEAL_LEAD_SEC       = 4.0;   // on re-anchor, play this far behind the live edge
-        var HARD_SEEK_MS        = 1000;  // medium drift → one clamped in-buffer seek
-        var REANCHOR_OUTSIDE_SEC = 1.5;  // re-anchor only if the target is outside the buffer by MORE
-                                         // than this (a real discontinuity, not a buffer-edge nudge)
-        var AUDIO_STALL_MS      = 700;   // audio clock unchanged this long ⇒ HOLD (≈3 sync ticks)
+        var SEEK_GUARD_SEC      = 0.5;
+        var HEAL_LEAD_SEC       = 4.0;
+        var HARD_SEEK_MS        = 1000;
+        var REANCHOR_OUTSIDE_SEC = 1.5;
+        var AUDIO_STALL_MS      = 700;
+        var AUDIO_JUMP_MS       = 4000;  // audio clock leaping forward > this in one tick ⇒ ring skip ⇒ hard recover
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -288,7 +247,6 @@
             caf: function () { return document.getElementById('caf-el'); }
         };
 
-        // ── LOAD interceptor ────────────────────────────────────────────────────
         playerManager.setMessageInterceptor(
             cast.framework.messages.MessageType.LOAD,
             function (request) {
@@ -300,11 +258,8 @@
                 _reportCapabilities(_baseUrl);
 
                 if (_mode === 'caf_wav_sync') {
-                    // CAF will load the WAV URL (contentId) onto #caf-el automatically.
-                    // We just need to start the video-only MSE pipeline.
                     _startCafWavSync(_baseUrl);
                 } else if (_mode === 'fmp4_muxed') {
-                    // Legacy muxed mode — silence CAF, use hls.js for A+V
                     _silenceCaf();
                     _startMuxed(_baseUrl);
                 } else {
@@ -316,7 +271,6 @@
             }
         );
 
-        // ── CAF PAUSE ──────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PAUSE, function () {
             _showOverlay(1);
             var p = document.getElementById('player');
@@ -325,12 +279,10 @@
             setTimeout(function () { _showOverlay(0); }, 1500);
         });
 
-        // ── CAF PLAYING ────────────────────────────────────────────────────────
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
             _cafPlaying = true;
-            _everPlayed = true;   // playback has started → arm the pause-bloat gate in _pollManifest
+            _everPlayed = true;
             if (_mode === 'caf_wav_sync') {
-                // CAF now owns audio — do NOT silence it
                 var p = document.getElementById('player');
                 if (p && p.paused) p.play().catch(function () {});
             } else {
@@ -340,7 +292,6 @@
             }
         });
 
-        // ── Queue next / prev ──────────────────────────────────────────────────
         playerManager.addEventListener(
             cast.framework.events.EventType.REQUEST_QUEUE_UPDATE,
             function (event) {
@@ -352,13 +303,11 @@
             }
         );
 
-        // ── Sender disconnected ────────────────────────────────────────────────
         context.addEventListener(
             cast.framework.system.EventType.SENDER_DISCONNECTED,
             function () { context.stop(); }
         );
 
-        // ── CAF options + start ────────────────────────────────────────────────
         var options = new cast.framework.CastReceiverOptions();
         options.customNamespaces = {};
         options.customNamespaces[CHANNEL] = cast.framework.system.MessageType.JSON;
@@ -367,24 +316,6 @@
         options.mediaElement = document.getElementById('caf-el');
         context.start(options);
 
-        // ══════════════════════════════════════════════════════════════════════
-        // caf_wav_sync mode
-        //
-        // Audio: CAF plays lossless WAV via #caf-el (hardware audio pipeline,
-        //        no MSE, no JavaScript in audio path).
-        // Video: Manual MSE loads video-only H.264 fMP4 segments from
-        //        /cast/split_video/ into #player (muted).
-        // Sync:  PLL (phase-locked loop) continuously adjusts #player.playbackRate
-        //        so video tracks the audio clock. No seeks except >2s drift.
-        //
-        // Epoch model:
-        //   Server exposes /cast/audio-clock → {epochMs, epochWallMs, videoEpochMs, serverNowMs}
-        //   epochMs      = AudioClockTee sample position (ms) when CAF HTTP client connected
-        //   videoEpochMs = AudioClockTee sample position (ms) represented by video PTS 0
-        //   CAF audio position = epochMs + cafEl.currentTime * 1000
-        //   Video position     = videoEpochMs + player.currentTime * 1000
-        //   Sync target: videoNowMs ≈ audioNowMs
-        // ══════════════════════════════════════════════════════════════════════
 
         function _startCafWavSync(baseUrl) {
             var player = document.getElementById('player');
@@ -394,24 +325,15 @@
             _showOverlay(1);
             console.log('[cws] Starting caf_wav_sync pipeline');
 
-            // Step 1: Wait for audio clock epoch (CAF has connected to /cast/caf-audio)
             _waitForEpoch(baseUrl, function () {
                 console.log('[cws] Epoch acquired: epochMs=' + _epochMs + ' epochWallMs=' + _epochWallMs + ' videoEpochMs=' + _videoEpochMs);
-                // Step 2: Set up manual MSE for video
                 _initVideoMSE(player, baseUrl);
             });
         }
 
-        // rVFC state — updated by requestVideoFrameCallback once player is playing.
-        // _rVFCMediaTimeSec is the PTS of the most recently *displayed* frame (not just
-        // decoded). _getVideoClockMs uses this instead of player.currentTime to eliminate
-        // the ~1-frame display-pipeline offset from the PLL error signal.
         var _rVFCMediaTimeSec = -1;
         var _rVFCRenderedCount = 0;
 
-        // Poll /cast/audio-clock until both epochs are available.
-        // Retries indefinitely — no timeout — because preroll + encoder startup
-        // can legitimately take >30 s on slow hardware or cold app launches.
         function _waitForEpoch(baseUrl, cb) {
             var attempt = 0;
             (function poll() {
@@ -429,22 +351,18 @@
                             receiverNowMs: Date.now(),
                             receiverRttMs: _serverRtt
                         };
-                        // videoEpochMs is null until the server has computed it; once it's a number
-                        // (ANY value, including negative — video PTS can lead the audio clock) it's ready.
                         if (d.epochMs >= 0 && typeof d.videoEpochMs === 'number') {
                             _epochMs      = d.epochMs;
                             _epochWallMs  = d.epochWallMs;
                             _videoEpochMs = d.videoEpochMs;
                             _videoEpochSet = true;
                             _cdispMs      = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
-                            // BAKE the offset once at this anchor; the drift loop holds it constant.
                             _cdispBaked      = _cdispMs;
                             _lastReanchorSeq = (typeof d.reanchorSeq === 'number') ? d.reanchorSeq : 0;
-                            if (!_tEpoch) _tEpoch = Date.now();   // telemetry: epoch acquired (convergence t0)
+                            if (!_tEpoch) _tEpoch = Date.now();
                             cb();
                         } else {
                             attempt++;
-                            // Log every 10 attempts (~5 s) so the console shows progress
                             if (attempt % 10 === 0)
                                 console.log('[cws] Waiting for epochs (attempt ' + attempt + ')...');
                             setTimeout(poll, 500);
@@ -457,14 +375,9 @@
             })();
         }
 
-        // Builds the exact RFC6381 codec string from the init segment's avcC box
-        // (configurationVersion, AVCProfileIndication, profile_compatibility, AVCLevelIndication)
-        // so the SourceBuffer codec matches the stream's real profile/level. A hardcoded
-        // avc1.640029 was silently rejected by this device's hardware decoder when the encoder
-        // produced a different level → empty buffer → blank video.
         function _codecFromInit(u8) {
             for (var i = 0; i + 8 < u8.length; i++) {
-                if (u8[i] === 0x61 && u8[i + 1] === 0x76 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) { // 'avcC'
+                if (u8[i] === 0x61 && u8[i + 1] === 0x76 && u8[i + 2] === 0x63 && u8[i + 3] === 0x43) {
                     var hx = function (b) { return ('0' + b.toString(16)).slice(-2); };
                     return 'video/mp4; codecs="avc1.' + hx(u8[i + 5]) + hx(u8[i + 6]) + hx(u8[i + 7]) + '"';
                 }
@@ -472,14 +385,10 @@
             return null;
         }
 
-        // Diagnostic only — must NEVER throw. Reading _sb.buffered/.updating on a SourceBuffer that
-        // has been removed from its (torn-down) MediaSource throws InvalidStateError; that used to
-        // surface as an Uncaught DOMException from the error handlers themselves.
         function _logSbError(tag) {
             try {
                 var p = document.getElementById('player');
                 var me = p && p.error ? { code: p.error.code, message: p.error.message } : null;
-                // code 2=NETWORK (mixed-content?), 3=DECODE (codec), 4=SRC_NOT_SUPPORTED (codec)
                 var upd = 'n/a', buf = 'n/a';
                 try { upd = String(_sb && _sb.updating); } catch (e1) { upd = 'detached'; }
                 try {
@@ -489,29 +398,27 @@
                 } catch (e2) { buf = 'detached'; }
                 console.error('[cws] ' + tag + ' player.error=' + JSON.stringify(me) +
                     ' msState=' + (_ms && _ms.readyState) + ' sbUpdating=' + upd + ' buffered=' + buf);
-            } catch (e) { /* logging must never throw */ }
+            } catch (e) {  }
         }
 
-        // Set up MediaSource + SourceBuffer for video-only fMP4. Fetches init first so the
-        // SourceBuffer is created with the stream's exact codec.
         function _initVideoMSE(player, baseUrl) {
-            var gen = ++_mseGen;                 // this init owns the pipeline until the next reset/init
+            var gen = ++_mseGen;
             var ms = new MediaSource();
             _ms = ms; _sb = null;
             player.src = URL.createObjectURL(ms);
             player.onerror = function () {
-                if (gen !== _mseGen) return;     // stale element from a superseded generation
+                if (gen !== _mseGen) return;
                 _logSbError('video element error.');
                 _scheduleMseReinit(player, baseUrl, gen);
             };
 
             ms.addEventListener('sourceopen', function () {
-                if (gen !== _mseGen || _ms !== ms) return;   // a newer LOAD/reset superseded us
+                if (gen !== _mseGen || _ms !== ms) return;
                 console.log('[cws] MediaSource opened');
                 fetch(baseUrl + 'cast/split_video/init.mp4')
                     .then(function (r) { if (!r.ok) throw new Error('init.mp4 HTTP ' + r.status); return r.arrayBuffer(); })
                     .then(function (buf) {
-                        if (gen !== _mseGen || _ms !== ms || ms.readyState !== 'open') return;  // superseded mid-fetch
+                        if (gen !== _mseGen || _ms !== ms || ms.readyState !== 'open') return;
                         var u8 = new Uint8Array(buf);
                         var codec = _codecFromInit(u8);
                         var fallbacks = ['video/mp4; codecs="avc1.640029"', 'video/mp4; codecs="avc1.4d401f"', 'video/mp4; codecs="avc1.42E01E"'];
@@ -551,11 +458,6 @@
             });
         }
 
-        // Rebuild the video MSE after a fatal SourceBuffer/element error or a failed init — but only
-        // if we're still the current generation (no newer LOAD/reset has taken over) and debounced so
-        // an error can't spin. The audio epoch is preserved; the self-heal re-anchors video on the new
-        // buffer. This is what turns a transient MSE error (a re-LOAD race) from "video dead" into a
-        // ~1 s self-recovery while audio keeps playing.
         function _scheduleMseReinit(player, baseUrl, gen) {
             if (gen !== _mseGen || _mseRetryTimer) return;
             _evt.mseReinit++;
@@ -563,14 +465,26 @@
             _postReceiverLog('mse-reinit');
             _mseRetryTimer = setTimeout(function () {
                 _mseRetryTimer = null;
-                if (gen !== _mseGen) return;             // superseded while waiting
+                if (gen !== _mseGen) return;
                 try { if (_ms && _ms.readyState === 'open') _ms.endOfStream(); } catch (e) {}
                 _ms = null; _sb = null;
-                _appendQueue = []; _appending = false; _trimming = false;
+                if (_drainRetryTimer) { clearTimeout(_drainRetryTimer); _drainRetryTimer = null; }
+                _appendQueue = []; _appending = false; _trimming = false; _quotaRetries = 0;
                 _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0; _videoReady = false;
                 try { player.removeAttribute('src'); player.load(); } catch (e) {}
                 _initVideoMSE(player, baseUrl);
             }, 1000);
+        }
+
+        // Hard video recovery after the audio timeline leapt forward (server CAF ring skipped to the
+        // live edge). The buffered video can never cover the skipped gap, so chasing it with seeks
+        // thrashes forever and wedges the SourceBuffer. Tear down and rebuild MSE from the new live
+        // edge instead — the rebuilt pipeline re-anchors video to the post-skip audio clock.
+        function _hardRecoverVideo(reason) {
+            var player = document.getElementById('player');
+            if (!player || !_baseUrl) return;
+            console.warn('[cws] hard video recover (' + reason + ') — rebuilding MSE from live edge');
+            _scheduleMseReinit(player, _baseUrl, _mseGen);
         }
 
         function _loadInitSegment(baseUrl, cb) {
@@ -584,21 +498,11 @@
                 })
                 .catch(function (e) {
                     console.error('[cws] init.mp4 fetch failed:', e);
-                    // Retry after 2s
                     setTimeout(function () { _loadInitSegment(baseUrl, cb); }, 2000);
                 });
         }
 
-        // Parse m3u8, fetch new segments, schedule next poll
         function _pollManifest(baseUrl) {
-            // Pause-bloat gate: while paused/stopped the play-head is frozen but the server's live
-            // edge keeps advancing, so fetching+appending forward segments here would grow the MSE
-            // buffer without bound — the documented "bloat → wedge the weak receiver" failure. Skip
-            // the fetch while we were-playing-but-are-now-paused and just re-check shortly; the next
-            // PLAYING resumes it. Only gate AFTER playback has started (_everPlayed) so startup
-            // pre-buffering is never blocked. Safe against segment gaps: a pause ≥2s forces a clean
-            // re-LOAD on resume (full reset, no gap), and a sub-2s pause skips < one playlist window,
-            // so the missed segments are still fetchable on resume.
             if (_everPlayed && !_cafPlaying) {
                 _pollTimer = setTimeout(function () { _pollManifest(baseUrl); }, 1000);
                 return;
@@ -627,9 +531,6 @@
                             _loadedSegs[seg.sn] = true;
                         }
                     }
-                    // Bound _loadedSegs: segment numbers are monotonic and the playlist window is
-                    // small (hls_list_size), so any sn well below the newest can never reappear.
-                    // Without this the map grows one key per segment forever (~3600/hr) — a slow leak.
                     var newestSn = parsed.segments.length ? parsed.segments[parsed.segments.length - 1].sn : 0;
                     var pruneBelow = newestSn - 64;
                     if (pruneBelow > 0) {
@@ -638,12 +539,6 @@
                     if (newFrags.length > 0) {
                         _fetchSegments(baseUrl, newFrags, 0);
                     }
-                    // Schedule next poll at ~one target-duration. RFC 8216 §6.3.4 says reload after
-                    // targetDuration (the 0.5× rule is only for an UNCHANGED playlist) — the old
-                    // 0.5× polled TWICE per 1 s segment. With segments arriving 1/s into a multi-second
-                    // buffer, polling once per segment grabs every new segment with ample margin and
-                    // halves manifest GET + parse + timer churn (the receiver's top active-JS cost) for
-                    // no visible latency change.
                     var pollMs = Math.max(1000, (parsed.targetDuration || 1) * 1000);
                     _pollTimer = setTimeout(function () { _pollManifest(baseUrl); }, pollMs);
                 })
@@ -653,7 +548,6 @@
                 });
         }
 
-        // Fetch segments sequentially (preserve decode order)
         function _fetchSegments(baseUrl, segs, idx) {
             if (idx >= segs.length) return;
             var seg = segs[idx];
@@ -671,32 +565,24 @@
                         }
                         _segsBuffered++;
                         console.log('[cws] Segment ' + seg.sn + ' buffered (' + _segsBuffered + ' total)');
-                        // Wait for preroll (5 segments ≈ 5s at hls_time=1) before starting playback
                         if (!_videoReady && _segsBuffered >= 5) {
                             _videoReady = true;
                             _startVideoPlayback();
                         }
-                        // Fetch next segment
                         _fetchSegments(baseUrl, segs, idx + 1);
                     });
                 })
                 .catch(function (e) {
                     console.warn('[cws] segment fetch failed:', e);
-                    // Skip and continue
                     _fetchSegments(baseUrl, segs, idx + 1);
                 });
         }
 
-        // SourceBuffer append queue — ensures only one appendBuffer at a time
         function _queueAppend(data, cb) {
             _appendQueue.push({ data: data, cb: cb });
             _drainAppendQueue();
         }
 
-        // True only when the SourceBuffer is still attached to an OPEN MediaSource. Reading
-        // _sb.buffered / .updating on a SourceBuffer that has been removed from its parent
-        // MediaSource (e.g. after _reset() ends the stream on calibration-stop / track-change)
-        // throws an InvalidStateError DOMException, so callers must gate on this first.
         function _sbReady() {
             if (!_ms || !_sb || _ms.readyState !== 'open') return false;
             try {
@@ -709,8 +595,6 @@
         function _trimBufferedVideo(aggressive) {
             if (_trimming || !_sbReady()) return false;
 
-            // Capture the SourceBuffer instance so a teardown that swaps/nulls _sb mid-flight
-            // can't make the updateend callback operate on the wrong (or detached) buffer.
             var sb = _sb;
             var firstStart, trimEnd;
             try {
@@ -766,18 +650,35 @@
             } catch (e) {
                 _appending = false;
                 if (_isQuotaExceededError(e)) {
-                    console.warn('[cws] appendBuffer hit buffer quota, trimming and retrying:', e);
+                    // Buffer full. Put the item back and free space — but NEVER recurse synchronously
+                    // here: appendBuffer→quota→appendBuffer spins until the call stack overflows and
+                    // kills the whole video pipeline (the observed freeze). The SourceBuffer's global
+                    // 'updateend'→_drainAppendQueue listener re-drains once a trim's remove() completes;
+                    // the deferred timer below covers the case where no trim could even start (e.g. the
+                    // player clock is wedged so the back buffer can't be evicted).
                     _appendQueue.unshift(item);
-                    if (_trimBufferedVideo(true)) return;
+                    if (++_quotaRetries > MAX_QUOTA_RETRIES) {
+                        _quotaRetries = 0;
+                        _appendQueue.shift();   // drop the un-appendable segment so the queue can't wedge
+                        console.error('[cws] appendBuffer quota persisted — dropping segment to unwedge queue');
+                        if (item.cb) item.cb(e);
+                    } else {
+                        console.warn('[cws] appendBuffer hit buffer quota (retry ' + _quotaRetries + '), trimming:', e && e.message);
+                        _trimBufferedVideo(true);
+                    }
+                    if (!_drainRetryTimer) {
+                        _drainRetryTimer = setTimeout(function () { _drainRetryTimer = null; _drainAppendQueue(); }, 80);
+                    }
+                    return;
                 }
                 console.error('[cws] appendBuffer error:', e && e.message);
                 if (item.cb) item.cb(e);
-                // Only keep draining if the SourceBuffer is still usable (avoid a tight loop
-                // re-throwing on a detached buffer during teardown).
-                if (_sbReady()) _drainAppendQueue();
+                if (!_drainRetryTimer && _appendQueue.length > 0) {
+                    _drainRetryTimer = setTimeout(function () { _drainRetryTimer = null; _drainAppendQueue(); }, 0);
+                }
                 return;
             }
-            // updateend will fire → _drainAppendQueue called again
+            _quotaRetries = 0;
             var onEnd = function () {
                 try { sb.removeEventListener('updateend', onEnd); } catch (e) {}
                 _appending = false;
@@ -787,14 +688,11 @@
             sb.addEventListener('updateend', onEnd);
         }
 
-        // Start video playback + PLL sync loop
         function _startVideoPlayback() {
             var player = document.getElementById('player');
             var cafEl  = document.getElementById('caf-el');
             if (!player || !cafEl) return;
 
-            // Wait until CAF audio is actually playing before starting sync.
-            // CAF may still be buffering the WAV stream.
             if (!_cafPlaying || cafEl.readyState < 2) {
                 console.log('[cws] Waiting for CAF audio to start playing...');
                 var waitCaf = setInterval(function () {
@@ -806,7 +704,6 @@
                 return;
             }
 
-            // Refresh epoch right before starting sync — this is the initial anchor, so BAKE Cdisp.
             var t0 = Date.now();
             fetch(_baseUrl + 'cast/audio-clock')
                 .then(function (r) { return r.json(); })
@@ -815,12 +712,6 @@
                     if (d.epochMs >= 0) {
                         _epochMs     = d.epochMs;
                         _epochWallMs = d.epochWallMs;
-                        // TIER 2: trust the server's LIVE videoEpochMs as the authority. It is recomputed
-                        // per frame as (content − PTS) so it tracks the wall-paced-video vs sample-paced-
-                        // audio skew and no longer goes stale across gaps. The receiver no longer derives
-                        // its own from the live edge — that produced the wrong startup epoch (audio ahead
-                        // of the small initial buffer → bogus multi-second offset → +6% catch-up →
-                        // underrun → frozen video).
                         if (typeof d.videoEpochMs === 'number') { _videoEpochMs = d.videoEpochMs; _videoEpochSet = true; }
                         _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                         _cdispBaked      = _cdispMs;
@@ -829,15 +720,10 @@
                     _beginSyncedPlayback(player, cafEl);
                 })
                 .catch(function () {
-                    // Use existing epoch
                     _beginSyncedPlayback(player, cafEl);
                 });
         }
 
-        // Clock helpers. Audio clock = PURE CAF content position (epoch + currentTime). The
-        // per-device offset (Cdisp) is NOT applied to the live clock — it's BAKED ONCE into the
-        // video target as _cdispBaked (held constant; only changes on a re-anchor), so the drift
-        // loop never chases a moving offset (which caused the live-seek ping-pong).
         function _getAudioClockMs(cafEl) {
             return _epochMs + cafEl.currentTime * 1000;
         }
@@ -845,39 +731,22 @@
             var t = (_rVFCMediaTimeSec >= 0) ? _rVFCMediaTimeSec : player.currentTime;
             return _videoEpochMs + t * 1000;
         }
-        // Video time (s) whose content matches a given audio clock ms, shifted by the baked offset.
-        // Steady state targets: videoContent == audioContent + _cdispBaked.
         function _getVideoTimeSecForAudioMs(audioMs) {
             return (audioMs + _cdispBaked - _videoEpochMs) / 1000;
         }
 
-        // ── Self-healing video anchor ────────────────────────────────────────────
-        // The single place that positions video against the audio clock. Tolerant of ANY
-        // discontinuity (track change, seek, fast-forward, rewind, buffering gap, or a stale
-        // server epoch): if the cdisp-correct target is reachable it honors it exactly; if not, it
-        // heals to a guaranteed-in-buffer position near the live edge and RE-DERIVES _videoEpochMs
-        // so the held relationship (and the Cdisp trim) stays consistent from there on. It never
-        // seeks outside the buffered range — an out-of-buffer seek is exactly what froze video.
         function _anchorVideo(player, cafEl, reason) {
             var buf = player.buffered;
             if (!buf || buf.length === 0) return false;
             var bufStart = buf.start(0), bufEnd = buf.end(buf.length - 1);
             var lo = bufStart + SEEK_GUARD_SEC, hi = bufEnd - SEEK_GUARD_SEC;
-            if (hi < lo) { lo = hi = (bufStart + bufEnd) / 2; }   // buffer thinner than 2×guard
+            if (hi < lo) { lo = hi = (bufStart + bufEnd) / 2; }
             var audioMs = _getAudioClockMs(cafEl);
-            var ideal = _getVideoTimeSecForAudioMs(audioMs);      // cdisp-correct, current epoch
+            var ideal = _getVideoTimeSecForAudioMs(audioMs);
             var target, healed = false;
             if (ideal >= lo && ideal <= hi) {
-                target = ideal;                                   // reachable → honor Cdisp exactly
+                target = ideal;
             } else {
-                // Target unreachable: the buffer hasn't covered this content time yet (startup, an
-                // underrun, or a transient gap). Clamp to a playable position near the live edge to
-                // keep video moving — but in TIER 2 do NOT re-derive _videoEpochMs from the live edge.
-                // The server publishes a LIVE, authoritative epoch (content − PTS per frame); inventing
-                // one here is exactly what produced the wrong startup epoch (→ catch-up → underrun →
-                // freeze). Once segments extend past the target, the normal seek/trim converges against
-                // the correct server epoch. Only fall back to deriving if we have NO server epoch yet
-                // (cold start / server restart) so there is *something* to anchor against meanwhile.
                 target = bufEnd - HEAL_LEAD_SEC;
                 if (target < lo) target = lo;
                 if (target > hi) target = hi;
@@ -898,10 +767,6 @@
         }
 
         function _beginSyncedPlayback(player, cafEl) {
-            // Wait only until there is a minimal buffer to anchor against. We do NOT require the
-            // buffer to "extend past the audio position" (the old forward-only assumption that hung
-            // forever when the live edge sat ahead of a stale audio target) — _anchorVideo
-            // self-heals to whatever is actually playable, in either direction.
             var buf = player.buffered;
             var bufLenSec = buf.length > 0 ? (buf.end(buf.length - 1) - buf.start(0)) : 0;
             if (bufLenSec < 2 * SEEK_GUARD_SEC) {
@@ -909,13 +774,7 @@
                 return;
             }
 
-            // FAST CONVERGENCE (anchor-wait): also wait until the cdisp-correct target is actually
-            // BUFFERED, so the start anchor lands ON it (≈0 initial error) and locks in seconds —
-            // instead of anchoring at a shallow live-edge buffer ~1-2 s off and rate-trimming at 3% for
-            // ~30 s. Bounded by START_WAIT_MAX so a slow/odd fetch can't hang startup (after the cap we
-            // anchor with whatever we have = the old self-healing behavior). Skipped until the server
-            // epoch is known (else the target isn't meaningful yet).
-            var START_WAIT_MAX = 30;   // × 300 ms ≈ 9 s ceiling
+            var START_WAIT_MAX = 30;
             if (_videoEpochSet && _epochMs >= 0 && _startWaitCount < START_WAIT_MAX) {
                 var idealStart = _getVideoTimeSecForAudioMs(_getAudioClockMs(cafEl));
                 var loS = buf.start(0) + SEEK_GUARD_SEC, hiS = buf.end(buf.length - 1) - SEEK_GUARD_SEC;
@@ -929,22 +788,16 @@
 
             _anchorVideo(player, cafEl, 'start');
             player.play().catch(function () {});
-            _tPlayStart = Date.now(); _convergeReported = false; _initialErrMs = null;   // telemetry: playback-start milestone
+            _tPlayStart = Date.now(); _convergeReported = false; _initialErrMs = null;
             console.log('[cws] Video playback started at ' + player.currentTime.toFixed(3) +
                         's, epochMs=' + _epochMs + ' videoEpochMs=' + Math.round(_videoEpochMs) +
                         ' cafT=' + cafEl.currentTime.toFixed(3));
 
             _showOverlay(0);
 
-            // ── requestVideoFrameCallback loop ────────────────────────────
-            // Updates _rVFCMediaTimeSec with the PTS of the frame actually on
-            // screen (not just decoded). _getVideoClockMs uses this so the PLL
-            // error signal reflects the displayed frame, eliminating the
-            // ~1-frame (~33 ms) decode-to-display pipeline offset.
             if (typeof player.requestVideoFrameCallback === 'function') {
                 console.log('[cws] requestVideoFrameCallback available — using display-accurate video clock');
                 (function rVFCLoop(now, meta) {
-                    // Only accept real callbacks (mediaTime > 0), not the synthetic bootstrap.
                     if (meta && typeof meta.mediaTime === 'number' && meta.mediaTime > 0) {
                         _rVFCMediaTimeSec = meta.mediaTime;
                         _rVFCRenderedCount++;
@@ -955,37 +808,21 @@
                 console.log('[cws] requestVideoFrameCallback not available — falling back to player.currentTime');
             }
 
-            // ── Drift-trim sync loop ───────────────────────────────────────
-            // Cdisp is baked into the server's reported epoch, so the target is PURE content
-            // equality (videoContentMs == audioContentMs). Both streams
-            // ride the same audio sample clock, so steady-state error stays within a small
-            // dead band — this loop only trims slow drift. playbackRate affects the MUTED
-            // video only (audio is separate CAF), so rate changes are inaudible, but rate>1
-            // drains the video buffer, so the trim is clamped (tighter when the buffer is
-            // low). Large excursions (startup, track change, gap) snap via a hard seek.
-            var DEAD_BAND_MS = 80;             // hold rate at 1.0 within this band
-            var KP = 0.0002;                   // 200 ms error → ~4% trim (then clamped)
-            var MAX_TRIM = 0.06;               // ±6% when the buffer is healthy
-            var MAX_TRIM_SAFE = 0.03;          // ±3% when the buffer is low
+            var DEAD_BAND_MS = 80;
+            var KP = 0.0002;
+            var MAX_TRIM = 0.06;
+            var MAX_TRIM_SAFE = 0.03;
             var BUFFER_LOW_SEC = 4;
-            var SEEK_COOLDOWN_MS = 2000;       // never seek/re-anchor more than once per 2s
-            var STARTUP_SNAP_MS = 300;         // one-shot first-correction seek threshold — snap the
-                                               // startup offset instead of rate-trimming it for ~15 s
-            var STALL_RECOVER_MS = 1500;       // currentTime pinned this long WITH buffer ahead ⇒ a
-                                               // paused/decode stall → resume + re-anchor to recover
-            var startupSnapPending = true;     // armed per playback start; cleared after the snap or once converged
+            var SEEK_COOLDOWN_MS = 2000;
+            var STARTUP_SNAP_MS = 300;
+            var STALL_RECOVER_MS = 1500;
+            var startupSnapPending = true;
             var _syncLogCounter = 0;
 
             if (_syncTimer) clearInterval(_syncTimer);
             _syncTimer = setInterval(function () {
                 if (!_cafPlaying) return;
 
-                // STRANDED-PLAYHEAD RESCUE (must run BEFORE the readyState guard below). An underrun +
-                // a forward buffer jump can leave currentTime OUTSIDE the buffered range — in a gap with
-                // no data. The element then stalls (readyState<2) and the guard would block the recovery
-                // seek forever → permanent video freeze with audio still playing. Seek back into the
-                // buffer (near the live edge) to un-stick it. This only fires when the playhead is
-                // demonstrably out of buffer, so it never triggers in normal playback.
                 var _rb = player.buffered;
                 if (_rb && _rb.length) {
                     var _rbS = _rb.start(0), _rbE = _rb.end(_rb.length - 1), _rct = player.currentTime;
@@ -1004,20 +841,10 @@
                     }
                 }
 
-                // VIDEO-STALL WATCHDOG (in-buffer stall) — complements the rescue above, which only
-                // catches a playhead OUTSIDE the buffer. Here currentTime is frozen while INSIDE the
-                // buffer: a paused element (e.g. a Home App PAUSE during a messy bootup) or a decode
-                // stall with data buffered ahead. The `paused || readyState<2 → return` below would
-                // otherwise bail forever and the rescue never fires (playhead in-buffer), so the video
-                // froze permanently with audio still playing (observed at bootup: playerT pinned, ~7 s
-                // buffered ahead). Detect no-advance and recover: resume if paused, then re-anchor to
-                // re-prime the decoder and re-sync. Gated so it can't fire during the legitimate
-                // audio-HOLD (where video SHOULD hold) or before there is buffered data to play; the
-                // seek cooldown keeps it to at most one recovery attempt per 2 s.
                 var _wNow = Date.now();
                 var _pt = player.currentTime;
                 if (_pt > _playerLastT + 0.02) {
-                    _playerLastT = _pt; _playerStallWall = _wNow;   // advancing normally
+                    _playerLastT = _pt; _playerStallWall = _wNow;
                 } else if (!_audioHeld && _rb && _rb.length &&
                            (_rb.end(_rb.length - 1) - _pt) > SEEK_GUARD_SEC &&
                            (_wNow - _playerStallWall) > STALL_RECOVER_MS &&
@@ -1028,8 +855,8 @@
                                 's) → recover');
                     _evt.stall++;
                     try { if (player.paused) player.play(); } catch (e) {}
-                    _anchorVideo(player, cafEl, 'stall-recover');   // re-seek in-buffer → re-prime decoder
-                    _playerStallWall = _wNow;                       // reset grace so we don't hammer
+                    _anchorVideo(player, cafEl, 'stall-recover');
+                    _playerStallWall = _wNow;
                     _postReceiverLog('stall');
                     return;
                 }
@@ -1039,12 +866,19 @@
                 var nowWall = Date.now();
                 var audioMs = _getAudioClockMs(cafEl);
 
-                // ── Audio-clock health gate ─────────────────────────────────────────────
-                // The PLL syncs video TO the audio clock. If that clock is frozen, seeking video is
-                // futile and harmful (it thrashes, and re-anchoring would bake a garbage epoch from a
-                // dead clock — the seek-storm + runaway videoEpochMs we hit). So HOLD: keep playing at
-                // 1× (which tracks the segment-arrival rate, keeping the buffer bounded) and stop
-                // chasing until the clock advances. When it resumes, the logic below re-converges.
+                // FORWARD-JUMP GATE — backstop for the server's epochJumpSeq signal. A large positive
+                // leap in the audio clock between ticks means the CAF ring skipped to the live edge
+                // (epoch advanced by the skipped duration). caf.currentTime advances smoothly, so the
+                // only way audioMs jumps multi-second is an epoch change — i.e. a ring skip. Rebuild
+                // video from the new live edge rather than chasing a gap the buffer can't cover.
+                if (_audioLastMs >= 0 && audioMs > _audioLastMs + AUDIO_JUMP_MS) {
+                    var _jump = Math.round(audioMs - _audioLastMs);
+                    console.warn('[cws] audio clock jumped ' + _jump + 'ms (ring skip?) — hard video recover');
+                    _audioLastMs = audioMs; _audioLastWall = nowWall;
+                    _hardRecoverVideo('audio-jump ' + _jump + 'ms');
+                    return;
+                }
+
                 if (_audioLastMs < 0 || audioMs > _audioLastMs + 1) {
                     _audioLastMs = audioMs;
                     _audioLastWall = nowWall;
@@ -1056,13 +890,8 @@
                 }
 
                 var videoMs = _getVideoClockMs(player);
-                var errorMs = videoMs - audioMs - _cdispBaked;  // target: videoContent == audioContent + Cdisp
+                var errorMs = videoMs - audioMs - _cdispBaked;
 
-                // Convergence telemetry (the "~30 s to sync" question). Capture the first real error
-                // after playback starts, and emit a one-shot breakdown the moment we first enter the
-                // dead band: where the time went (epoch wait vs play→converge) and how it converged
-                // (startup-snap / hard-seeks / anchors). Flushes the console ring so the full trajectory
-                // lands in the server log.
                 if (_initialErrMs === null) _initialErrMs = errorMs;
                 if (!_convergeReported && _tPlayStart && Math.abs(errorMs) <= DEAD_BAND_MS) {
                     _convergeReported = true;
@@ -1080,17 +909,12 @@
                 var ideal = _getVideoTimeSecForAudioMs(audioMs);
                 var canSeek = (nowWall - _lastSeekMs) > SEEK_COOLDOWN_MS;
 
-                // A "Save" (reanchorSeq bump) re-bakes Cdisp → one clean anchor that honors it.
                 if (_reanchorPending) {
                     _reanchorPending = false;
                     _anchorVideo(player, cafEl, 'cdisp-save');
                     return;
                 }
 
-                // RE-ANCHOR only for a GENUINE discontinuity: the target sits outside the live buffer
-                // by a real margin (track change / seek / fast-forward / long gap). The audio clock is
-                // healthy here (gated above), so the re-derived epoch is sound. Edge-of-buffer is NOT a
-                // discontinuity — it falls through to the clamped seek and converges normally.
                 var outsideBy = (ideal < bufStart) ? (bufStart - ideal)
                               : (ideal > bufEnd)   ? (ideal - bufEnd) : 0;
                 if (outsideBy > REANCHOR_OUTSIDE_SEC && canSeek) {
@@ -1098,10 +922,6 @@
                     return;
                 }
 
-                // Medium drift → ONE clamped in-buffer seek (the proven recovery). Clamping keeps the
-                // target inside the buffer, so a near-edge target seeks to the edge instead of failing.
-                // STARTUP SNAP: for the FIRST correction of a session use a lower threshold so a
-                // few-hundred-ms startup offset snaps in ~1 s instead of rate-trimming for ~15 s.
                 var seekThresh = startupSnapPending ? STARTUP_SNAP_MS : HARD_SEEK_MS;
                 if (Math.abs(errorMs) > seekThresh && canSeek) {
                     var target = ideal;
@@ -1117,14 +937,12 @@
                     return;
                 }
 
-                // Startup snap no longer needed once we're inside the dead band (converged on its own).
                 if (startupSnapPending && Math.abs(errorMs) <= DEAD_BAND_MS) startupSnapPending = false;
 
-                // Fine alignment → gentle rate trim on the (muted) video only.
                 var bufAheadSec = bufEnd - player.currentTime;
                 var rate;
                 if (Math.abs(errorMs) <= DEAD_BAND_MS) {
-                    rate = 1.0;  // within dead band — hold steady, no trim
+                    rate = 1.0;
                 } else {
                     var maxTrim = bufAheadSec < BUFFER_LOW_SEC ? MAX_TRIM_SAFE : MAX_TRIM;
                     rate = 1.0 - KP * errorMs;
@@ -1133,8 +951,6 @@
                 player.playbackRate = rate;
 
                 _syncLogCounter++;
-                // Log every tick (~250 ms) BEFORE convergence so the startup trajectory is fully
-                // captured (the "~30 s" breakdown), then back off to every 16 ticks (~4 s) once locked.
                 if (_syncLogCounter % (_convergeReported ? 16 : 1) === 0) {
                     var rVFCActive = _rVFCMediaTimeSec >= 0;
                     console.log('[cws] drift: err=' + errorMs.toFixed(0) + 'ms rate=' + rate.toFixed(4) +
@@ -1143,21 +959,7 @@
                 }
             }, 250);
 
-            // A/V-sync calibration no longer involves the receiver: the Chromecast cannot read
-            // hardware-decoded video pixels, so measurement is done by the phone companion
-            // (camera reads the on-screen barcode, mic reads the FSK audio timecode).
 
-            // Periodically refresh the AUDIO epoch from the server (handles slow wall-clock drift /
-            // an audio reconnect) AND adopt the server's LIVE videoEpochMs (TIER 2) AND watch for the
-            // re-anchor signal (reanchorSeq bumps when the user Saves a new offset). The server now
-            // recomputes videoEpochMs per frame as (content − PTS), so it tracks the wall-vs-sample
-            // skew and stays correct across gaps — the receiver trusts it as authority instead of
-            // owning a self-derived value (the old self-derived value was wrong on a clean start and
-            // desynced track changes). A large adopted shift makes the drift loop do ONE clamped seek
-            // to converge; the value is EMA-smoothed server-side so small jitter stays in the dead
-            // band. It must NOT touch _cdispBaked — only a reanchorSeq change re-bakes it (one clean
-            // anchor in the drift loop). Captured in _epochPollTimer so _reset() can clear it (else
-            // every track change leaks another poll that fights over the shared state).
             if (_epochPollTimer) clearInterval(_epochPollTimer);
             _epochPollTimer = setInterval(function () {
                 if (!_baseUrl) return;
@@ -1166,20 +968,24 @@
                     .then(function (r) { return r.json(); })
                     .then(function (d) {
                         _serverRtt = Date.now() - t0;
-                        // Calibration Stop edge (independent of epoch readiness): hide the buffered
-                        // barcode/tone the instant the test ends, instead of waiting for it to drain.
                         var calibActive = (d.calibActive === true);
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
-                            if (!calibActive) _calibStopBlank(player, cafEl);       // Stop → blank + mute now
-                            else if (_calibStopBlanked) _calibStopReveal(cafEl);    // re-Start after a Stop → reveal
+                            if (!calibActive) _calibStopBlank(player, cafEl);
+                            else if (_calibStopBlanked) _calibStopReveal(cafEl);
                         }
                         if (d.epochMs >= 0) {
                             _epochMs     = d.epochMs;
                             _epochWallMs = d.epochWallMs;
-                            // TIER 2: adopt the server's live videoEpochMs (authority). Accept ANY
-                            // numeric value, including negative (video PTS can lead the audio clock);
-                            // null means the server hasn't computed it yet → keep what we have.
+                            // Server ring-skip signal: epochMs above already jumped forward; rebuild
+                            // video from the new live edge. Guard on >=0 so the first poll only baselines.
+                            if (typeof d.epochJumpSeq === 'number') {
+                                if (_lastEpochJumpSeq >= 0 && d.epochJumpSeq !== _lastEpochJumpSeq) {
+                                    console.warn('[cws] server ring-skip (epochJumpSeq ' + _lastEpochJumpSeq + '→' + d.epochJumpSeq + ') — hard video recover');
+                                    _hardRecoverVideo('epochJumpSeq');
+                                }
+                                _lastEpochJumpSeq = d.epochJumpSeq;
+                            }
                             if (typeof d.videoEpochMs === 'number') { _videoEpochMs = d.videoEpochMs; _videoEpochSet = true; }
                             _cdispMs     = (typeof d.cdispMs === 'number') ? d.cdispMs : 0;
                             if (typeof d.reanchorSeq === 'number' && d.reanchorSeq !== _lastReanchorSeq) {
@@ -1202,8 +1008,6 @@
                     .catch(function () {});
             }, 2000);
 
-            // Periodically POST sync telemetry so server can monitor convergence.
-            // Captured in _reportTimer so _reset() can clear it (avoids leaking one per track change).
             if (_reportTimer) clearInterval(_reportTimer);
             _reportTimer = setInterval(function () {
                 if (!_baseUrl || !_cafPlaying) return;
@@ -1213,11 +1017,6 @@
                     var bAhead = player.buffered.length > 0
                         ? (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000
                         : 0;
-                    // pllErr is the TRUE convergence error = deviation from the target the drift loop
-                    // actually holds (videoContent == audioContent + Cdisp). Subtract _cdispBaked so
-                    // pllErr≈0 means "holding the calibrated offset",
-                    // instead of misleadingly reading ~Cdisp when perfectly converged. The raw A/V
-                    // offset is still derivable as videoTimeMs−audioTimeMs (both reported below).
                     var pllErr = vMs - aMs - _cdispBaked;
                     var rVFCActive = _rVFCMediaTimeSec >= 0;
                     fetch(_baseUrl + 'cast/sync-report', {
@@ -1235,14 +1034,10 @@
                             rVFCDeltaMs: rVFCActive ? Math.round((player.currentTime - _rVFCMediaTimeSec) * 1000) : null,
                             playerCurrentTime: player.currentTime,
                             playbackRate: player.playbackRate,
-                            // Anchor diagnostics: makes a stalled/disjoint anchor visible server-side
-                            // (e.g. a seek target outside [bufStartSec,bufEndSec] is the freeze signature).
                             bufStartSec: player.buffered.length > 0 ? +player.buffered.start(0).toFixed(2) : -1,
                             bufEndSec:   player.buffered.length > 0 ? +player.buffered.end(player.buffered.length - 1).toFixed(2) : -1,
                             videoEpochMs: Math.round(_videoEpochMs),
                             epochMs: _epochMs,
-                            // Tier-1 telemetry: element state (paused vs decode-stall), loader health,
-                            // and cumulative recovery-path counts (which "hacks" actually fire).
                             paused: player.paused,
                             readyState: player.readyState,
                             appendQueueLen: _appendQueue.length,
@@ -1254,7 +1049,6 @@
             }, 5000);
         }
 
-        // Minimal m3u8 parser — extracts segment URIs, sequence numbers, target duration
         function _parseM3u8(text) {
             var lines = text.split('\n');
             var segments = [];
@@ -1273,7 +1067,6 @@
                 } else if (line.indexOf('#EXT-X-PROGRAM-DATE-TIME:') === 0) {
                     pendingProgramDateTime = Date.parse(line.substring('#EXT-X-PROGRAM-DATE-TIME:'.length));
                 } else if (line.indexOf('#EXTINF:') === 0) {
-                    // Next non-comment line is the segment URI
                     for (var j = i + 1; j < lines.length; j++) {
                         var nextLine = lines[j].trim();
                         if (nextLine && nextLine.charAt(0) !== '#') {
@@ -1289,9 +1082,6 @@
             return { segments: segments, mediaSeq: mediaSeq, targetDuration: targetDuration };
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // Silence CAF element (for fmp4_muxed mode only)
-        // ══════════════════════════════════════════════════════════════════════
         function _silenceCaf() {
             var cafEl = document.getElementById('caf-el');
             if (!cafEl || cafEl._silenced) return;
@@ -1299,7 +1089,6 @@
             try {
                 var silenceCtx = new (window.AudioContext || window.webkitAudioContext)();
                 silenceCtx.createMediaElementSource(cafEl);
-                // NOT connected to destination → silence
             } catch (e) {
                 cafEl.addEventListener('volumechange', function () {
                     if (cafEl.volume !== 0) cafEl.volume = 0;
@@ -1308,9 +1097,6 @@
             }
         }
 
-        // ══════════════════════════════════════════════════════════════════════
-        // fmp4_muxed mode (legacy — kept for fallback)
-        // ══════════════════════════════════════════════════════════════════════
         var _hls = null;
         window.__hls = function () { return _hls; };
 
@@ -1322,7 +1108,7 @@
                 return;
             }
 
-            player.muted = false;  // muxed mode: player produces audio
+            player.muted = false;
             _showOverlay(1);
 
             fetch(baseUrl + 'api/settings')
@@ -1383,14 +1169,12 @@
                 });
         }
 
-        // ── Common helpers ──────────────────────────────────────────────────────
 
         function _reset() {
             if (_syncTimer)  { clearInterval(_syncTimer); _syncTimer = null; }
             if (_pollTimer)  { clearTimeout(_pollTimer); _pollTimer = null; }
             if (_epochPollTimer) { clearInterval(_epochPollTimer); _epochPollTimer = null; }
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
-            // Drop any pending calibration-stop blank/mute — a fresh LOAD owns the overlay + audio now.
             if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
             _lastCalibActive = false; _calibStopBlanked = false;
             var _cafReset = document.getElementById('caf-el');
@@ -1398,15 +1182,16 @@
             _lastSeekMs = 0;
             _audioLastMs = -1; _audioLastWall = 0; _audioHeld = false;
             _playerLastT = -1; _playerStallWall = 0; _startWaitCount = 0;
-            _mseGen++;       // invalidate any in-flight MSE init from the previous session
+            _mseGen++;
             if (_mseRetryTimer) { clearTimeout(_mseRetryTimer); _mseRetryTimer = null; }
             if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
             if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
             _ms = null; _sb = null;
-            _appendQueue = []; _appending = false; _trimming = false;
+            if (_drainRetryTimer) { clearTimeout(_drainRetryTimer); _drainRetryTimer = null; }
+            _appendQueue = []; _appending = false; _trimming = false; _quotaRetries = 0;
             _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
             _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1; _videoEpochSet = false; _cdispMs = 0;
-            _cdispBaked = 0; _lastReanchorSeq = -1; _reanchorPending = false;
+            _cdispBaked = 0; _lastReanchorSeq = -1; _reanchorPending = false; _lastEpochJumpSeq = -1;
             _videoReady = false; _cafPlaying = false; _everPlayed = false;
             _lastManifestInfo = null; _lastClockInfo = null;
             if (_debugWatchTimer) clearInterval(_debugWatchTimer);
@@ -1426,11 +1211,6 @@
             if (el) el.style.opacity = String(opacity);
         }
 
-        // Calibration Stop: the test pattern is part of the continuous stream, so the Stop only swaps
-        // content (barcode/tone → theme) at the live WRITE edge — ~10-15 s ahead of what the receiver is
-        // showing. Rather than wait for that to drain (the "Stop takes 5-10 s" complaint), cover the
-        // buffered pattern with the black overlay and mute the CAF beep immediately, then reveal the
-        // theme once the buffered pattern has played out (drain ≈ buffer-ahead at rate≈1).
         function _calibStopBlank(player, cafEl) {
             _calibStopBlanked = true;
             var bufAheadMs = 0;
@@ -1438,7 +1218,6 @@
                 if (player && player.buffered && player.buffered.length > 0)
                     bufAheadMs = Math.max(0, (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000);
             } catch (e) {}
-            // Floor (cover the 0.4 s fade + poll jitter) and cap (guard against a garbage buffer reading).
             var revealMs = Math.min(20000, Math.max(1500, bufAheadMs + 1000));
             console.log('[cws] calibration stopped — overlay + CAF mute now; reveal theme in ~' +
                         Math.round(revealMs) + 'ms (buffer drain)');
@@ -1458,8 +1237,6 @@
             _showOverlay(0);
         }
 
-        // Report this device's codec/feature support to the plugin (read-only; the settings page
-        // displays it). Re-sent on each LOAD so a restarted plugin always has the current matrix.
         function _reportCapabilities(baseUrl) {
             if (!baseUrl) return;
             function ms(t) { try { return !!(window.MediaSource && MediaSource.isTypeSupported(t)); } catch (e) { return false; } }
