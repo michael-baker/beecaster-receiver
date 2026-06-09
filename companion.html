@@ -247,7 +247,7 @@
 <script src="sync-barcode.js"></script>
 <script>
 'use strict';
-var VERSION = '2026-06-07-companion-v18-xtalkgate';
+var VERSION = '2026-06-07-companion-v19-latch';
 var PROTO = {
   CHIRP_F0: 1500, CHIRP_F1: 2150,
   SYNC_MS: 150,
@@ -795,6 +795,11 @@ var GEN = {
   var trim=0;
   var locked=false, lockedVal=null;
   var LOCK_SPREAD=90, LOCK_N=4, LOCK_SPAN=8000;
+  // Lock on TOTAL clean beacons (both directions are guaranteed present — EST.result needs ≥2 of each).
+  // The old min(down,up)≥LOCK_N gate never latched when one direction was sample-starved (low-yield UP
+  // beacon) even though the offset had clearly converged; the cross-talk gate now keeps residues clean,
+  // so a smaller total is reliable.
+  var LOCK_AUD=6;
   function word(ms){ return ms>0 ? 'audio AHEAD of video' : (ms<0 ? 'audio LAGS video' : 'in sync'); }
 
   var lastVidAccept=0, lastAudAccept=0, lastCamStatus='', _acceptT=0;
@@ -813,7 +818,7 @@ var GEN = {
   }
   function updateMeters(){
     var now=performance.now(), r=EST.result();
-    var ready = r ? clamp(Math.min(r.aN/LOCK_N, r.spanMs/LOCK_SPAN) * (r.spread<=LOCK_SPREAD?1:0.6), 0, 1) : 0;
+    var ready = r ? clamp(Math.min(r.aN/LOCK_AUD, r.spanMs/LOCK_SPAN) * (r.spread<=LOCK_SPREAD?1:0.6), 0, 1) : 0;
     var vN=EST.vid.length, aN=EST.audN();
     setMeter('mVid','mVidBar','mVidTxt', CAM.running, (now-lastVidAccept)<1500, vN/Math.max(LOCK_N,1), String(vN));
     setMeter('mAud','mAudBar','mAudTxt', MIC.running, (now-lastAudAccept)<7000, locked?1:ready, String(aN));
@@ -875,13 +880,13 @@ var GEN = {
     var r=EST.result();
     if (!r){ $('pConf').textContent='confidence: -'; $('pConf').className='pill'; setBar(0,false); updateUi(); return; }
     $('rN').textContent=r.vN+'+'+r.aN; $('rSd').textContent=r.spread;
-    var good = r.spread<=60 && r.n>=5, mid = r.spread<=100;
+    var good = r.spread<=60 && r.aN>=8, mid = r.spread<=100;
     $('pConf').textContent='confidence: '+(good?'high':(mid?'medium':'low'))+' (±'+r.spread+')';
     $('pConf').className='pill '+(good?'ok':(mid?'mid':'no'));
 
-    if (!locked && r.spread<=LOCK_SPREAD && r.n>=LOCK_N && r.spanMs>=LOCK_SPAN){
+    if (!locked && r.spread<=LOCK_SPREAD && r.aN>=LOCK_AUD && r.spanMs>=LOCK_SPAN){
       locked=true; lockedVal=r.offset;
-      log('[lock] offset='+lockedVal+'ms  spread=±'+r.spread+'  n='+r.n);
+      log('[lock] offset='+lockedVal+'ms  spread=±'+r.spread+'  aN='+r.aN);
       stopMeasuring();
     }
     if (locked){
@@ -893,7 +898,7 @@ var GEN = {
       var sh=r.offset - trim;
       $('offsetBig').textContent=(sh>0?'+':'')+sh;
       $('offsetBig').style.color='var(--dim)';
-      setBar(Math.min(r.n/LOCK_N, r.spanMs/LOCK_SPAN) * (r.spread<=LOCK_SPREAD?1:0.5), false);
+      setBar(Math.min(r.aN/LOCK_AUD, r.spanMs/LOCK_SPAN) * (r.spread<=LOCK_SPREAD?1:0.5), false);
     }
     updateUi();
   }
