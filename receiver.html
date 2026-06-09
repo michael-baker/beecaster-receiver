@@ -33,7 +33,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-09-r30-ringskip-recover';
+        var RECEIVER_VERSION = '2026-06-09-r31-calib-hold';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -113,6 +113,7 @@
         var _reanchorPending = false;
         var _lastEpochJumpSeq = -1;  // last epochJumpSeq seen; a change = server ring-skip → hard recover
         var _lastCalibActive = false;
+        var _calibActive = false;     // read by the drift loop to suppress auto clamp/nudge during a calibration session
         var _calibStopBlanked = false;
         var _calibStopRevealTimer = null;
         var _serverRtt   = 0;
@@ -485,21 +486,6 @@
             if (!player || !_baseUrl) return;
             console.warn('[cws] hard video recover (' + reason + ') — rebuilding MSE from live edge');
             _scheduleMseReinit(player, _baseUrl, _mseGen);
-        }
-
-        function _loadInitSegment(baseUrl, cb) {
-            fetch(baseUrl + 'cast/split_video/init.mp4')
-                .then(function (r) {
-                    if (!r.ok) throw new Error('init.mp4 HTTP ' + r.status);
-                    return r.arrayBuffer();
-                })
-                .then(function (buf) {
-                    _queueAppend(new Uint8Array(buf), cb);
-                })
-                .catch(function (e) {
-                    console.error('[cws] init.mp4 fetch failed:', e);
-                    setTimeout(function () { _loadInitSegment(baseUrl, cb); }, 2000);
-                });
         }
 
         function _pollManifest(baseUrl) {
@@ -915,6 +901,20 @@
                     return;
                 }
 
+                // CALIBRATION HOLD — during a calibration session the tuning loop is: the companion
+                // measures a STABLE rendered A/V offset while the user nudges Cdisp; a Save bumps
+                // reanchorSeq → the _reanchorPending anchor above moves the picture ONCE. The automatic
+                // clamp (hard-seek) and nudge (rate-trim) below must NOT run: they jump the barcode and
+                // warp the tone (corrupting the read), and when the calibration video sits at the live
+                // edge with a shallow buffer they re-seek every cooldown forever — the stalls/glitches on
+                // the tone page. Hold at 1.0; the 'start'/'cdisp-save' anchors (HEAL → ~4 s buffer lead)
+                // keep it from underrunning. Safety paths above (rescue / stall-recover / audio-HOLD /
+                // ring-skip) still apply. The companion-nudge loop only needs stability, not auto-align.
+                if (_calibActive) {
+                    if (player.playbackRate !== 1.0) player.playbackRate = 1.0;
+                    return;
+                }
+
                 var outsideBy = (ideal < bufStart) ? (bufStart - ideal)
                               : (ideal > bufEnd)   ? (ideal - bufEnd) : 0;
                 if (outsideBy > REANCHOR_OUTSIDE_SEC && canSeek) {
@@ -969,6 +969,7 @@
                     .then(function (d) {
                         _serverRtt = Date.now() - t0;
                         var calibActive = (d.calibActive === true);
+                        _calibActive = calibActive;
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
                             if (!calibActive) _calibStopBlank(player, cafEl);
@@ -1176,7 +1177,7 @@
             if (_epochPollTimer) { clearInterval(_epochPollTimer); _epochPollTimer = null; }
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
-            _lastCalibActive = false; _calibStopBlanked = false;
+            _lastCalibActive = false; _calibActive = false; _calibStopBlanked = false;
             var _cafReset = document.getElementById('caf-el');
             if (_cafReset) { try { _cafReset.muted = false; } catch (e) {} }
             _lastSeekMs = 0;
