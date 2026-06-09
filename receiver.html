@@ -50,7 +50,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r34-calib-prep-overlay';
+        var RECEIVER_VERSION = '2026-06-10-r35-calib-prep-fast';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -175,7 +175,6 @@
         var CALIB_UNSETTLE_HOLD_MS = 4000;
         var _calibAnchored = false;
         var _calibSettled  = false;
-        var _calibEverSettled = false;
         var _calibErrWin   = [];
         var _lastDisruptMs = 0;
         var _lastEvtSum    = 0;
@@ -355,6 +354,17 @@
         options.maxInactivity = 3600;
         options.mediaElement = document.getElementById('caf-el');
         context.start(options);
+
+        // Persistent calibration-overlay poll, independent of the media pipeline (NOT cleared by _reset),
+        // so the device-side "Preparing" overlay appears within ~1 s of calibration starting and stays up
+        // through the pipeline restart + warmup, then hides the moment the server reports the picture ready.
+        setInterval(function () {
+            if (!_baseUrl) return;
+            fetch(_baseUrl + 'cast/audio-clock').then(function (r) { return r.json(); }).then(function (d) {
+                if (d.calibActive === true && d.calibReady !== true) _showPrepCalib();
+                else _hidePrepCalib();
+            }).catch(function () {});
+        }, 1000);
 
 
         function _startCafWavSync(baseUrl) {
@@ -989,7 +999,6 @@
                         _unsettledSinceMs = 0;
                         if (!_calibSettled) {
                             _calibSettled = true;
-                            if (!_calibEverSettled) { _calibEverSettled = true; _hidePrepCalib(); }
                             console.log('[cws] calib SETTLED: err=' + Math.round(errorMs) + 'ms spread=' + Math.round(spread) + 'ms');
                             _postSyncReport(player, cafEl);
                         }
@@ -1070,12 +1079,9 @@
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
                             if (calibActive) {
-                                _calibAnchored = false; _calibSettled = false; _calibEverSettled = false;
+                                _calibAnchored = false; _calibSettled = false;
                                 _calibErrWin = []; _calibErrTicks = 0; _unsettledSinceMs = 0;
                                 _lastDisruptMs = Date.now(); _calibActiveSinceMs = Date.now();
-                                _showPrepCalib();
-                            } else {
-                                _hidePrepCalib();
                             }
                             if (!calibActive) _calibStopBlank(player, cafEl);
                             else if (_calibStopBlanked) _calibStopReveal(cafEl);
@@ -1287,9 +1293,9 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
             _lastCalibActive = false; _calibActive = false; _calibStopBlanked = false;
-            _calibAnchored = false; _calibSettled = false; _calibEverSettled = false; _calibErrWin = [];
+            _calibAnchored = false; _calibSettled = false; _calibErrWin = [];
             _lastEvtSum = 0; _calibActiveSinceMs = 0; _unsettledSinceMs = 0;
-            _hideSyncError(); _hidePrepCalib();
+            _hideSyncError();
             var _cafReset = document.getElementById('caf-el');
             if (_cafReset) { try { _cafReset.muted = false; } catch (e) {} }
             _lastSeekMs = 0;
