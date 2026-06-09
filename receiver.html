@@ -41,7 +41,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r32-calib-syncerr';
+        var RECEIVER_VERSION = '2026-06-10-r33-calib-ready';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -156,6 +156,19 @@
         var CALIB_ERR_GRACE_MS  = 6000;
         var CALIB_ERR_TICKS     = 3;
         var _calibErrTicks      = 0;
+
+        // Calibration settle gate: the picture must be anchored on the cdisp-ideal and the error must
+        // be stable (low spread) with no disruptive event for a quiet window before it is trustworthy.
+        var CALIB_SETTLE_SPREAD_MS = 50;
+        var CALIB_SETTLE_QUIET_MS  = 3000;
+        var CALIB_SETTLE_SAMPLES   = 8;
+        var CALIB_PREP_TIMEOUT_MS  = 20000;
+        var _calibAnchored = false;
+        var _calibSettled  = false;
+        var _calibErrWin   = [];
+        var _lastDisruptMs = 0;
+        var _lastEvtSum    = 0;
+        var _calibActiveSinceMs = 0;
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -892,6 +905,11 @@
                 var videoMs = _getVideoClockMs(player);
                 var errorMs = videoMs - audioMs - _cdispBaked;
 
+                // Any seek / anchor / rebuild / rescue / stall bumps an evt counter; treat a change since
+                // the last tick as a disruption that restarts the calibration quiet window.
+                var _evtSum = _evt.rescue + _evt.stall + _evt.anchor + _evt.hardSeek + _evt.snap + _evt.mseReinit;
+                if (_evtSum !== _lastEvtSum) { _lastEvtSum = _evtSum; _lastDisruptMs = nowWall; }
+
                 if (_initialErrMs === null) _initialErrMs = errorMs;
                 if (!_convergeReported && _tPlayStart && Math.abs(errorMs) <= DEAD_BAND_MS) {
                     _convergeReported = true;
@@ -915,22 +933,54 @@
                     return;
                 }
 
-                // CALIBRATION HOLD — during a calibration session the tuning loop is: the companion
-                // measures a STABLE rendered A/V offset while the user nudges Cdisp; a Save bumps
-                // reanchorSeq → the _reanchorPending anchor above moves the picture ONCE. The automatic
-                // clamp (hard-seek) and nudge (rate-trim) below must NOT run: they jump the barcode and
-                // warp the tone (corrupting the read), and when the calibration video sits at the live
-                // edge with a shallow buffer they re-seek every cooldown forever — the stalls/glitches on
-                // the tone page. Hold at 1.0; the 'start'/'cdisp-save' anchors (HEAL → ~4 s buffer lead)
-                // keep it from underrunning. Safety paths above (rescue / stall-recover / audio-HOLD /
-                // ring-skip) still apply. The companion-nudge loop only needs stability, not auto-align.
+                // CALIBRATION HOLD — the loop places the picture exactly on the cdisp-ideal once it sits
+                // inside the buffer, then holds and reports trustworthiness; the clamp/rate-trim below stay
+                // off so they can't warp the read. Safety paths above (rescue / stall / audio-HOLD) still apply.
                 if (_calibActive) {
                     if (player.playbackRate !== 1.0) player.playbackRate = 1.0;
-                    // A sustained large offset after the grace window means the local pipeline can't keep up, so flag it.
-                    var settled = _tPlayStart
-                        && (nowWall - _tPlayStart) > CALIB_ERR_GRACE_MS
-                        && (nowWall - _lastSeekMs) > CALIB_ERR_GRACE_MS;
-                    if (settled && Math.abs(errorMs) > CALIB_ERR_MS) {
+
+                    // Anchor on the true ideal once it is inside the buffer; never heal to the edge and freeze there.
+                    if (!_calibAnchored) {
+                        var loC = bufStart + SEEK_GUARD_SEC, hiC = bufEnd - SEEK_GUARD_SEC;
+                        if (ideal >= loC && ideal <= hiC && canSeek) {
+                            _rVFCMediaTimeSec = -1;
+                            try { player.currentTime = ideal; } catch (e) {}
+                            player.playbackRate = 1.0;
+                            _lastSeekMs = nowWall;
+                            _evt.anchor++;
+                            _calibAnchored = true;
+                            _calibErrWin = [];
+                            console.log('[cws] calib settle-anchor: t=' + ideal.toFixed(3) + ' cdisp=' + _cdispBaked);
+                        } else if (_calibActiveSinceMs && (nowWall - _calibActiveSinceMs) > CALIB_PREP_TIMEOUT_MS) {
+                            // Never reached a deep-enough buffer to anchor: the pipeline can't keep up.
+                            _showSyncError(errorMs);
+                        }
+                        return;
+                    }
+
+                    // Trustworthy once the error has held a tight spread with no disruption for the quiet window.
+                    _calibErrWin.push(errorMs);
+                    if (_calibErrWin.length > CALIB_SETTLE_SAMPLES) _calibErrWin.shift();
+                    var spread = 0;
+                    if (_calibErrWin.length === CALIB_SETTLE_SAMPLES) {
+                        var lo = _calibErrWin[0], hi = _calibErrWin[0];
+                        for (var i = 1; i < _calibErrWin.length; i++) {
+                            if (_calibErrWin[i] < lo) lo = _calibErrWin[i];
+                            if (_calibErrWin[i] > hi) hi = _calibErrWin[i];
+                        }
+                        spread = hi - lo;
+                    }
+                    var quiet = (nowWall - _lastDisruptMs) > CALIB_SETTLE_QUIET_MS;
+                    var nowSettled = _calibErrWin.length === CALIB_SETTLE_SAMPLES
+                        && spread <= CALIB_SETTLE_SPREAD_MS && quiet && Math.abs(errorMs) <= CALIB_ERR_MS;
+                    if (nowSettled !== _calibSettled) {
+                        _calibSettled = nowSettled;
+                        console.log('[cws] calib ' + (nowSettled ? 'SETTLED' : 'UNSETTLED') +
+                                    ': err=' + Math.round(errorMs) + 'ms spread=' + Math.round(spread) + 'ms');
+                        _postSyncReport(player, cafEl);
+                    }
+
+                    if (quiet && Math.abs(errorMs) > CALIB_ERR_MS) {
                         if (++_calibErrTicks >= CALIB_ERR_TICKS) _showSyncError(errorMs);
                     } else {
                         _calibErrTicks = 0;
@@ -996,6 +1046,10 @@
                         _calibActive = calibActive;
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
+                            if (calibActive) {
+                                _calibAnchored = false; _calibSettled = false; _calibErrWin = [];
+                                _calibErrTicks = 0; _lastDisruptMs = Date.now(); _calibActiveSinceMs = Date.now();
+                            }
                             if (!calibActive) _calibStopBlank(player, cafEl);
                             else if (_calibStopBlanked) _calibStopReveal(cafEl);
                         }
@@ -1034,44 +1088,48 @@
             }, 2000);
 
             if (_reportTimer) clearInterval(_reportTimer);
-            _reportTimer = setInterval(function () {
-                if (!_baseUrl || !_cafPlaying) return;
-                try {
-                    var aMs = _getAudioClockMs(cafEl);
-                    var vMs = _getVideoClockMs(player);
-                    var bAhead = player.buffered.length > 0
-                        ? (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000
-                        : 0;
-                    var pllErr = vMs - aMs - _cdispBaked;
-                    var rVFCActive = _rVFCMediaTimeSec >= 0;
-                    fetch(_baseUrl + 'cast/sync-report', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            audioTimeMs: Math.round(aMs),
-                            videoTimeMs: Math.round(vMs),
-                            bufferAheadMs: Math.round(bAhead),
-                            pllErrorMs: Math.round(pllErr),
-                            cdispMs: Math.round(_cdispBaked),
-                            rVFCAvailable: typeof player.requestVideoFrameCallback === 'function',
-                            rVFCActive: rVFCActive,
-                            rVFCRenderedCount: _rVFCRenderedCount,
-                            rVFCDeltaMs: rVFCActive ? Math.round((player.currentTime - _rVFCMediaTimeSec) * 1000) : null,
-                            playerCurrentTime: player.currentTime,
-                            playbackRate: player.playbackRate,
-                            bufStartSec: player.buffered.length > 0 ? +player.buffered.start(0).toFixed(2) : -1,
-                            bufEndSec:   player.buffered.length > 0 ? +player.buffered.end(player.buffered.length - 1).toFixed(2) : -1,
-                            videoEpochMs: Math.round(_videoEpochMs),
-                            epochMs: _epochMs,
-                            paused: player.paused,
-                            readyState: player.readyState,
-                            appendQueueLen: _appendQueue.length,
-                            videoEpochSet: _videoEpochSet,
-                            evt: _evt
-                        })
-                    }).catch(function () {});
-                } catch(_) {}
-            }, 5000);
+            _reportTimer = setInterval(function () { _postSyncReport(player, cafEl); }, 5000);
+        }
+
+        // Builds and POSTs one sync report. Called on the 5 s timer and immediately on a calib settle change.
+        function _postSyncReport(player, cafEl) {
+            if (!_baseUrl || !_cafPlaying) return;
+            try {
+                var aMs = _getAudioClockMs(cafEl);
+                var vMs = _getVideoClockMs(player);
+                var bAhead = player.buffered.length > 0
+                    ? (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000
+                    : 0;
+                var pllErr = vMs - aMs - _cdispBaked;
+                var rVFCActive = _rVFCMediaTimeSec >= 0;
+                fetch(_baseUrl + 'cast/sync-report', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        audioTimeMs: Math.round(aMs),
+                        videoTimeMs: Math.round(vMs),
+                        bufferAheadMs: Math.round(bAhead),
+                        pllErrorMs: Math.round(pllErr),
+                        cdispMs: Math.round(_cdispBaked),
+                        rVFCAvailable: typeof player.requestVideoFrameCallback === 'function',
+                        rVFCActive: rVFCActive,
+                        rVFCRenderedCount: _rVFCRenderedCount,
+                        rVFCDeltaMs: rVFCActive ? Math.round((player.currentTime - _rVFCMediaTimeSec) * 1000) : null,
+                        playerCurrentTime: player.currentTime,
+                        playbackRate: player.playbackRate,
+                        bufStartSec: player.buffered.length > 0 ? +player.buffered.start(0).toFixed(2) : -1,
+                        bufEndSec:   player.buffered.length > 0 ? +player.buffered.end(player.buffered.length - 1).toFixed(2) : -1,
+                        videoEpochMs: Math.round(_videoEpochMs),
+                        epochMs: _epochMs,
+                        paused: player.paused,
+                        readyState: player.readyState,
+                        appendQueueLen: _appendQueue.length,
+                        videoEpochSet: _videoEpochSet,
+                        calibSettled: _calibSettled,
+                        evt: _evt
+                    })
+                }).catch(function () {});
+            } catch(_) {}
         }
 
         function _parseM3u8(text) {
@@ -1202,6 +1260,7 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
             _lastCalibActive = false; _calibActive = false; _calibStopBlanked = false;
+            _calibAnchored = false; _calibSettled = false; _calibErrWin = []; _lastEvtSum = 0; _calibActiveSinceMs = 0;
             _hideSyncError();
             var _cafReset = document.getElementById('caf-el');
             if (_cafReset) { try { _cafReset.muted = false; } catch (e) {} }
