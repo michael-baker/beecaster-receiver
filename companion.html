@@ -137,13 +137,13 @@
                         <span class="ic">&#128247;</span><span class="ml">Video</span>
                         <span class="mbar">
                             <i id="mVidBar"></i>
-                        </span><span class="cnt" id="mVidTxt">0/12</span>
+                        </span><span class="cnt" id="mVidTxt">0</span>
                     </div>
                     <div class="meter none" id="mAud">
                         <span class="ic">&#128266;</span><span class="ml">Audio</span>
                         <span class="mbar">
                             <i id="mAudBar"></i>
-                        </span><span class="cnt" id="mAudTxt">0/12</span>
+                        </span><span class="cnt" id="mAudTxt">0</span>
                     </div>
                 </div>
             </div>
@@ -265,7 +265,7 @@
    = OFFSET_MOD (±~18 s) with no wrap. NO per-bit decode — only chirp ONSET detection, the one thing that
    survives real-room reverb/comb-nulls/AGC (ρ≈0.3-0.6). Precision = onset timing + barcode (medianed);
    range = CRT. Band ~1.5-2.1 kHz. MUST match FskTimecode (SYNC_MS / the two periods / band). */
-var VERSION = '2026-06-07-companion-v16-stable';
+var VERSION = '2026-06-07-companion-v17-lockstop';
 var PROTO = {
   CHIRP_F0: 1500, CHIRP_F1: 2150,          // beacon band: DOWN-chirp sweeps F1->F0, UP-chirp F0->F1
   SYNC_MS: 150,                            // beacon chirp length. MUST match FskTimecode.SyncMs.
@@ -313,6 +313,7 @@ var EST = {
   MAX_AGE_MS: 60000,  // the offset is CONSTANT, so accumulate over the last 60s
   MAX_N: 1200,
   lastVidMs: -1, lastOffMs: -1, _anchor: null,   // _anchor = last confident offset (CRT continuity hint)
+  _mode: '', _dmad: -1, _umad: -1,               // diagnostics: 'crt'|'down'|'up', and per-direction residue MAD
 
   pushVideo: function(t, v){ this.lastVidMs=v; this.vid.push({t:t, v:v}); this._trim(this.vid, t); },
   pushResidue: function(kind, t, r){ var a = kind==='D'?this.resD:this.resU; a.push({t:t, r:r}); this._trim(a, t); },
@@ -366,20 +367,33 @@ var EST = {
     return (isFinite(t0) && isFinite(t1)) ? (t1 - t0) : 0;
   },
 
+  // ms: a direction whose residue MAD exceeds this is unreliable (missing/weak beacon, wrong period, or
+  // cross-talk noise). The CRT needs BOTH tight; otherwise we fall back to the one good direction alone.
+  MAD_OK: 300,
+
   result: function(){
-    if (this.vid.length < 3 || this.resD.length < 2 || this.resU.length < 2) return null;
+    if (this.vid.length < 3) return null;
     // Require FRESH video: a stale barcode (camera lost it / wobble) must NOT produce a garbage offset.
     if (performance.now() - this.vid[this.vid.length-1].t > 3000) return null;
-    var D=this._resCentre(this.resD, PROTO.BEACON_MS_DOWN), U=this._resCentre(this.resU, PROTO.BEACON_MS_UP);
-    if (!D || !U) return null;
-    var offset = crtOffset(D.center, U.center, PROTO.BEACON_MS_DOWN, PROTO.BEACON_MS_UP, this._anchor);   // CRT (+continuity hint)
-    var spread = Math.round(Math.max(D.mad, U.mad) * 1.4826);   // robust ~stddev of the per-beacon residues
-    if (spread <= 150) this._anchor = offset;   // once residues are tight, anchor the CRT integer against later noise
-    this.lastOffMs = Math.round(offset);
-    return { offset: Math.round(offset), spread: spread, n: Math.min(D.n, U.n),
+    var BD=PROTO.BEACON_MS_DOWN, BU=PROTO.BEACON_MS_UP;
+    var D = this.resD.length>=2 ? this._resCentre(this.resD, BD) : null;
+    var U = this.resU.length>=2 ? this._resCentre(this.resU, BU) : null;
+    this._dmad = D?Math.round(D.mad):-1; this._umad = U?Math.round(U.mad):-1;   // diagnostics
+    var dOk = D && D.mad <= this.MAD_OK, uOk = U && U.mad <= this.MAD_OK;
+    var offset, mad, n, mode;
+    if (dOk && uOk){                                          // both directions clean → full CRT (range ±lcm/2)
+      offset = crtOffset(D.center, U.center, BD, BU, this._anchor); mad=Math.max(D.mad,U.mad); n=Math.min(D.n,U.n); mode='crt';
+      if (mad*1.4826 <= 150) this._anchor = offset;           // anchor the CRT integer only from a clean full fix
+    } else if (dOk){                                          // only DOWN reliable → single-beacon: offset mod BD (±BD/2)
+      offset=D.center; mad=D.mad; n=D.n; mode='down';
+    } else if (uOk){                                          // only UP reliable → single-beacon: offset mod BU (±BU/2)
+      offset=U.center; mad=U.mad; n=U.n; mode='up';
+    } else return null;                                       // neither direction tight yet → no confidence
+    this._mode=mode; this.lastOffMs=Math.round(offset);
+    return { offset: Math.round(offset), spread: Math.round(mad*1.4826), n: n, mode: mode,
              vN: this.vid.length, aN: this.resD.length + this.resU.length, spanMs: this.spanMs() };
   },
-  reset: function(){ this.vid=[]; this.resD=[]; this.resU=[]; this.lastVidMs=-1; this.lastOffMs=-1; this._anchor=null; }
+  reset: function(){ this.vid=[]; this.resD=[]; this.resU=[]; this.lastVidMs=-1; this.lastOffMs=-1; this._anchor=null; this._mode=''; this._dmad=-1; this._umad=-1; }
 };
 // wrap a difference into signed range of `bits` (handles the camera gate's 16-bit barcode compare)
 function wrapSigned(d, bits){ var m=1<<bits; d=((d%m)+m)%m; if (d >= m/2) d-=m; return d; }
@@ -612,7 +626,7 @@ var MIC = {
   recentSync:0,
   pending:[],                           // {s, kind} beacon onsets awaiting refine ('D'=down, 'U'=up)
   _det:null, _tmplLen:0,                // per-direction detector states (built in _initChirp)
-  _dbgMaxRho:0, _dbgDown:0, _dbgUp:0, _dbgPush:0, _dbgRefineFail:0, _dbgSyncRho:0,   // diagnostics
+  _dbgMaxRho:0, _dbgDown:0, _dbgUp:0, _dbgPush:0, _dbgRefineFail:0, _dbgSyncRho:0, _dbgDownRho:0, _dbgUpRho:0,   // diagnostics
   // beacon matched-filter thresholds (tune on real hardware): coarse = trigger to catch the peak region;
   // strict = accept threshold applied to the refined peak ρ (in 0..1). Both sit below a real beacon
   // (ρ~0.3-0.6 observed) so detection stays reliable, above the noise floor so silence doesn't trigger.
@@ -804,8 +818,9 @@ var MIC = {
     var d = (kind==='D') ? this._det[0] : this._det[1];
     var refined = this._refineOnset(onset, d.tmpl, d.et);
     if (refined<0){ this._dbgRefineFail++; return; }
-    if (kind==='D') this._dbgDown++; else this._dbgUp++;
-    this._dbgSyncRho = this._corr(refined - this.bufBase, d.tmpl, d.et);
+    var rho = this._corr(refined - this.bufBase, d.tmpl, d.et);
+    if (kind==='D'){ this._dbgDown++; this._dbgDownRho=rho; } else { this._dbgUp++; this._dbgUpRho=rho; }
+    this._dbgSyncRho = rho;
     this.recentSync = performance.now();
     var tMs = this._timeOfSample(refined);
     var vms = EST.predictVideoLocal(tMs, OFFSET_MOD, 1500);   // video content at the onset from LOCAL barcode samples (±1.5s)
@@ -909,16 +924,23 @@ var GEN = {
     w.classList.add('accept'); clearTimeout(_acceptT);
     _acceptT=setTimeout(function(){ w.classList.remove('accept'); }, 140);
   }
-  function setMeter(meterId, barId, txtId, running, lastAccept, count){
+  function setMeter(meterId, barId, txtId, running, fresh, fillFrac, text){
     var m=$(meterId); if(!m) return;
-    var fresh=(performance.now()-lastAccept)<1200;
-    m.className='meter '+(!running ? 'none' : (fresh ? 'good' : (count>0 ? 'weak' : 'none')));
-    $(barId).style.width=Math.min(count/LOCK_N,1)*100+'%';
-    $(txtId).textContent=Math.min(count,LOCK_N)+'/'+LOCK_N;
+    m.className='meter '+(!running ? 'none' : (fresh ? 'good' : (fillFrac>0 ? 'weak' : 'none')));
+    $(barId).style.width=Math.round(clamp(fillFrac,0,1)*100)+'%';
+    $(txtId).textContent=text;
   }
   function updateMeters(){
-    setMeter('mVid','mVidBar','mVidTxt', CAM.running, lastVidAccept, EST.vid.length);
-    setMeter('mAud','mAudBar','mAudTxt', MIC.running, lastAudAccept, EST.audN());
+    var now=performance.now(), r=EST.result();
+    // Averaging readiness 0..1 — the SAME gate the lock uses (enough audio samples AND a long-enough span
+    // AND a converged spread). The audio bar tracks THIS, so it fills only as the average actually firms up,
+    // not the instant a few beacons arrive. Text shows the real sample count captured so far.
+    var ready = r ? clamp(Math.min(r.aN/LOCK_N, r.spanMs/LOCK_SPAN) * (r.spread<=LOCK_SPREAD?1:0.6), 0, 1) : 0;
+    var vN=EST.vid.length, aN=EST.audN();
+    // video is fast/reliable (fills quickly); audio is the slow channel and tracks averaging readiness.
+    // audio "fresh" must outlast the gap between beacons (~5s) so the chip doesn't flicker while waiting.
+    setMeter('mVid','mVidBar','mVidTxt', CAM.running, (now-lastVidAccept)<1500, vN/Math.max(LOCK_N,1), String(vN));
+    setMeter('mAud','mAudBar','mAudTxt', MIC.running, (now-lastAudAccept)<7000, locked?1:ready, String(aN));
   }
   function updateState(){
     var s=$('stateText'); if(!s) return;
@@ -971,6 +993,10 @@ var GEN = {
     b.style.width=Math.round(clamp(frac,0,1)*100)+'%';
     b.style.background = green ? 'var(--good)' : 'var(--accent)';
   }
+  function stopMeasuring(){   // averaging done → stop BOTH streams so the offset is frozen and can't drift/overshoot
+    try { if (CAM.running){ CAM.stop(); var cb=$('camBtn'); if(cb) cb.textContent='Start camera'; } } catch(e){}
+    try { if (MIC.running){ MIC.stop(); var mb=$('micBtn'); if(mb) mb.textContent='Start mic'; } } catch(e){}
+  }
   function refreshResult(){
     var r=EST.result();
     if (!r){ $('pConf').textContent='confidence: -'; $('pConf').className='pill'; setBar(0,false); updateUi(); return; }
@@ -981,7 +1007,8 @@ var GEN = {
 
     if (!locked && r.spread<=LOCK_SPREAD && r.n>=LOCK_N && r.spanMs>=LOCK_SPAN){
       locked=true; lockedVal=r.offset;
-      log('[lock] offset='+lockedVal+'ms  spread=±'+r.spread+'  n='+r.n);
+      log('[lock] offset='+lockedVal+'ms  spread=±'+r.spread+'  n='+r.n+'  mode='+r.mode);
+      stopMeasuring();   // freeze — stop capturing so it can't overshoot past the averaged value
     }
     if (locked){
       var shown=lockedVal - trim;
@@ -998,9 +1025,11 @@ var GEN = {
   }
 
   var _vidN=0, _audN=0;
-  CAM.pushSample=function(t,v){ _vidN++; lastVidAccept=performance.now(); EST.pushVideo(t,v); flashAccept(); refreshResult(); };
+  // Once LOCKED the measurement is DONE — ignore further samples so the value can't drift/overshoot
+  // (the user reported +274 ms then "tens of seconds" as late samples kept moving it). Re-measure clears it.
+  CAM.pushSample=function(t,v){ if(locked) return; _vidN++; lastVidAccept=performance.now(); EST.pushVideo(t,v); flashAccept(); refreshResult(); };
   CAM.onStatus=function(s){ lastCamStatus=s; var p=$('pVid'); p.textContent='video: '+s; p.className='pill '+(s==='ok'?'ok':'no'); };
-  MIC.pushSample=function(t,r,kind){ _audN++; lastAudAccept=performance.now(); EST.pushResidue(kind,t,r); $('pAud').textContent='audio: locked'; $('pAud').className='pill ok'; refreshResult(); };
+  MIC.pushSample=function(t,r,kind){ if(locked) return; _audN++; lastAudAccept=performance.now(); EST.pushResidue(kind,t,r); $('pAud').textContent='audio: locked'; $('pAud').className='pill ok'; refreshResult(); };
   MIC.onSync=function(active){ $('syncLed').style.width=active?'100%':'0'; if(active){ $('pAud').className='pill ok'; } };
 
   var _dbgPrevVid=0, _dbgPrevAud=0;
@@ -1013,11 +1042,12 @@ var GEN = {
     if (MIC.running){
       log('[band dB] '+MIC._bandProfile());
       log('[chirp] best ρ/3s='+MIC._dbgMaxRho.toFixed(3)+'  accept≥'+MIC.chirpStrictThr); MIC._dbgMaxRho=0;
-      // [beacon] down/up = DOWN/UP-chirp onsets detected this interval; pushed = those paired with a video
-      // lock and fed to EST; refineFail = triggers below strict; syncρ = last refined onset; off = current
-      // CRT offset. BOTH down & up climbing (and off settling) = the two-chirp path is working.
-      log('[beacon] down='+MIC._dbgDown+' up='+MIC._dbgUp+' pushed='+MIC._dbgPush+' refineFail='+MIC._dbgRefineFail+
-          ' syncρ='+MIC._dbgSyncRho.toFixed(2)+' off='+(r?r.offset:'-'));
+      // [beacon] down/up = onsets detected per direction; Dρ/Uρ = last refined correlation per direction
+      // (a healthy beacon ≈0.3-0.99; ≈0.1-0.2 means that direction is NOT really present — e.g. the sender
+      // DLL isn't emitting it). Dmad/Umad = that direction's residue MAD (ms); >300 ⇒ unusable. mode = which
+      // estimator is live: 'crt' (both good, full range), 'down'/'up' (single-beacon fallback, ±period/2 range).
+      log('[beacon] down='+MIC._dbgDown+' up='+MIC._dbgUp+' Dρ='+MIC._dbgDownRho.toFixed(2)+' Uρ='+MIC._dbgUpRho.toFixed(2)+
+          ' Dmad='+EST._dmad+' Umad='+EST._umad+' mode='+(EST._mode||'-')+' pushed='+MIC._dbgPush+' off='+(r?r.offset:'-'));
       MIC._dbgDown=MIC._dbgUp=MIC._dbgPush=MIC._dbgRefineFail=0;
     }
   }, 3000);
