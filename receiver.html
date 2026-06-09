@@ -29,6 +29,14 @@
             padding: 28px 40px; text-align: center;
             z-index: 20; display: none;
         }
+        #prepCalib {
+            position: absolute; inset: 0;
+            background: #07021a; color: #ffcf4d;
+            display: none; flex-direction: column; align-items: center; justify-content: center;
+            font: 800 34px/1.4 system-ui, "Segoe UI", sans-serif; text-align: center;
+            z-index: 15;
+        }
+        #prepCalib .s { margin-top: 14px; font: 400 18px/1.4 system-ui, sans-serif; color: rgba(221,214,240,.6); }
     </style>
 </head>
 <body>
@@ -36,12 +44,13 @@
 <video id="player" playsinline muted></video>
 <div id="overlay"></div>
 <div id="syncErr"></div>
+<div id="prepCalib">Preparing calibration&hellip;<div class="s">Waiting for the picture to stabilise &mdash; do not measure yet.</div></div>
 
 <script>
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r33-calib-ready';
+        var RECEIVER_VERSION = '2026-06-10-r34-calib-prep-overlay';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -159,16 +168,19 @@
 
         // Calibration settle gate: the picture must be anchored on the cdisp-ideal and the error must
         // be stable (low spread) with no disruptive event for a quiet window before it is trustworthy.
-        var CALIB_SETTLE_SPREAD_MS = 50;
+        var CALIB_SETTLE_SPREAD_MS = 150;
         var CALIB_SETTLE_QUIET_MS  = 3000;
         var CALIB_SETTLE_SAMPLES   = 8;
         var CALIB_PREP_TIMEOUT_MS  = 20000;
+        var CALIB_UNSETTLE_HOLD_MS = 4000;
         var _calibAnchored = false;
         var _calibSettled  = false;
+        var _calibEverSettled = false;
         var _calibErrWin   = [];
         var _lastDisruptMs = 0;
         var _lastEvtSum    = 0;
         var _calibActiveSinceMs = 0;
+        var _unsettledSinceMs = 0;
 
         function _getBufferedRanges(mediaEl) {
             if (!mediaEl || !mediaEl.buffered) return [];
@@ -973,11 +985,22 @@
                     var quiet = (nowWall - _lastDisruptMs) > CALIB_SETTLE_QUIET_MS;
                     var nowSettled = _calibErrWin.length === CALIB_SETTLE_SAMPLES
                         && spread <= CALIB_SETTLE_SPREAD_MS && quiet && Math.abs(errorMs) <= CALIB_ERR_MS;
-                    if (nowSettled !== _calibSettled) {
-                        _calibSettled = nowSettled;
-                        console.log('[cws] calib ' + (nowSettled ? 'SETTLED' : 'UNSETTLED') +
-                                    ': err=' + Math.round(errorMs) + 'ms spread=' + Math.round(spread) + 'ms');
-                        _postSyncReport(player, cafEl);
+                    if (nowSettled) {
+                        _unsettledSinceMs = 0;
+                        if (!_calibSettled) {
+                            _calibSettled = true;
+                            if (!_calibEverSettled) { _calibEverSettled = true; _hidePrepCalib(); }
+                            console.log('[cws] calib SETTLED: err=' + Math.round(errorMs) + 'ms spread=' + Math.round(spread) + 'ms');
+                            _postSyncReport(player, cafEl);
+                        }
+                    } else if (_calibSettled) {
+                        // Debounce: a brief excursion (which the companion medians out) must not flap the reveal.
+                        if (!_unsettledSinceMs) _unsettledSinceMs = nowWall;
+                        else if (nowWall - _unsettledSinceMs > CALIB_UNSETTLE_HOLD_MS) {
+                            _calibSettled = false;
+                            console.log('[cws] calib UNSETTLED (sustained): err=' + Math.round(errorMs) + 'ms spread=' + Math.round(spread) + 'ms');
+                            _postSyncReport(player, cafEl);
+                        }
                     }
 
                     if (quiet && Math.abs(errorMs) > CALIB_ERR_MS) {
@@ -1047,8 +1070,12 @@
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
                             if (calibActive) {
-                                _calibAnchored = false; _calibSettled = false; _calibErrWin = [];
-                                _calibErrTicks = 0; _lastDisruptMs = Date.now(); _calibActiveSinceMs = Date.now();
+                                _calibAnchored = false; _calibSettled = false; _calibEverSettled = false;
+                                _calibErrWin = []; _calibErrTicks = 0; _unsettledSinceMs = 0;
+                                _lastDisruptMs = Date.now(); _calibActiveSinceMs = Date.now();
+                                _showPrepCalib();
+                            } else {
+                                _hidePrepCalib();
                             }
                             if (!calibActive) _calibStopBlank(player, cafEl);
                             else if (_calibStopBlanked) _calibStopReveal(cafEl);
@@ -1260,8 +1287,9 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
             _lastCalibActive = false; _calibActive = false; _calibStopBlanked = false;
-            _calibAnchored = false; _calibSettled = false; _calibErrWin = []; _lastEvtSum = 0; _calibActiveSinceMs = 0;
-            _hideSyncError();
+            _calibAnchored = false; _calibSettled = false; _calibEverSettled = false; _calibErrWin = [];
+            _lastEvtSum = 0; _calibActiveSinceMs = 0; _unsettledSinceMs = 0;
+            _hideSyncError(); _hidePrepCalib();
             var _cafReset = document.getElementById('caf-el');
             if (_cafReset) { try { _cafReset.muted = false; } catch (e) {} }
             _lastSeekMs = 0;
@@ -1309,6 +1337,11 @@
             var el = document.getElementById('syncErr');
             if (el) el.style.display = 'none';
         }
+
+        // Instant device-side "Preparing" overlay over #player — appears the moment calibration goes active,
+        // long before the calibration video frame arrives, and hides on the first settle.
+        function _showPrepCalib() { var el = document.getElementById('prepCalib'); if (el) el.style.display = 'flex'; }
+        function _hidePrepCalib() { var el = document.getElementById('prepCalib'); if (el) el.style.display = 'none'; }
 
         function _calibStopBlank(player, cafEl) {
             _calibStopBlanked = true;
