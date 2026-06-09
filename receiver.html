@@ -128,9 +128,7 @@
         var _videoEpochSet = false; // true once a server videoEpochMs (any value, incl. negative) adopted
         // Cdisp (presentation skew) is now baked into the server's reported audio epoch
         // (epochMs already biased by the connected device's Cdisp), so the receiver targets
-        // PURE content equality (videoContentMs == audioContentMs). Kept at 0 so the legacy
-        // "- _contentLagMs" terms are no-ops; the server no longer sends contentLagMs.
-        var _contentLagMs = 0;
+        // PURE content equality (videoContentMs == audioContentMs).
         var _cdispMs     = 0;    // latest Cdisp reported by /cast/audio-clock (raw; baked at anchor)
         var _cdispBaked  = 0;    // Cdisp BAKED into the video target — set once at anchor, then held
                                  // constant; only re-baked on a re-anchor (reanchorSeq change).
@@ -224,7 +222,6 @@
                     videoEpochMs: _videoEpochMs,
                     serverRttMs: _serverRtt
                 },
-                contentLagMs: _contentLagMs,
                 latestClockPoll: _lastClockInfo,
                 latestManifest: _lastManifestInfo,
                 queue: {
@@ -960,7 +957,7 @@
 
             // ── Drift-trim sync loop ───────────────────────────────────────
             // Cdisp is baked into the server's reported epoch, so the target is PURE content
-            // equality (videoContentMs == audioContentMs; _contentLagMs == 0). Both streams
+            // equality (videoContentMs == audioContentMs). Both streams
             // ride the same audio sample clock, so steady-state error stays within a small
             // dead band — this loop only trims slow drift. playbackRate affects the MUTED
             // video only (audio is separate CAF), so rate changes are inaudible, but rate>1
@@ -1217,8 +1214,8 @@
                         ? (player.buffered.end(player.buffered.length - 1) - player.currentTime) * 1000
                         : 0;
                     // pllErr is the TRUE convergence error = deviation from the target the drift loop
-                    // actually holds (videoContent == audioContent + Cdisp). Subtract _cdispBaked (NOT
-                    // the legacy _contentLagMs=0) so pllErr≈0 means "holding the calibrated offset",
+                    // actually holds (videoContent == audioContent + Cdisp). Subtract _cdispBaked so
+                    // pllErr≈0 means "holding the calibrated offset",
                     // instead of misleadingly reading ~Cdisp when perfectly converged. The raw A/V
                     // offset is still derivable as videoTimeMs−audioTimeMs (both reported below).
                     var pllErr = vMs - aMs - _cdispBaked;
@@ -1232,7 +1229,6 @@
                             bufferAheadMs: Math.round(bAhead),
                             pllErrorMs: Math.round(pllErr),
                             cdispMs: Math.round(_cdispBaked),
-                            contentLagMs: _contentLagMs,
                             rVFCAvailable: typeof player.requestVideoFrameCallback === 'function',
                             rVFCActive: rVFCActive,
                             rVFCRenderedCount: _rVFCRenderedCount,

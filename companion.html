@@ -242,7 +242,7 @@
 <details class="adv">
     <summary>Log (advanced)</summary>
     <div class="card" style="margin-top:8px">
-        <h2>Log <button class="act" id="clrLog" style="float:right;padding:4px 8px;font-size:11px">clear</button></h2>
+        <h2>Log <button class="act" id="clrLog" style="float:right;padding:4px 8px;font-size:11px">clear</button><button class="act" id="copyLog" style="float:right;padding:4px 8px;font-size:11px;margin-right:6px">copy</button></h2>
         <div id="log"></div>
     </div>
 </details>
@@ -265,7 +265,7 @@
    = OFFSET_MOD (±~18 s) with no wrap. NO per-bit decode — only chirp ONSET detection, the one thing that
    survives real-room reverb/comb-nulls/AGC (ρ≈0.3-0.6). Precision = onset timing + barcode (medianed);
    range = CRT. Band ~1.5-2.1 kHz. MUST match FskTimecode (SYNC_MS / the two periods / band). */
-var VERSION = '2026-06-07-companion-v17-lockstop';
+var VERSION = '2026-06-07-companion-v18-xtalkgate';
 var PROTO = {
   CHIRP_F0: 1500, CHIRP_F1: 2150,          // beacon band: DOWN-chirp sweeps F1->F0, UP-chirp F0->F1
   SYNC_MS: 150,                            // beacon chirp length. MUST match FskTimecode.SyncMs.
@@ -615,7 +615,7 @@ var MIC = {
   recentSync:0,
   pending:[],                           // {s, kind} beacon onsets awaiting refine ('D'=down, 'U'=up)
   _det:null, _tmplLen:0,                // per-direction detector states (built in _initChirp)
-  _dbgMaxRho:0, _dbgDown:0, _dbgUp:0, _dbgPush:0, _dbgRefineFail:0, _dbgSyncRho:0, _dbgDownRho:0, _dbgUpRho:0,   // diagnostics
+  _dbgMaxRho:0, _dbgDown:0, _dbgUp:0, _dbgPush:0, _dbgRefineFail:0, _dbgSyncRho:0, _dbgDownRho:0, _dbgUpRho:0, _dbgXtalk:0,   // diagnostics
   // beacon matched-filter thresholds (tune on real hardware): coarse = trigger to catch the peak region;
   // strict = accept threshold applied to the refined peak ρ (in 0..1). Both sit below a real beacon
   // (ρ~0.3-0.6 observed) so detection stays reliable, above the noise floor so silence doesn't trigger.
@@ -766,7 +766,7 @@ var MIC = {
     var mk=function(kind, b, Bms){
       return { kind:kind, tmpl:b.tmpl, et:b.et, len:L, Bms:Bms,
                muteLen:Math.round(Bms/1000*sr*0.5),   // mute half a period after a hit (> reverb, < period)
-               nextHop:0, prev:false, mute:0 };
+               nextHop:0, prev:false, mute:0, peakRho:0 };   // peakRho = decaying per-direction peak (cross-talk gate)
     };
     this._det = [ mk('D', dn, PROTO.BEACON_MS_DOWN), mk('U', up, PROTO.BEACON_MS_UP) ];
   },
@@ -810,7 +810,15 @@ var MIC = {
     var rho = this._corr(refined - this.bufBase, d.tmpl, d.et);
     if (kind==='D'){ this._dbgDown++; this._dbgDownRho=rho; } else { this._dbgUp++; this._dbgUpRho=rho; }
     this._dbgSyncRho = rho;
-    this.recentSync = performance.now();
+    this.recentSync = performance.now();   // a detection (even cross-talk) means a real beacon is audible
+    // CROSS-TALK GATE: the OTHER direction's chirp leaks into this matched filter at a FRACTION of a real
+    // beacon (observed ~0.2-0.27 vs a 0.98 real one) — enough to pass the absolute strict threshold and push
+    // a GARBAGE residue, which is what made the medians (Dmad/Umad ~1000+) and the CRT jump. Reject anything
+    // well below this direction's own recent peak. It auto-scales with signal (no fixed level), and the decay
+    // lets it recover if the signal genuinely weakens (so a real-but-quieter beacon isn't locked out forever).
+    d.peakRho *= 0.9;
+    if (d.peakRho > 0.1 && rho < 0.45 * d.peakRho){ this._dbgXtalk++; return; }
+    if (rho > d.peakRho) d.peakRho = rho;
     var tMs = this._timeOfSample(refined);
     var vms = EST.predictVideoLocal(tMs, OFFSET_MOD, 1500);   // video content at the onset from LOCAL barcode samples (±1.5s)
     if (vms===null) return;                        // no fresh barcode near the beacon — skip (don't form a noisy residue)
@@ -1036,8 +1044,8 @@ var GEN = {
       // DLL isn't emitting it, or it's reverb cross-talk). Dmad/Umad = that direction's residue MAD (ms) —
       // BOTH must be small (≪ the CRT gcd/2 = 512) for a clean offset; a large one means that beacon is bad.
       log('[beacon] down='+MIC._dbgDown+' up='+MIC._dbgUp+' Dρ='+MIC._dbgDownRho.toFixed(2)+' Uρ='+MIC._dbgUpRho.toFixed(2)+
-          ' Dmad='+EST._dmad+' Umad='+EST._umad+' pushed='+MIC._dbgPush+' off='+(r?r.offset:'-'));
-      MIC._dbgDown=MIC._dbgUp=MIC._dbgPush=MIC._dbgRefineFail=0;
+          ' Dmad='+EST._dmad+' Umad='+EST._umad+' xtalk='+MIC._dbgXtalk+' pushed='+MIC._dbgPush+' off='+(r?r.offset:'-'));
+      MIC._dbgDown=MIC._dbgUp=MIC._dbgPush=MIC._dbgRefineFail=MIC._dbgXtalk=0;
     }
   }, 3000);
   window.__cwsDbg = function(){ return { vidN:_vidN, audN:_audN, vid:EST.vid.length, aud:EST.audN(),
@@ -1101,6 +1109,12 @@ var GEN = {
   });
 
   $('clrLog').addEventListener('click', function(){ $('log').textContent=''; });
+  $('copyLog').addEventListener('click', function(){
+    var txt=$('log').textContent||'';
+    if (navigator.clipboard) navigator.clipboard.writeText(txt).then(
+      function(){ log('[copy] log copied ('+txt.length+' chars)'); }, function(){ log('[copy] log copy failed'); });
+    else log('[copy] clipboard unavailable');
+  });
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     log('[!] getUserMedia unavailable. This page needs HTTPS (or localhost).');
