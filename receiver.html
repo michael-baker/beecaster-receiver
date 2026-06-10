@@ -37,6 +37,33 @@
             z-index: 15;
         }
         #prepCalib .s { margin-top: 14px; font: 400 18px/1.4 system-ui, sans-serif; color: rgba(221,214,240,.6); }
+
+        /* Device-side real-time HUD over the video. Shown only when the Audio Debug cast-screen theme is
+           active: the captured cast screen is baked into the delayed video, so this is the device truth now. */
+        #devDebug {
+            position: absolute; top: 0; left: 0; z-index: 40;
+            display: none; pointer-events: none; margin: 16px; max-width: 50%;
+            font: 15px/1.35 ui-monospace, Consolas, "Cascadia Mono", monospace;
+            color: #dffaff; background: rgba(4,8,14,0.74);
+            border: 1px solid rgba(120,200,255,0.3); border-radius: 9px;
+            padding: 12px 14px; box-shadow: 0 6px 30px rgba(0,0,0,0.55); text-shadow: 0 0 2px #000;
+        }
+        #devDebug h4 { margin: 0; font: 700 13px/1 "Segoe UI", system-ui, sans-serif;
+            letter-spacing: 0.12em; text-transform: uppercase; color: #8fe6ff; }
+        #devDebug .dd-note { font-size: 11px; color: rgba(255,255,255,0.4); margin: 3px 0 9px; }
+        #devDebug .dd-grid { display: grid; grid-template-columns: auto 1fr; gap: 2px 18px; }
+        #devDebug .dd-k { color: #7fb8d8; white-space: nowrap; }
+        #devDebug .dd-v { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+        #devDebug .dd-sec { grid-column: 1 / -1; margin-top: 7px; padding-top: 4px;
+            border-top: 1px solid rgba(120,200,255,0.18); color: #8fe6ff;
+            font: 700 10px/1.6 "Segoe UI", system-ui, sans-serif; letter-spacing: 0.16em; text-transform: uppercase; }
+        #devDebug .dd-full { grid-column: 1 / -1; text-align: left; color: rgba(255,255,255,0.6); font-size: 12px; }
+        #devDebug .ok { color: #7dffa0; } #devDebug .warn { color: #ffb454; } #devDebug .bad { color: #ff6b6b; }
+        #devDebug .dd-bar { grid-column: 1 / -1; position: relative; height: 9px; margin-top: 6px;
+            border-radius: 3px; background: rgba(120,200,255,0.12); overflow: hidden; }
+        #devDebug .dd-bar .b-behind { position: absolute; height: 100%; left: 0; width: 0; background: rgba(120,200,255,0.3); }
+        #devDebug .dd-bar .b-ahead  { position: absolute; height: 100%; left: 0; width: 0; background: rgba(125,255,160,0.4); }
+        #devDebug .dd-bar .b-play   { position: absolute; height: 100%; left: 0; width: 2px; background: #ff1450; }
     </style>
 </head>
 <body>
@@ -45,12 +72,13 @@
 <div id="overlay"></div>
 <div id="syncErr"></div>
 <div id="prepCalib">Preparing calibration&hellip;<div class="s">Waiting for the cast to stabilise.</div></div>
+<div id="devDebug"></div>
 
 <script>
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r39-trim-muxed-debug';
+        var RECEIVER_VERSION = '2026-06-10-r40-device-debug-hud';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -140,6 +168,10 @@
         var _backBufferKeepSec = 10;
         var _epochPollTimer = null;
         var _reportTimer = null;
+        var _deviceDebug   = false;   // device-side real-time HUD active (Audio Debug theme selected)
+        var _devDebugTimer = null;
+        var _devEl         = null;
+        var _devValEls     = null;    // parallel to DD_DEFS; value element per row (null for section rows)
         var _lastSeekMs  = 0;
 
         var _audioLastMs   = -1;
@@ -934,6 +966,10 @@
                         _calibActive = calibActive;
                         _calibMode = (typeof d.calibMode === 'number') ? d.calibMode : 0;
                    
+                        // Audio Debug theme selected → render the device-side real-time HUD over the video.
+                        var _wantDbg = (d.deviceDebugOverlay === true);
+                        if (_wantDbg !== _deviceDebug) { _deviceDebug = _wantDbg; if (_wantDbg) _showDeviceDebug(); else _hideDeviceDebug(); }
+
                         if (cafEl && !calibActive) cafEl.muted = (d.audioMuted === true);
 
                         if (calibActive !== _lastCalibActive) {
@@ -1060,6 +1096,7 @@
             _calibSettled = false; _calibErrWin = [];
             _lastEvtSum = 0; _calibActiveSinceMs = 0; _unsettledSinceMs = 0;
             _hideSyncError();
+            _deviceDebug = false; _hideDeviceDebug();
             var _cafReset = document.getElementById('caf-el');
             if (_cafReset) { try { _cafReset.muted = false; } catch (e) {} }
             _lastSeekMs = 0;
@@ -1163,6 +1200,155 @@
                     body: JSON.stringify(caps)
                 }).catch(function () {});
             } catch (e) {}
+        }
+
+        // ── Device-side real-time HUD ─────────────────────────────────────────────
+        // The cast-screen theme is rendered server-side via CEF and captured into the video, which always
+        // trails real time. This overlay reads the receiver's OWN live state so the device shows the true
+        // audio/video clocks, buffer and drift at this instant. Toggled by deviceDebugOverlay on the clock poll.
+        function _ddClock(v) {
+            if (typeof v !== 'number' || !isFinite(v) || v < 0) return '—';
+            var s = v / 1000, m = Math.floor(s / 60), sec = s - m * 60;
+            return m + ':' + (sec < 10 ? '0' : '') + sec.toFixed(3);
+        }
+        function _ddMs(v, frac) { return (typeof v === 'number' && isFinite(v)) ? v.toFixed(frac == null ? 0 : frac) + 'ms' : '—'; }
+        function _ddInt(v)      { return (typeof v === 'number' && isFinite(v)) ? Math.round(v).toString() : '—'; }
+        function _ddDriftCls(v) { if (typeof v !== 'number' || !isFinite(v)) return ''; var a = Math.abs(v); return a > 100 ? 'bad' : (a > 40 ? 'warn' : 'ok'); }
+
+        // Row registry. {sec} = section header, {bar} = buffer bar, {full} = full-width value fn, else key/value.
+        var DD_DEFS = [
+            { sec: 'Clocks · device real-time' },
+            { k: 'audio clock',    f: function (c) { return _ddClock(c.audioMs); } },
+            { k: 'video clock',    f: function (c) { return _ddClock(c.videoMs); } },
+            { k: 'drift v-a-cdisp', f: function (c) { return _ddMs(c.errMs, 0); }, c: function (c) { return _ddDriftCls(c.errMs); } },
+            { k: 'caf.t / vid.t',  f: function (c) { return c.cafT + ' / ' + c.pT; } },
+            { k: 'playbackRate',   f: function (c) { return c.rate; }, c: function (c) { return c.rateN === 1 ? '' : 'warn'; } },
+            { k: 'clock source',   f: function (c) { return c.rvfc ? ('rVFC Δ' + _ddMs(c.rvfcDelta, 0)) : 'currentTime'; } },
+            { sec: 'Epoch / offset' },
+            { k: 'audio epochMs',  f: function (c) { return _ddInt(c.epochMs); }, c: function (c) { return c.epochMs >= 0 ? '' : 'warn'; } },
+            { k: 'video epochMs',  f: function (c) { return _ddInt(c.videoEpochMs); } },
+            { k: 'cdisp bake/live', f: function (c) { return _ddInt(c.cdispBaked) + ' / ' + _ddInt(c.cdispMs); } },
+            { k: 'reanchor/jump',  f: function (c) { return _ddInt(c.reanchorSeq) + ' / ' + _ddInt(c.epochJumpSeq); } },
+            { sec: 'Buffer' },
+            { k: 'behind / ahead', f: function (c) { return c.behind + 's / ' + c.ahead + 's'; }, c: function (c) { return isFinite(c.aheadN) ? (c.aheadN < 2 ? 'warn' : 'ok') : ''; } },
+            { k: 'ranges',         f: function (c) { return _ddInt(c.ranges); } },
+            { bar: true },
+            { sec: 'Pipeline' },
+            { k: 'append queue',   f: function (c) { return c.q + (c.appending ? ' ·busy' : '') + (c.trimming ? ' ·trim' : ''); } },
+            { k: 'quota retries',  f: function (c) { return _ddInt(c.quota); }, c: function (c) { return c.quota > 0 ? 'warn' : ''; } },
+            { k: 'segs / loaded',  f: function (c) { return _ddInt(c.segs) + ' / ' + _ddInt(c.loaded); } },
+            { k: 'vid rs / paused', f: function (c) { return c.pRs + ' / ' + (c.pPaused ? 'yes' : 'no'); }, c: function (c) { return c.pRs >= 2 ? '' : 'warn'; } },
+            { k: 'caf rs / muted', f: function (c) { return c.cRs + ' / ' + (c.cMuted ? 'yes' : 'no'); } },
+            { sec: 'Status / events' },
+            { k: 'audio',          f: function (c) { return c.held ? 'HELD' : 'flowing'; }, c: function (c) { return c.held ? 'warn' : 'ok'; } },
+            { k: 'calibration',    f: function (c) { return c.calib ? ('on · ' + (c.calibMode === 1 ? 'tone' : 'auto')) : 'off'; } },
+            { k: 'converged',      f: function (c) { return c.converged ? ('yes +' + _ddInt(c.convMs) + 'ms') : 'no'; }, c: function (c) { return c.converged ? 'ok' : 'warn'; } },
+            { full: function (c) { var e = c.evt; return 'evt  rsc' + e.rescue + ' stl' + e.stall + ' anc' + e.anchor + ' rea' + e.reanchor + ' hsk' + e.hardSeek + ' snp' + e.snap + ' mse' + e.mseReinit + ' hld' + e.hold; } }
+        ];
+
+        function _devCtx() {
+            var player = document.getElementById('player');
+            var cafEl  = document.getElementById('caf-el');
+            var c = {
+                evt: _evt, epochMs: _epochMs, videoEpochMs: _videoEpochMs,
+                cdispBaked: _cdispBaked, cdispMs: _cdispMs,
+                reanchorSeq: _lastReanchorSeq, epochJumpSeq: _lastEpochJumpSeq,
+                held: _audioHeld, calib: _calibActive, calibMode: _calibMode, converged: _convergeReported,
+                convMs: (_convergeReported && _tConverged && _tPlayStart) ? (_tConverged - _tPlayStart) : NaN,
+                q: _appendQueue.length, appending: _appending, trimming: _trimming, quota: _quotaRetries,
+                segs: _segsBuffered, loaded: Object.keys(_loadedSegs).length,
+                cafT: '—', pT: '—', rate: '—', rateN: NaN, cRs: '—', pRs: '—',
+                cMuted: false, pPaused: true, audioMs: NaN, videoMs: NaN, errMs: NaN, rvfc: false, rvfcDelta: NaN,
+                behind: '—', ahead: '—', behindN: NaN, aheadN: NaN, ranges: 0
+            };
+            if (cafEl) {
+                c.cafT = cafEl.currentTime.toFixed(3); c.cRs = cafEl.readyState; c.cMuted = !!cafEl.muted;
+                if (_epochMs >= 0) c.audioMs = _getAudioClockMs(cafEl);
+            }
+            if (player) {
+                c.pT = player.currentTime.toFixed(3); c.rateN = player.playbackRate;
+                c.rate = player.playbackRate.toFixed(3); c.pRs = player.readyState; c.pPaused = !!player.paused;
+                if (_videoEpochSet) c.videoMs = _getVideoClockMs(player);
+                c.rvfc = _rVFCMediaTimeSec >= 0;
+                if (c.rvfc) c.rvfcDelta = (player.currentTime - _rVFCMediaTimeSec) * 1000;
+                var buf = player.buffered;
+                if (buf && buf.length) {
+                    var bs = buf.start(0), be = buf.end(buf.length - 1);
+                    c.behindN = player.currentTime - bs; c.aheadN = be - player.currentTime;
+                    c.behind = c.behindN.toFixed(2); c.ahead = c.aheadN.toFixed(2); c.ranges = buf.length;
+                }
+            }
+            if (isFinite(c.audioMs) && isFinite(c.videoMs)) c.errMs = c.videoMs - c.audioMs - _cdispBaked;
+            return c;
+        }
+
+        function _buildDevDebug() {
+            if (_devEl) return;
+            _devEl = document.getElementById('devDebug');
+            if (!_devEl) return;
+            _devEl.innerHTML = '<h4>Device · Real-Time</h4>' +
+                '<div class="dd-note">captured cast screen is delayed — this is the device truth, now</div>' +
+                '<div class="dd-grid" id="dd-grid"></div>';
+            var grid = _devEl.querySelector('#dd-grid');
+            _devValEls = [];
+            for (var i = 0; i < DD_DEFS.length; i++) {
+                var def = DD_DEFS[i];
+                if (def.sec) {
+                    var s = document.createElement('div'); s.className = 'dd-sec'; s.textContent = def.sec;
+                    grid.appendChild(s); _devValEls.push(null); continue;
+                }
+                if (def.bar) {
+                    var bar = document.createElement('div'); bar.className = 'dd-bar';
+                    bar.innerHTML = '<div class="b-behind"></div><div class="b-ahead"></div><div class="b-play"></div>';
+                    grid.appendChild(bar); _devValEls.push(bar); continue;
+                }
+                if (def.full) {
+                    var fr = document.createElement('div'); fr.className = 'dd-full'; fr.textContent = '—';
+                    grid.appendChild(fr); _devValEls.push(fr); continue;
+                }
+                var k = document.createElement('div'); k.className = 'dd-k'; k.textContent = def.k;
+                var v = document.createElement('div'); v.className = 'dd-v'; v.textContent = '—';
+                grid.appendChild(k); grid.appendChild(v); _devValEls.push(v);
+            }
+        }
+
+        function _renderBufBar(bar, c) {
+            var behind = bar.querySelector('.b-behind'), ahead = bar.querySelector('.b-ahead'), play = bar.querySelector('.b-play');
+            if (!isFinite(c.behindN) || !isFinite(c.aheadN) || (c.behindN + c.aheadN) <= 0) {
+                behind.style.width = '0'; ahead.style.width = '0'; play.style.left = '0'; return;
+            }
+            var win = c.behindN + c.aheadN, bp = Math.max(0, Math.min(1, c.behindN / win)) * 100;
+            behind.style.width = bp.toFixed(1) + '%';
+            ahead.style.left = bp.toFixed(1) + '%'; ahead.style.width = (100 - bp).toFixed(1) + '%';
+            play.style.left = bp.toFixed(1) + '%';
+        }
+
+        function _renderDeviceDebug() {
+            if (!_devEl || !_devValEls) return;
+            var c = _devCtx();
+            for (var i = 0; i < DD_DEFS.length; i++) {
+                var def = DD_DEFS[i], el = _devValEls[i];
+                if (!el) continue;
+                if (def.bar) { _renderBufBar(el, c); continue; }
+                var txt = def.full ? def.full(c) : def.f(c);
+                if (el.textContent !== txt) el.textContent = txt;
+                if (def.c) {
+                    var base = def.full ? 'dd-full' : 'dd-v', add = def.c(c);
+                    var cls = base + (add ? ' ' + add : '');
+                    if (el.className !== cls) el.className = cls;
+                }
+            }
+        }
+
+        function _showDeviceDebug() {
+            _buildDevDebug();
+            if (_devEl) _devEl.style.display = 'block';
+            if (!_devDebugTimer) _devDebugTimer = setInterval(_renderDeviceDebug, 100);
+            _renderDeviceDebug();
+        }
+        function _hideDeviceDebug() {
+            if (_devDebugTimer) { clearInterval(_devDebugTimer); _devDebugTimer = null; }
+            if (_devEl) _devEl.style.display = 'none';
         }
 
     })();
