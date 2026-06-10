@@ -50,7 +50,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r35-calib-prep-fast';
+        var RECEIVER_VERSION = '2026-06-10-r36-calib-closed-loop';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -160,20 +160,19 @@
         var AUDIO_STALL_MS      = 700;
         var AUDIO_JUMP_MS       = 4000;  // audio clock leaping forward > this in one tick ⇒ ring skip ⇒ hard recover
 
-        // Calibration-only failure banner thresholds.
-        var CALIB_ERR_MS        = 2500;
-        var CALIB_ERR_GRACE_MS  = 6000;
+        // Consecutive prep-timeout ticks before the on-screen failure banner is shown.
         var CALIB_ERR_TICKS     = 3;
         var _calibErrTicks      = 0;
 
-        // Calibration settle gate: the picture must be anchored on the cdisp-ideal and the error must
-        // be stable (low spread) with no disruptive event for a quiet window before it is trustworthy.
-        var CALIB_SETTLE_SPREAD_MS = 150;
+        // Calibration readiness gate. The real sync loop converges the picture (closed loop); "ready" fires
+        // only once the MEAN error over the window is genuinely centred on zero (not merely stable) and the
+        // loop is quiet (no recent seek). Spread is allowed to absorb the pipeline's residual jitter.
+        var CALIB_READY_BAND_MS    = 80;
+        var CALIB_READY_SPREAD_MS  = 400;
         var CALIB_SETTLE_QUIET_MS  = 3000;
         var CALIB_SETTLE_SAMPLES   = 8;
         var CALIB_PREP_TIMEOUT_MS  = 20000;
         var CALIB_UNSETTLE_HOLD_MS = 4000;
-        var _calibAnchored = false;
         var _calibSettled  = false;
         var _calibErrWin   = [];
         var _lastDisruptMs = 0;
@@ -955,70 +954,51 @@
                     return;
                 }
 
-                // CALIBRATION HOLD — the loop places the picture exactly on the cdisp-ideal once it sits
-                // inside the buffer, then holds and reports trustworthiness; the clamp/rate-trim below stay
-                // off so they can't warp the read. Safety paths above (rescue / stall / audio-HOLD) still apply.
+                // CALIBRATION READINESS — this page proves the real pipeline, so it runs the SAME closed
+                // loop as normal playback (fall through below); we only judge when the picture has genuinely
+                // converged. "Ready" = the MEAN error over the window is centred on zero and the loop is
+                // quiet (no recent seek). The barcode/orb stay hidden until then, so the read is never taken
+                // mid-correction. If it cannot converge within the prep window the failure banner appears.
                 if (_calibActive) {
-                    if (player.playbackRate !== 1.0) player.playbackRate = 1.0;
-
-                    // Anchor on the true ideal once it is inside the buffer; never heal to the edge and freeze there.
-                    if (!_calibAnchored) {
-                        var loC = bufStart + SEEK_GUARD_SEC, hiC = bufEnd - SEEK_GUARD_SEC;
-                        if (ideal >= loC && ideal <= hiC && canSeek) {
-                            _rVFCMediaTimeSec = -1;
-                            try { player.currentTime = ideal; } catch (e) {}
-                            player.playbackRate = 1.0;
-                            _lastSeekMs = nowWall;
-                            _evt.anchor++;
-                            _calibAnchored = true;
-                            _calibErrWin = [];
-                            console.log('[cws] calib settle-anchor: t=' + ideal.toFixed(3) + ' cdisp=' + _cdispBaked);
-                        } else if (_calibActiveSinceMs && (nowWall - _calibActiveSinceMs) > CALIB_PREP_TIMEOUT_MS) {
-                            // Never reached a deep-enough buffer to anchor: the pipeline can't keep up.
-                            _showSyncError(errorMs);
-                        }
-                        return;
-                    }
-
-                    // Trustworthy once the error has held a tight spread with no disruption for the quiet window.
                     _calibErrWin.push(errorMs);
                     if (_calibErrWin.length > CALIB_SETTLE_SAMPLES) _calibErrWin.shift();
-                    var spread = 0;
-                    if (_calibErrWin.length === CALIB_SETTLE_SAMPLES) {
-                        var lo = _calibErrWin[0], hi = _calibErrWin[0];
-                        for (var i = 1; i < _calibErrWin.length; i++) {
-                            if (_calibErrWin[i] < lo) lo = _calibErrWin[i];
-                            if (_calibErrWin[i] > hi) hi = _calibErrWin[i];
+                    var _full = _calibErrWin.length === CALIB_SETTLE_SAMPLES;
+                    var _mean = 0, _lo = 0, _hi = 0;
+                    if (_full) {
+                        _lo = _hi = _calibErrWin[0];
+                        for (var _ci = 0; _ci < _calibErrWin.length; _ci++) {
+                            _mean += _calibErrWin[_ci];
+                            if (_calibErrWin[_ci] < _lo) _lo = _calibErrWin[_ci];
+                            if (_calibErrWin[_ci] > _hi) _hi = _calibErrWin[_ci];
                         }
-                        spread = hi - lo;
+                        _mean /= _calibErrWin.length;
                     }
-                    var quiet = (nowWall - _lastDisruptMs) > CALIB_SETTLE_QUIET_MS;
-                    var nowSettled = _calibErrWin.length === CALIB_SETTLE_SAMPLES
-                        && spread <= CALIB_SETTLE_SPREAD_MS && quiet && Math.abs(errorMs) <= CALIB_ERR_MS;
-                    if (nowSettled) {
+                    var _spread = _hi - _lo;
+                    var _quiet = (nowWall - _lastDisruptMs) > CALIB_SETTLE_QUIET_MS;
+                    var _converged = _full && Math.abs(_mean) <= CALIB_READY_BAND_MS && _spread <= CALIB_READY_SPREAD_MS && _quiet;
+                    if (_converged) {
                         _unsettledSinceMs = 0;
                         if (!_calibSettled) {
                             _calibSettled = true;
-                            console.log('[cws] calib SETTLED: err=' + Math.round(errorMs) + 'ms spread=' + Math.round(spread) + 'ms');
+                            console.log('[cws] calib READY: mean=' + Math.round(_mean) + 'ms spread=' + Math.round(_spread) + 'ms');
                             _postSyncReport(player, cafEl);
                         }
                     } else if (_calibSettled) {
-                        // Debounce: a brief excursion (which the companion medians out) must not flap the reveal.
                         if (!_unsettledSinceMs) _unsettledSinceMs = nowWall;
                         else if (nowWall - _unsettledSinceMs > CALIB_UNSETTLE_HOLD_MS) {
                             _calibSettled = false;
-                            console.log('[cws] calib UNSETTLED (sustained): err=' + Math.round(errorMs) + 'ms spread=' + Math.round(spread) + 'ms');
+                            console.log('[cws] calib NOT-READY: mean=' + Math.round(_mean) + 'ms spread=' + Math.round(_spread) + 'ms');
                             _postSyncReport(player, cafEl);
                         }
                     }
-
-                    if (quiet && Math.abs(errorMs) > CALIB_ERR_MS) {
+                    if (!_calibSettled && _calibActiveSinceMs && (nowWall - _calibActiveSinceMs) > CALIB_PREP_TIMEOUT_MS) {
                         if (++_calibErrTicks >= CALIB_ERR_TICKS) _showSyncError(errorMs);
                     } else {
                         _calibErrTicks = 0;
                         _hideSyncError();
                     }
-                    return;
+                    // Fall through: the reanchor / hard-seek / rate-trim below run exactly as in normal
+                    // playback so the picture actually converges on the cdisp offset.
                 }
 
                 var outsideBy = (ideal < bufStart) ? (bufStart - ideal)
@@ -1079,7 +1059,7 @@
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
                             if (calibActive) {
-                                _calibAnchored = false; _calibSettled = false;
+                                _calibSettled = false;
                                 _calibErrWin = []; _calibErrTicks = 0; _unsettledSinceMs = 0;
                                 _lastDisruptMs = Date.now(); _calibActiveSinceMs = Date.now();
                             }
@@ -1293,7 +1273,7 @@
             if (_reportTimer)    { clearInterval(_reportTimer); _reportTimer = null; }
             if (_calibStopRevealTimer) { clearTimeout(_calibStopRevealTimer); _calibStopRevealTimer = null; }
             _lastCalibActive = false; _calibActive = false; _calibStopBlanked = false;
-            _calibAnchored = false; _calibSettled = false; _calibErrWin = [];
+            _calibSettled = false; _calibErrWin = [];
             _lastEvtSum = 0; _calibActiveSinceMs = 0; _unsettledSinceMs = 0;
             _hideSyncError();
             var _cafReset = document.getElementById('caf-el');
