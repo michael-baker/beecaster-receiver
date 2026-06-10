@@ -50,7 +50,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r37-tonetest-lenient';
+        var RECEIVER_VERSION = '2026-06-10-r38-receiver-mute';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -1076,6 +1076,10 @@
                         var calibActive = (d.calibActive === true);
                         _calibActive = calibActive;
                         _calibMode = (typeof d.calibMode === 'number') ? d.calibMode : 0;
+                        // Receiver-side audio mute (MusicBee paused/stopped). Local element mute only - no
+                        // device-volume command, so no Chromecast volume OSD. Skip during calibration so the
+                        // tone/FSK stays audible (the server already masks audioMuted while calibrating).
+                        if (cafEl && !calibActive) cafEl.muted = (d.audioMuted === true);
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
                             if (calibActive) {
@@ -1118,7 +1122,7 @@
                         }
                     })
                     .catch(function () {});
-            }, 2000);
+            }, 500);   // 500ms so a pause/resume mute flag is applied snappily (also tightens epoch/reanchor tracking)
 
             if (_reportTimer) clearInterval(_reportTimer);
             _reportTimer = setInterval(function () { _postSyncReport(player, cafEl); }, 5000);
