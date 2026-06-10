@@ -50,7 +50,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r36-calib-closed-loop';
+        var RECEIVER_VERSION = '2026-06-10-r37-tonetest-lenient';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -131,6 +131,7 @@
         var _lastEpochJumpSeq = -1;  // last epochJumpSeq seen; a change = server ring-skip → hard recover
         var _lastCalibActive = false;
         var _calibActive = false;     // read by the drift loop to suppress auto clamp/nudge during a calibration session
+        var _calibMode = 0;           // 0 = auto-tune (strict machine read), 1 = test-tone (lenient human verify)
         var _calibStopBlanked = false;
         var _calibStopRevealTimer = null;
         var _serverRtt   = 0;
@@ -960,42 +961,60 @@
                 // quiet (no recent seek). The barcode/orb stay hidden until then, so the read is never taken
                 // mid-correction. If it cannot converge within the prep window the failure banner appears.
                 if (_calibActive) {
-                    _calibErrWin.push(errorMs);
-                    if (_calibErrWin.length > CALIB_SETTLE_SAMPLES) _calibErrWin.shift();
-                    var _full = _calibErrWin.length === CALIB_SETTLE_SAMPLES;
-                    var _mean = 0, _lo = 0, _hi = 0;
-                    if (_full) {
-                        _lo = _hi = _calibErrWin[0];
-                        for (var _ci = 0; _ci < _calibErrWin.length; _ci++) {
-                            _mean += _calibErrWin[_ci];
-                            if (_calibErrWin[_ci] < _lo) _lo = _calibErrWin[_ci];
-                            if (_calibErrWin[_ci] > _hi) _hi = _calibErrWin[_ci];
-                        }
-                        _mean /= _calibErrWin.length;
-                    }
-                    var _spread = _hi - _lo;
-                    var _quiet = (nowWall - _lastDisruptMs) > CALIB_SETTLE_QUIET_MS;
-                    var _converged = _full && Math.abs(_mean) <= CALIB_READY_BAND_MS && _spread <= CALIB_READY_SPREAD_MS && _quiet;
-                    if (_converged) {
-                        _unsettledSinceMs = 0;
+                    if (_calibMode === 1) {
+                        // TEST-TONE (human verify) rides the live cast exactly like normal playback — the
+                        // human's eyes/ears are the instrument, so there is NO strict machine-convergence
+                        // gate and the failure banner is NEVER shown. Reveal the orb as soon as the picture
+                        // is playing (clocks are valid here, so it is), then fall through to the normal drift
+                        // loop so it stays locked to the saved Cdisp just like a regular cast.
                         if (!_calibSettled) {
                             _calibSettled = true;
-                            console.log('[cws] calib READY: mean=' + Math.round(_mean) + 'ms spread=' + Math.round(_spread) + 'ms');
+                            console.log('[cws] calib READY (test-tone): lenient reveal');
                             _postSyncReport(player, cafEl);
                         }
-                    } else if (_calibSettled) {
-                        if (!_unsettledSinceMs) _unsettledSinceMs = nowWall;
-                        else if (nowWall - _unsettledSinceMs > CALIB_UNSETTLE_HOLD_MS) {
-                            _calibSettled = false;
-                            console.log('[cws] calib NOT-READY: mean=' + Math.round(_mean) + 'ms spread=' + Math.round(_spread) + 'ms');
-                            _postSyncReport(player, cafEl);
-                        }
-                    }
-                    if (!_calibSettled && _calibActiveSinceMs && (nowWall - _calibActiveSinceMs) > CALIB_PREP_TIMEOUT_MS) {
-                        if (++_calibErrTicks >= CALIB_ERR_TICKS) _showSyncError(errorMs);
-                    } else {
                         _calibErrTicks = 0;
                         _hideSyncError();
+                    } else {
+                        // AUTO-TUNE: the companion reads a barcode/FSK and must never lock onto a transient,
+                        // so gate strictly — mean error centred on zero, low spread, loop quiet — and raise
+                        // the failure banner if it cannot converge within the prep window.
+                        _calibErrWin.push(errorMs);
+                        if (_calibErrWin.length > CALIB_SETTLE_SAMPLES) _calibErrWin.shift();
+                        var _full = _calibErrWin.length === CALIB_SETTLE_SAMPLES;
+                        var _mean = 0, _lo = 0, _hi = 0;
+                        if (_full) {
+                            _lo = _hi = _calibErrWin[0];
+                            for (var _ci = 0; _ci < _calibErrWin.length; _ci++) {
+                                _mean += _calibErrWin[_ci];
+                                if (_calibErrWin[_ci] < _lo) _lo = _calibErrWin[_ci];
+                                if (_calibErrWin[_ci] > _hi) _hi = _calibErrWin[_ci];
+                            }
+                            _mean /= _calibErrWin.length;
+                        }
+                        var _spread = _hi - _lo;
+                        var _quiet = (nowWall - _lastDisruptMs) > CALIB_SETTLE_QUIET_MS;
+                        var _converged = _full && Math.abs(_mean) <= CALIB_READY_BAND_MS && _spread <= CALIB_READY_SPREAD_MS && _quiet;
+                        if (_converged) {
+                            _unsettledSinceMs = 0;
+                            if (!_calibSettled) {
+                                _calibSettled = true;
+                                console.log('[cws] calib READY: mean=' + Math.round(_mean) + 'ms spread=' + Math.round(_spread) + 'ms');
+                                _postSyncReport(player, cafEl);
+                            }
+                        } else if (_calibSettled) {
+                            if (!_unsettledSinceMs) _unsettledSinceMs = nowWall;
+                            else if (nowWall - _unsettledSinceMs > CALIB_UNSETTLE_HOLD_MS) {
+                                _calibSettled = false;
+                                console.log('[cws] calib NOT-READY: mean=' + Math.round(_mean) + 'ms spread=' + Math.round(_spread) + 'ms');
+                                _postSyncReport(player, cafEl);
+                            }
+                        }
+                        if (!_calibSettled && _calibActiveSinceMs && (nowWall - _calibActiveSinceMs) > CALIB_PREP_TIMEOUT_MS) {
+                            if (++_calibErrTicks >= CALIB_ERR_TICKS) _showSyncError(errorMs);
+                        } else {
+                            _calibErrTicks = 0;
+                            _hideSyncError();
+                        }
                     }
                     // Fall through: the reanchor / hard-seek / rate-trim below run exactly as in normal
                     // playback so the picture actually converges on the cdisp offset.
@@ -1056,6 +1075,7 @@
                         _serverRtt = Date.now() - t0;
                         var calibActive = (d.calibActive === true);
                         _calibActive = calibActive;
+                        _calibMode = (typeof d.calibMode === 'number') ? d.calibMode : 0;
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
                             if (calibActive) {
