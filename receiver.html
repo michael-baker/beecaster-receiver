@@ -50,7 +50,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r38-receiver-mute';
+        var RECEIVER_VERSION = '2026-06-10-r39-trim-muxed-debug';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -118,7 +118,6 @@
         var _drainRetryTimer = null;  // deferred re-drain (NEVER recurse synchronously on quota)
         var MAX_QUOTA_RETRIES = 50;   // ~4 s of trimming/retrying, then drop the stuck segment
         var _loadedSegs  = {};
-        var _initLoaded  = false;
         var _segsBuffered = 0;
         var _epochMs     = -1;
         var _epochWallMs = -1;
@@ -134,15 +133,11 @@
         var _calibMode = 0;           // 0 = auto-tune (strict machine read), 1 = test-tone (lenient human verify)
         var _calibStopBlanked = false;
         var _calibStopRevealTimer = null;
-        var _serverRtt   = 0;
         var _cafPlaying  = false;
         var _everPlayed  = false;
         var _videoReady  = false;
         var _maxBufferedWindowSec = 24;
         var _backBufferKeepSec = 10;
-        var _lastManifestInfo = null;
-        var _lastClockInfo = null;
-        var _debugWatchTimer = null;
         var _epochPollTimer = null;
         var _reportTimer = null;
         var _lastSeekMs  = 0;
@@ -181,111 +176,6 @@
         var _calibActiveSinceMs = 0;
         var _unsettledSinceMs = 0;
 
-        function _getBufferedRanges(mediaEl) {
-            if (!mediaEl || !mediaEl.buffered) return [];
-            var ranges = [];
-            for (var i = 0; i < mediaEl.buffered.length; i++) {
-                var start = mediaEl.buffered.start(i);
-                var end = mediaEl.buffered.end(i);
-                ranges.push({ start: start, end: end, duration: end - start });
-            }
-            return ranges;
-        }
-
-        function _snapshotSyncState() {
-            var player = document.getElementById('player');
-            var cafEl = document.getElementById('caf-el');
-            var audioClockMs = null;
-            var videoClockMs = null;
-            var errorMs = null;
-            var targetSec = null;
-            var bufferAheadSec = null;
-
-            if (cafEl && _epochMs >= 0) audioClockMs = _getAudioClockMs(cafEl);
-            if (player && _videoEpochSet) videoClockMs = _getVideoClockMs(player);
-            if (audioClockMs != null && videoClockMs != null) {
-                errorMs = videoClockMs - audioClockMs - _cdispBaked;
-                targetSec = _getVideoTimeSecForAudioMs(audioClockMs);
-            }
-            if (player && player.buffered && player.buffered.length > 0) {
-                bufferAheadSec = player.buffered.end(player.buffered.length - 1) - player.currentTime;
-            }
-
-            var rVFCActive = _rVFCMediaTimeSec >= 0;
-            return {
-                mode: _mode,
-                epochs: {
-                    epochMs: _epochMs,
-                    epochWallMs: _epochWallMs,
-                    videoEpochMs: _videoEpochMs,
-                    serverRttMs: _serverRtt
-                },
-                latestClockPoll: _lastClockInfo,
-                latestManifest: _lastManifestInfo,
-                queue: {
-                    pendingAppends: _appendQueue.length,
-                    appending: _appending,
-                    trimming: _trimming,
-                    loadedSegCount: Object.keys(_loadedSegs).length,
-                    segsBuffered: _segsBuffered,
-                    videoReady: _videoReady,
-                    cafPlaying: _cafPlaying
-                },
-                audio: cafEl ? {
-                    currentTime: cafEl.currentTime,
-                    paused: cafEl.paused,
-                    readyState: cafEl.readyState,
-                    computedClockMs: audioClockMs
-                } : null,
-                video: player ? {
-                    currentTime: player.currentTime,
-                    paused: player.paused,
-                    readyState: player.readyState,
-                    playbackRate: player.playbackRate,
-                    computedClockMs: videoClockMs,
-                    rVFCActive: rVFCActive,
-                    rVFCMediaTimeSec: _rVFCMediaTimeSec,
-                    rVFCDeltaMs: rVFCActive ? (player.currentTime - _rVFCMediaTimeSec) * 1000 : null,
-                    rVFCRenderedCount: _rVFCRenderedCount,
-                    targetTimeSecForAudio: targetSec,
-                    bufferAheadSec: bufferAheadSec,
-                    buffered: _getBufferedRanges(player)
-                } : null,
-                drift: { errorMs: errorMs },
-                nowMs: Date.now()
-            };
-        }
-
-        window.__cws = {
-            state: function () { return _snapshotSyncState(); },
-            log: function () {
-                var s = _snapshotSyncState();
-                console.log('[cws][debug]', s);
-                if (console.table && s.video && s.video.buffered) console.table(s.video.buffered);
-                return s;
-            },
-            watch: function (intervalMs) {
-                var ms = Math.max(250, intervalMs || 1000);
-                if (_debugWatchTimer) clearInterval(_debugWatchTimer);
-                _debugWatchTimer = setInterval(function () {
-                    var s = _snapshotSyncState();
-                    console.log('[cws][watch] err=' + (s.drift.errorMs != null ? s.drift.errorMs.toFixed(0) : 'n/a') +
-                                'ms audio=' + (s.audio && s.audio.computedClockMs != null ? (s.audio.computedClockMs / 1000).toFixed(3) : 'n/a') +
-                                's video=' + (s.video && s.video.computedClockMs != null ? (s.video.computedClockMs / 1000).toFixed(3) : 'n/a') +
-                                's playerT=' + (s.video ? s.video.currentTime.toFixed(3) : 'n/a') +
-                                's rate=' + (s.video ? s.video.playbackRate.toFixed(4) : 'n/a') +
-                                ' bufAhead=' + (s.video && s.video.bufferAheadSec != null ? s.video.bufferAheadSec.toFixed(3) : 'n/a') + 's');
-                }, ms);
-                return ms;
-            },
-            stopWatch: function () {
-                if (_debugWatchTimer) clearInterval(_debugWatchTimer);
-                _debugWatchTimer = null;
-            },
-            player: function () { return document.getElementById('player'); },
-            caf: function () { return document.getElementById('caf-el'); }
-        };
-
         playerManager.setMessageInterceptor(
             cast.framework.messages.MessageType.LOAD,
             function (request) {
@@ -298,9 +188,6 @@
 
                 if (_mode === 'caf_wav_sync') {
                     _startCafWavSync(_baseUrl);
-                } else if (_mode === 'fmp4_muxed') {
-                    _silenceCaf();
-                    _startMuxed(_baseUrl);
                 } else {
                     console.error('[receiver] Unsupported mode: ' + _mode);
                     _showOverlay(1);
@@ -321,14 +208,8 @@
         playerManager.addEventListener(cast.framework.events.EventType.PLAYING, function () {
             _cafPlaying = true;
             _everPlayed = true;
-            if (_mode === 'caf_wav_sync') {
-                var p = document.getElementById('player');
-                if (p && p.paused) p.play().catch(function () {});
-            } else {
-                _silenceCaf();
-                var p2 = document.getElementById('player');
-                if (p2 && p2.paused) p2.play().catch(function () {});
-            }
+            var p = document.getElementById('player');
+            if (p && p.paused) p.play().catch(function () {});
         });
 
         playerManager.addEventListener(
@@ -387,20 +268,9 @@
         function _waitForEpoch(baseUrl, cb) {
             var attempt = 0;
             (function poll() {
-                var t0 = Date.now();
                 fetch(baseUrl + 'cast/audio-clock')
                     .then(function (r) { return r.json(); })
                     .then(function (d) {
-                        _serverRtt = Date.now() - t0;
-                        _lastClockInfo = {
-                            audioMs: d.audioMs,
-                            epochMs: d.epochMs,
-                            epochWallMs: d.epochWallMs,
-                            videoEpochMs: d.videoEpochMs,
-                            serverNowMs: d.serverNowMs,
-                            receiverNowMs: Date.now(),
-                            receiverRttMs: _serverRtt
-                        };
                         if (d.epochMs >= 0 && typeof d.videoEpochMs === 'number') {
                             _epochMs      = d.epochMs;
                             _epochWallMs  = d.epochWallMs;
@@ -495,7 +365,6 @@
                         });
 
                         _queueAppend(u8, function () {
-                            _initLoaded = true;
                             console.log('[cws] init.mp4 appended (' + u8.length + ' bytes)');
                             _pollManifest(baseUrl);
                         });
@@ -520,7 +389,7 @@
                 _ms = null; _sb = null;
                 if (_drainRetryTimer) { clearTimeout(_drainRetryTimer); _drainRetryTimer = null; }
                 _appendQueue = []; _appending = false; _trimming = false; _quotaRetries = 0;
-                _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0; _videoReady = false;
+                _loadedSegs = {}; _segsBuffered = 0; _videoReady = false;
                 try { player.removeAttribute('src'); player.load(); } catch (e) {}
                 _initVideoMSE(player, baseUrl);
             }, 1000);
@@ -550,14 +419,6 @@
                 })
                 .then(function (text) {
                     var parsed = _parseM3u8(text);
-                    _lastManifestInfo = {
-                        fetchedAtMs: Date.now(),
-                        mediaSeq: parsed.mediaSeq,
-                        targetDuration: parsed.targetDuration,
-                        segmentCount: parsed.segments.length,
-                        firstSegment: parsed.segments.length > 0 ? parsed.segments[0] : null,
-                        lastSegment: parsed.segments.length > 0 ? parsed.segments[parsed.segments.length - 1] : null
-                    };
                     var newFrags = [];
                     for (var i = 0; i < parsed.segments.length; i++) {
                         var seg = parsed.segments[i];
@@ -739,11 +600,9 @@
                 return;
             }
 
-            var t0 = Date.now();
             fetch(_baseUrl + 'cast/audio-clock')
                 .then(function (r) { return r.json(); })
                 .then(function (d) {
-                    _serverRtt = Date.now() - t0;
                     if (d.epochMs >= 0) {
                         _epochMs     = d.epochMs;
                         _epochWallMs = d.epochWallMs;
@@ -1068,20 +927,18 @@
             if (_epochPollTimer) clearInterval(_epochPollTimer);
             _epochPollTimer = setInterval(function () {
                 if (!_baseUrl) return;
-                var t0 = Date.now();
                 fetch(_baseUrl + 'cast/audio-clock')
                     .then(function (r) { return r.json(); })
                     .then(function (d) {
-                        _serverRtt = Date.now() - t0;
                         var calibActive = (d.calibActive === true);
                         _calibActive = calibActive;
                         _calibMode = (typeof d.calibMode === 'number') ? d.calibMode : 0;
-                        // Receiver-side audio mute (MusicBee paused/stopped). Local element mute only - no
-                        // device-volume command, so no Chromecast volume OSD. Skip during calibration so the
-                        // tone/FSK stays audible (the server already masks audioMuted while calibrating).
+                   
                         if (cafEl && !calibActive) cafEl.muted = (d.audioMuted === true);
+
                         if (calibActive !== _lastCalibActive) {
                             _lastCalibActive = calibActive;
+
                             if (calibActive) {
                                 _calibSettled = false;
                                 _calibErrWin = []; _calibErrTicks = 0; _unsettledSinceMs = 0;
@@ -1110,25 +967,16 @@
                                 _reanchorPending = true;
                                 console.log('[cws] re-anchor requested (Cdisp=' + _cdispBaked + 'ms)');
                             }
-                            _lastClockInfo = {
-                                audioMs: d.audioMs,
-                                epochMs: d.epochMs,
-                                epochWallMs: d.epochWallMs,
-                                videoEpochMs: d.videoEpochMs,
-                                serverNowMs: d.serverNowMs,
-                                receiverNowMs: Date.now(),
-                                receiverRttMs: _serverRtt
-                            };
                         }
                     })
                     .catch(function () {});
-            }, 500);   // 500ms so a pause/resume mute flag is applied snappily (also tightens epoch/reanchor tracking)
+            }, 500);
 
             if (_reportTimer) clearInterval(_reportTimer);
             _reportTimer = setInterval(function () { _postSyncReport(player, cafEl); }, 5000);
         }
 
-        // Builds and POSTs one sync report. Called on the 5 s timer and immediately on a calib settle change.
+        // Builds and POSTs one sync report
         function _postSyncReport(player, cafEl) {
             if (!_baseUrl || !_cafPlaying) return;
             try {
@@ -1202,94 +1050,6 @@
             return { segments: segments, mediaSeq: mediaSeq, targetDuration: targetDuration };
         }
 
-        function _silenceCaf() {
-            var cafEl = document.getElementById('caf-el');
-            if (!cafEl || cafEl._silenced) return;
-            cafEl._silenced = true;
-            try {
-                var silenceCtx = new (window.AudioContext || window.webkitAudioContext)();
-                silenceCtx.createMediaElementSource(cafEl);
-            } catch (e) {
-                cafEl.addEventListener('volumechange', function () {
-                    if (cafEl.volume !== 0) cafEl.volume = 0;
-                });
-                cafEl.volume = 0;
-            }
-        }
-
-        var _hls = null;
-        window.__hls = function () { return _hls; };
-
-        function _startMuxed(baseUrl) {
-            var player = document.getElementById('player');
-            if (!player) { console.error('[muxed] #player missing'); return; }
-            if (!window.Hls || !Hls.isSupported()) {
-                console.error('[muxed] hls.js / MSE not available');
-                return;
-            }
-
-            player.muted = false;
-            _showOverlay(1);
-
-            fetch(baseUrl + 'api/settings')
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .catch(function () { return null; })
-                .then(function (cfg) {
-                    var liveSyncCount = (cfg && cfg.hlsLiveSyncSegments  > 0) ? cfg.hlsLiveSyncSegments  : 3;
-                    var liveMaxCount  = (cfg && cfg.hlsMaxLatencySegments > 0) ? cfg.hlsMaxLatencySegments : 6;
-
-                    _hls = new Hls({
-                        lowLatencyMode:              false,
-                        liveSyncDurationCount:       liveSyncCount,
-                        liveMaxLatencyDurationCount: liveMaxCount,
-                        maxBufferLength:             30,
-                        maxMaxBufferLength:          60,
-                        maxBufferSize:               60 * 1024 * 1024,
-                        backBufferLength:            Infinity,
-                        enableWorker:                false,
-                        abrEnabled:                  false,
-                        startLevel:                  0,
-                        debug:                       false,
-                        progressive:                 false,
-                        manifestLoadingMaxRetry:     12,
-                        manifestLoadingRetryDelay:   1000,
-                        manifestLoadingMaxRetryTimeout: 12000,
-                    });
-
-                    var _playStarted = false;
-                    var _fragsBuffered = 0;
-                    function _tryStartPlayback() {
-                        if (_playStarted) return;
-                        _playStarted = true;
-                        var pos = _hls.liveSyncPosition;
-                        if (pos != null) player.currentTime = pos;
-                        player.play().catch(function () {});
-                        player.addEventListener('playing', function onP() {
-                            player.removeEventListener('playing', onP);
-                            setTimeout(function () { _showOverlay(0); }, 500);
-                        });
-                        setTimeout(function () { _showOverlay(0); }, 6000);
-                    }
-
-                    _hls.on(Hls.Events.LEVEL_LOADED, function (e, d) {
-                        if (!_playStarted && d.details.fragments.length >= 3) _tryStartPlayback();
-                    });
-                    _hls.on(Hls.Events.FRAG_BUFFERED, function () {
-                        _fragsBuffered++;
-                        if (!_playStarted && _fragsBuffered >= 3) _tryStartPlayback();
-                    });
-                    _hls.on(Hls.Events.ERROR, function (e, d) {
-                        if (!d.fatal) return;
-                        if (_hls) { try { _hls.destroy(); } catch (err) {} _hls = null; }
-                        setTimeout(function () { if (_baseUrl) _startMuxed(_baseUrl); }, 3000);
-                    });
-
-                    _hls.loadSource(baseUrl + 'cast/muxed/stream.m3u8');
-                    _hls.attachMedia(player);
-                });
-        }
-
-
         function _reset() {
             if (_syncTimer)  { clearInterval(_syncTimer); _syncTimer = null; }
             if (_pollTimer)  { clearTimeout(_pollTimer); _pollTimer = null; }
@@ -1307,18 +1067,14 @@
             _playerLastT = -1; _playerStallWall = 0; _startWaitCount = 0;
             _mseGen++;
             if (_mseRetryTimer) { clearTimeout(_mseRetryTimer); _mseRetryTimer = null; }
-            if (_hls)        { try { _hls.destroy(); } catch (e) {} _hls = null; }
             if (_ms)         { try { _ms.endOfStream(); } catch (e) {} }
             _ms = null; _sb = null;
             if (_drainRetryTimer) { clearTimeout(_drainRetryTimer); _drainRetryTimer = null; }
             _appendQueue = []; _appending = false; _trimming = false; _quotaRetries = 0;
-            _loadedSegs = {}; _initLoaded = false; _segsBuffered = 0;
+            _loadedSegs = {}; _segsBuffered = 0;
             _epochMs = -1; _epochWallMs = -1; _videoEpochMs = -1; _videoEpochSet = false; _cdispMs = 0;
             _cdispBaked = 0; _lastReanchorSeq = -1; _reanchorPending = false; _lastEpochJumpSeq = -1;
             _videoReady = false; _cafPlaying = false; _everPlayed = false;
-            _lastManifestInfo = null; _lastClockInfo = null;
-            if (_debugWatchTimer) clearInterval(_debugWatchTimer);
-            _debugWatchTimer = null;
             var p = document.getElementById('player');
             if (p) {
                 try { p.pause(); } catch (e) {}
