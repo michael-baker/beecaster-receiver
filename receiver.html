@@ -78,7 +78,7 @@
     (function () {
         'use strict';
 
-        var RECEIVER_VERSION = '2026-06-10-r40-device-debug-hud';
+        var RECEIVER_VERSION = '2026-06-11-r41-fast-acquire-trim';
 
         var _logRing = [];
         var _LOG_RING_MAX = 60;
@@ -738,7 +738,11 @@
             var KP = 0.0002;
             var MAX_TRIM = 0.06;
             var MAX_TRIM_SAFE = 0.03;
-            var BUFFER_LOW_SEC = 4;
+            // Video carries no audio (CAF plays sound separately), so a large playbackRate is inaudible. Use a
+            // wider trim cap until first convergence to close the initial residual in a few seconds.
+            var MAX_TRIM_ACQUIRE = 0.12;
+            // Forward buffer normally sits near the live edge, so keep this below it or the trim is stuck on SAFE.
+            var BUFFER_LOW_SEC = 1.5;
             var SEEK_COOLDOWN_MS = 2000;
             var STARTUP_SNAP_MS = 300;
             var STALL_RECOVER_MS = 1500;
@@ -940,7 +944,8 @@
                 if (Math.abs(errorMs) <= DEAD_BAND_MS) {
                     rate = 1.0;
                 } else {
-                    var maxTrim = bufAheadSec < BUFFER_LOW_SEC ? MAX_TRIM_SAFE : MAX_TRIM;
+                    var maxTrim = bufAheadSec < BUFFER_LOW_SEC ? MAX_TRIM_SAFE
+                        : (_convergeReported ? MAX_TRIM : MAX_TRIM_ACQUIRE);
                     rate = 1.0 - KP * errorMs;
                     rate = Math.max(1 - maxTrim, Math.min(1 + maxTrim, rate));
                 }
